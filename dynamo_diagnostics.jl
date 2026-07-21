@@ -40,33 +40,22 @@ begin
     KM_CM = 1.0e5                    # cm
     GAUSS_TO_MICROGAUSS = 1.0e6
 
-    const TICK_SUPERSCRIPTS = Dict(
-        '-' => '⁻', '0' => '⁰', '1' => '¹', '2' => '²', '3' => '³',
-        '4' => '⁴', '5' => '⁵', '6' => '⁶', '7' => '⁷', '8' => '⁸', '9' => '⁹',
-    )
-    superscript_integer(value) =
-        join(get(TICK_SUPERSCRIPTS, character, character) for character in string(value))
-
     """
-    Render numeric ticks as one atomic TeX-styled text block.
-
-    Genuine LaTeXStrings remain in axis and colorbar labels. Numeric tick arrays
-    use Unicode mathematical glyphs because CairoMakie can otherwise update their
-    LaTeX glyph blocks before the matching tick positions while Pluto is reactive.
+    Render every numeric axis and colorbar tick as a genuine LaTeXString.
     """
     function latex_number(x)
         if isnan(x)
-            return "NaN"
+            return L"\mathrm{NaN}"
         elseif isinf(x)
-            return x > 0 ? "+∞" : "−∞"
+            return x > 0 ? L"+\infty" : L"-\infty"
         end
-        x == 0 && return "0"
+        x == 0 && return L"0"
         exponent = floor(Int, log10(abs(x)))
         if exponent <= -3 || exponent >= 4
             mantissa = x / 10.0^exponent
-            string(@sprintf("%.3g", mantissa), "×10", superscript_integer(exponent))
+            latexstring(@sprintf("%.3g", mantissa), "\\times 10^{", exponent, "}")
         else
-            @sprintf("%.4g", x)
+            latexstring(@sprintf("%.4g", x))
         end
     end
 
@@ -1817,6 +1806,13 @@ begin
     sky_dims = filter(!=(los_dim), (1, 2, 3))
     axis_names = ("x", "y", "z")
     sky_labels = axis_names[collect(sky_dims)]
+    comparison_snapshot_indices = Dict(label =>
+        min(Int(selected_snapshot), length(run_files[label]))
+        for label in comparison_run_labels)
+    comparison_cubes = Dict(label =>
+        (label == selected_run && comparison_snapshot_indices[label] == selected_snapshot ?
+            cube : load_cube(run_files[label][comparison_snapshot_indices[label]]))
+        for label in comparison_run_labels)
 end
 
 # ╔═╡ 5fbd0d53-09e8-4b39-bb1d-29c8cc45c6ee
@@ -2031,7 +2027,7 @@ md"""
 
 ## 3. Physical probability density functions
 
-The panels show number density $n$, magnetic-field strength $|B|$, and turbulent speed $|\delta\mathbf v|$ in physical units. Histograms are evaluated in $\log_{10}X$ bins. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
+The panels compare every run selected in **Simulations in comparative plots** at the selected snapshot index (clamped to the last available snapshot of shorter runs). They show number density $n$, magnetic-field strength $|B|$, and turbulent speed $|\delta\mathbf v|$ in physical units. Shared $\log_{10}X$ bins are used across runs. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
 
 **Display physical PDFs:** $(@bind display_pdfs PlutoUI.CheckBox(default = true))
 
@@ -2044,22 +2040,45 @@ The panels show number density $n$, magnetic-field strength $|B|$, and turbulent
 
 # ╔═╡ 496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
 begin
-    function density_pdf(values, weights, n)
+    function density_pdf(values, weights, edges)
         valid = isfinite.(values) .& isfinite.(weights) .& (weights .>= 0)
         values, weights = Float64.(values[valid]), Float64.(weights[valid])
         isempty(values) && return (Float64[], Float64[])
-        lo, hi = quantile(values, (0.001, 0.999))
-        if lo == hi
-            lo, hi = lo - 0.5, hi + 0.5
-        end
-        edges = range(lo, hi; length = n + 1)
         h = fit(Histogram, values, Weights(weights), edges)
         centers = (edges[1:end-1] .+ edges[2:end]) ./ 2
         pdf = h.weights ./ max(sum(h.weights .* diff(edges)), eps())
         centers, pdf
     end
 
-    pdf_weights = pdf_weighting == "mass" ? vec(Float64.(cube.rho)) : ones(length(cube.rho))
+    function cube_pdf_samples(c)
+        local_mag = magnetic_fields(c)
+        local_turb = turbulent_velocity(c)
+        local_weights = pdf_weighting == "mass" ?
+            vec(Float64.(c.rho)) : ones(length(c.rho))
+        local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
+        local_v = sqrt.(local_turb.dv2)
+        local_mean_B = finite_mean(local_mag.B)
+        (
+            density = vec(safe_log10.(number_density(c.rho))),
+            magnetic = vec(safe_log10.(local_B)),
+            velocity = vec(safe_log10.(local_v)),
+            normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
+            weights = local_weights,
+        )
+    end
+
+    function comparative_pdf(samples_by_run, field, bins)
+        combined = vcat([finite_values(getfield(samples_by_run[label], field))
+            for label in comparison_run_labels]...)
+        isempty(combined) && return Dict{String, Any}()
+        lo, hi = quantile(combined, (0.001, 0.999))
+        lo == hi && ((lo, hi) = (lo - 0.5, hi + 0.5))
+        edges = range(lo, hi; length = Int(bins) + 1)
+        Dict(label => density_pdf(getfield(samples_by_run[label], field),
+                samples_by_run[label].weights, edges)
+            for label in comparison_run_labels)
+    end
+
     number_density_cells = number_density(cube.rho)
     magnetic_strength_uG = GAUSS_TO_MICROGAUSS .* mag.B
     turbulent_speed_kms = sqrt.(turb.dv2)
@@ -2068,33 +2087,44 @@ begin
     logn = vec(safe_log10.(number_density_cells))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
-    n_logx, n_p = density_pdf(logn, pdf_weights, nbins)
-    B_logx, B_p = density_pdf(logBphysical, pdf_weights, nbins)
-    v_logx, v_p = density_pdf(logvphysical, pdf_weights, nbins)
-    logB_ratio_x, logB_ratio_p = density_pdf(sB, pdf_weights, nbins)
-    n_x, B_x, v_x = 10.0 .^ n_logx, 10.0 .^ B_logx, 10.0 .^ v_logx
+    comparative_pdf_samples = Dict(label => cube_pdf_samples(comparison_cubes[label])
+        for label in comparison_run_labels)
+    density_pdfs = comparative_pdf(comparative_pdf_samples, :density, nbins)
+    magnetic_pdfs = comparative_pdf(comparative_pdf_samples, :magnetic, nbins)
+    velocity_pdfs = comparative_pdf(comparative_pdf_samples, :velocity, nbins)
+    normalized_B_pdfs = comparative_pdf(comparative_pdf_samples, :normalized_B, nbins)
 end
 
 # ╔═╡ 1e0e6c0e-1ae0-40a1-a6f8-9c18fae91961
 begin
     pdf_specs = NamedTuple[]
-    show_pdf_density && push!(pdf_specs, (x = n_x, p = n_p,
-        xlabel = L"n\;[\mathrm{cm}^{-3}]", color = MHD_COLORS[1]))
-    show_pdf_magnetic && push!(pdf_specs, (x = B_x, p = B_p,
-        xlabel = L"|B|\;[\mu\mathrm{G}]", color = MHD_COLORS[2]))
-    show_pdf_velocity && push!(pdf_specs, (x = v_x, p = v_p,
-        xlabel = L"|\delta v|\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[3]))
+    show_pdf_density && push!(pdf_specs, (pdfs = density_pdfs,
+        xlabel = L"n\;[\mathrm{cm}^{-3}]"))
+    show_pdf_magnetic && push!(pdf_specs, (pdfs = magnetic_pdfs,
+        xlabel = L"|B|\;[\mu\mathrm{G}]"))
+    show_pdf_velocity && push!(pdf_specs, (pdfs = velocity_pdfs,
+        xlabel = L"|\delta v|\;[\mathrm{km\,s}^{-1}]"))
     if isempty(pdf_specs)
         fig_pdf = Figure(size = (900, 180))
         Label(fig_pdf[1, 1], L"\mathrm{Select\ at\ least\ one\ PDF.}", fontsize = 20)
     else
-        fig_pdf = Figure(size = (390length(pdf_specs), 360))
+        fig_pdf = Figure(size = (420length(pdf_specs), 430))
         for (j, spec) in enumerate(pdf_specs)
             ax = Axis(fig_pdf[1, j], xlabel = spec.xlabel,
                 ylabel = L"\mathrm{d}\mathcal{P}/\mathrm{d}\log_{10}X", xscale = log10)
-            stairs!(ax, spec.x, spec.p; color = spec.color, linewidth = 2.5, step = :center)
+            for label in comparison_run_labels
+                logx, probability = spec.pdfs[label]
+                stairs!(ax, 10.0 .^ logx, probability;
+                    color = run_colors[label], linewidth = 2.5, step = :center,
+                    label = legend_run_label(label))
+            end
             ylims!(ax, low = 0)
         end
+        Legend(fig_pdf[2, 1:length(pdf_specs)],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true, framevisible = false)
     end
     display_pdfs ? fig_pdf : nothing
 end
@@ -2105,7 +2135,7 @@ md"""
 
 ## 4. Thermodynamic phase diagram
 
-This diagram shows the joint distribution of number density $n$ and thermal pressure $P/k_{\mathrm B}$ in the active three-dimensional cube. The plotted coordinates are $\log_{10}n$ and $\log_{10}(P/k_{\mathrm B})$; empty probability bins are masked.
+This comparative figure shows one joint distribution of number density $n$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. The plotted coordinates are $\log_{10}n$ and $\log_{10}(P/k_{\mathrm B})$; empty probability bins are masked and all panels share one color scale.
 
 The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curve satisfies $n\Lambda(T)=\Gamma$ with $P/k_{\mathrm B}=nT$.
 
@@ -2162,40 +2192,54 @@ begin
         )
     end
 
-    phase_logn = vec(safe_log10.(number_density(cube.rho)))
-    phase_logpk = vec(safe_log10.(cube.P ./ K_B_CGS))
-    phase_weights = pdf_weighting == "mass" ? vec(Float64.(cube.rho)) : ones(length(cube.rho))
-    phase_data = phase_histogram(phase_logn, phase_logpk, phase_weights, phase_bins)
+    phase_data_by_run = Dict(label => begin
+        local_cube = comparison_cubes[label]
+        local_logn = vec(safe_log10.(number_density(local_cube.rho)))
+        local_logpk = vec(safe_log10.(local_cube.P ./ K_B_CGS))
+        local_weights = pdf_weighting == "mass" ?
+            vec(Float64.(local_cube.rho)) : ones(length(local_cube.rho))
+        phase_histogram(local_logn, local_logpk, local_weights, phase_bins)
+    end for label in comparison_run_labels)
     phase_equilibrium = koyama_inutsuka_equilibrium()
 end
 
 # ╔═╡ 41b4eb12-889d-43b3-87c2-fc7cccf8679f
 begin
-    fig_phase = Figure(size = (680, 540))
-    phase_axis = Axis(fig_phase[1, 1],
-        xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
-        ylabel = L"\log_{10}\!\left[(P/k_B)/(\mathrm{K\,cm}^{-3})\right]")
-    phase_range = robust_colorrange(phase_data.log_probability, 99.0)
-    phase_heatmap = heatmap!(phase_axis, phase_data.xcenters, phase_data.ycenters,
-        phase_data.log_probability; colormap = :magma, colorrange = phase_range)
-    if show_phase_equilibrium
-        lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
-            color = :black, linewidth = 4.5)
-        lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
-            color = :white, linewidth = 2.5, label = "n Λ(T) = Γ")
-        axislegend(phase_axis; position = :rt, labelsize = 14)
+    phase_panel_count = length(comparison_run_labels)
+    fig_phase = Figure(size = (560phase_panel_count + 80, 520))
+    combined_phase_probability = vcat([
+        finite_values(phase_data_by_run[label].log_probability)
+        for label in comparison_run_labels]...)
+    phase_range = robust_colorrange(combined_phase_probability, 99.0)
+    phase_heatmap = nothing
+    for (panel_index, label) in enumerate(comparison_run_labels)
+        phase_data = phase_data_by_run[label]
+        phase_axis = Axis(fig_phase[1, panel_index],
+            xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
+            ylabel = L"\log_{10}\!\left[(P/k_B)/(\mathrm{K\,cm}^{-3})\right]",
+            title = latex_run_label(label))
+        phase_heatmap = heatmap!(phase_axis, phase_data.xcenters, phase_data.ycenters,
+            phase_data.log_probability; colormap = :magma, colorrange = phase_range)
+        if show_phase_equilibrium
+            lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
+                color = :black, linewidth = 4.5)
+            lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
+                color = :white, linewidth = 2.5,
+                label = L"n\Lambda(T)=\Gamma")
+            panel_index == 1 && axislegend(phase_axis; position = :rt, labelsize = 14)
+        end
+        phase_dx = length(phase_data.xcenters) > 1 ?
+            phase_data.xcenters[2] - phase_data.xcenters[1] : 1.0
+        phase_dy = length(phase_data.ycenters) > 1 ?
+            phase_data.ycenters[2] - phase_data.ycenters[1] : 1.0
+        xlims!(phase_axis, first(phase_data.xcenters) - phase_dx / 2,
+            last(phase_data.xcenters) + phase_dx / 2)
+        ylims!(phase_axis, first(phase_data.ycenters) - phase_dy / 2,
+            last(phase_data.ycenters) + phase_dy / 2)
     end
-    phase_dx = length(phase_data.xcenters) > 1 ?
-        phase_data.xcenters[2] - phase_data.xcenters[1] : 1.0
-    phase_dy = length(phase_data.ycenters) > 1 ?
-        phase_data.ycenters[2] - phase_data.ycenters[1] : 1.0
-    xlims!(phase_axis, first(phase_data.xcenters) - phase_dx / 2,
-        last(phase_data.xcenters) + phase_dx / 2)
-    ylims!(phase_axis, first(phase_data.ycenters) - phase_dy / 2,
-        last(phase_data.ycenters) + phase_dy / 2)
-    Colorbar(fig_phase[1, 2], phase_heatmap,
+    Colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
         label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)
-    colsize!(fig_phase.layout, 2, 22)
+    colsize!(fig_phase.layout, phase_panel_count + 1, 22)
     display_phase_diagram ? fig_phase : nothing
 end
 
@@ -2832,7 +2876,7 @@ md"""
 
 ## 7. Normalized magnetic-field distribution
 
-The map shows the line-of-sight mean of the transformed field $\log_{10}(B/\langle B\rangle)$. The PDF uses every cell in the active cube. A value of zero corresponds to the cube-mean field strength; positive and negative values identify locally stronger and weaker fields.
+The map shows the active run's line-of-sight mean of $\log_{10}(B/\langle B\rangle)$. The PDF compares every selected simulation using shared bins and every cell of the corresponding cube. A value of zero corresponds to each cube's mean field strength; positive and negative values identify locally stronger and weaker fields.
 
 **Display the normalized magnetic-field distribution:** $(@bind display_normalized_field PlutoUI.CheckBox(default = true))
 
@@ -2871,8 +2915,13 @@ begin
             logB_column += 1
             axhist = Axis(fig_logB[1, logB_column],
                 xlabel = L"\log_{10}(B/\langle B\rangle)", ylabel = L"\mathcal{P}")
-            lines!(axhist, logB_ratio_x, logB_ratio_p;
-                color = MHD_COLORS[2], linewidth = 2.5)
+            for label in comparison_run_labels
+                logB_ratio_x, logB_ratio_p = normalized_B_pdfs[label]
+                lines!(axhist, logB_ratio_x, logB_ratio_p;
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
+            end
+            axislegend(axhist; position = :rt, framevisible = false)
         end
     end
     display_normalized_field ? fig_logB : nothing
@@ -3229,10 +3278,7 @@ begin
         L"N^3" : comparison_kind == :ratio ?
         L"\chi=E_{\mathrm{comp}}/E_{\mathrm{sol}}" : comparison_kind == :mach ?
         L"\mathcal{M}" : L"\mathrm{simulation}"
-    # Keep categorical tick labels as atomic strings. LaTeXString labels can be
-    # split into a different number of Makie text blocks while Pluto updates the
-    # corresponding tick positions, triggering a ComputePipeline length error.
-    enstrophy_parameter_ticklabels = String.(
+    enstrophy_parameter_ticklabels = as_latex.(
         enstrophy_parameter_ticklabel.(comparison_run_labels))
 end
 
@@ -3667,6 +3713,8 @@ md"""
 
 This section implements the line-of-sight geometry used by `GammaDust.jl`, `PhiDust.jl`, and `DustIQU.jl`. The magnetic inclination and polarization position angle satisfy $\gamma_{\mathrm d}=\arcsin(B_{\mathrm{LOS}}/|B|)$ and $\psi=\operatorname{atan2}(B_2,B_1)+\pi/2$. Optically thin emission follows $I_\nu,Q_\nu,U_\nu\propto B_\nu(T_{\mathrm d})\sigma_\nu n_{\mathrm H}\,\mathrm d\ell$, with the standard Stokes-$I$ correction $1-p_0(\cos^2\gamma_{\mathrm d}-2/3)$.
 
+The polarization-fraction PDF and the $p$--$N_{\mathrm H}$ distribution compare all selected simulations with shared histogram bins and one color per run.
+
 | Dust figure | Display |
 |:--|:--:|
 | Polarization maps | $(@bind display_dust_maps PlutoUI.CheckBox(default = true)) |
@@ -3877,6 +3925,37 @@ end
 
 # ╔═╡ 61c3b28c-9d62-4689-a85d-bc827e89641d
 begin
+    function dust_distribution_products(c)
+        local_mag = magnetic_fields(c)
+        local_Bcomponents = (c.bx, c.by, c.bz)
+        local_B1 = local_Bcomponents[sky_dims[1]]
+        local_B2 = local_Bcomponents[sky_dims[2]]
+        local_cos2gamma = clamp.((local_B1 .^ 2 .+ local_B2 .^ 2) ./
+            max.(local_mag.B2, eps(Float64)), 0.0, 1.0)
+        local_phi = atan.(local_B2, local_B1) .+ pi / 2
+        local_dx_cm = c.L[los_dim] / size(c.rho, los_dim) * PC_CM
+        local_nH = c.rho ./ (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
+        local_weight = local_dx_cm .* local_nH
+        local_p0 = Float64(dust_p0)
+        local_I = finite_sum_dims(local_weight .*
+            (1 .- local_p0 .* (local_cos2gamma .- 2 / 3)), los_dim)
+        local_Q = finite_sum_dims(local_weight .* local_p0 .* local_cos2gamma .*
+            cos.(2 .* local_phi), los_dim)
+        local_U = finite_sum_dims(local_weight .* local_p0 .* local_cos2gamma .*
+            sin.(2 .* local_phi), los_dim)
+        local_I = apply_observational_beam_2d(local_I, c, sky_dims)
+        local_Q = apply_observational_beam_2d(local_Q, c, sky_dims)
+        local_U = apply_observational_beam_2d(local_U, c, sky_dims)
+        local_fraction = sqrt.(local_Q .^ 2 .+ local_U .^ 2) ./
+            max.(local_I, eps(Float64))
+        local_column = finite_sum_dims(c.rho, los_dim) .* local_dx_cm ./
+            (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
+        (column = local_column, fraction = local_fraction)
+    end
+
+    dust_distributions_by_run = Dict(label =>
+        dust_distribution_products(comparison_cubes[label])
+        for label in comparison_run_labels)
     dust_stat_specs = Symbol[]
     show_dust_p_column && push!(dust_stat_specs, :column_relation)
     show_dust_p_pdf && push!(dust_stat_specs, :fraction_pdf)
@@ -3884,42 +3963,71 @@ begin
         fig_dust_statistics = Figure(size = (900, 180))
         Label(fig_dust_statistics[1, 1], L"\mathrm{Select\ at\ least\ one\ dust\ statistic.}", fontsize = 20)
     else
-        fig_dust_statistics = Figure(size = (520length(dust_stat_specs), 390))
-        dust_N = vec(Float64.(column_density))
-        dust_p = 100 .* vec(Float64.(dust_fraction))
-        dust_valid = isfinite.(dust_N) .& isfinite.(dust_p) .& (dust_N .> 0) .& (dust_p .>= 0)
-        dust_N_valid, dust_p_valid = dust_N[dust_valid], dust_p[dust_valid]
+        fig_dust_statistics = Figure(size = (540length(dust_stat_specs), 470))
+        dust_distribution_vectors = Dict(label => begin
+            products = dust_distributions_by_run[label]
+            local_N = vec(Float64.(products.column))
+            local_p = 100 .* vec(Float64.(products.fraction))
+            valid = isfinite.(local_N) .& isfinite.(local_p) .&
+                (local_N .> 0) .& (local_p .>= 0)
+            (N = local_N[valid], p = local_p[valid])
+        end for label in comparison_run_labels)
+        all_dust_p = vcat([dust_distribution_vectors[label].p
+            for label in comparison_run_labels]...)
+        dust_pdf_upper = isempty(all_dust_p) ? 1.0e-6 :
+            max(quantile(all_dust_p, 0.999), 1.0e-6)
+        dust_pdf_edges = range(0, dust_pdf_upper; length = 45)
         for (index, statistic) in enumerate(dust_stat_specs)
             if statistic == :column_relation
                 ax = Axis(fig_dust_statistics[1, index], xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
                     ylabel = L"100p_{\mathrm d}\;[\%]", xscale = log10,
                     xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-                sample_step = max(1, cld(length(dust_N_valid), 6000))
-                sample = 1:sample_step:length(dust_N_valid)
-                scatter!(ax, dust_N_valid[sample], dust_p_valid[sample];
-                    color = (:dodgerblue3, 0.20), markersize = 4)
-                if !isempty(dust_N_valid)
-                    edges = 10 .^ range(extrema(log10.(dust_N_valid))...; length = 18)
-                    centers, medians = Float64[], Float64[]
-                    for bin in 1:length(edges)-1
-                        members = (dust_N_valid .>= edges[bin]) .& (dust_N_valid .< edges[bin + 1])
-                        any(members) || continue
-                        push!(centers, sqrt(edges[bin] * edges[bin + 1]))
-                        push!(medians, median(dust_p_valid[members]))
+                for label in comparison_run_labels
+                    dust_N_valid = dust_distribution_vectors[label].N
+                    dust_p_valid = dust_distribution_vectors[label].p
+                    sample_step = max(1, cld(length(dust_N_valid), 6000))
+                    sample = 1:sample_step:length(dust_N_valid)
+                    scatter!(ax, dust_N_valid[sample], dust_p_valid[sample];
+                        color = (run_colors[label], 0.16), markersize = 4)
+                    if !isempty(dust_N_valid)
+                        edges = 10 .^ range(extrema(log10.(dust_N_valid))...; length = 18)
+                        centers, medians = Float64[], Float64[]
+                        for bin in 1:length(edges)-1
+                            members = (dust_N_valid .>= edges[bin]) .&
+                                (dust_N_valid .< edges[bin + 1])
+                            any(members) || continue
+                            push!(centers, sqrt(edges[bin] * edges[bin + 1]))
+                            push!(medians, median(dust_p_valid[members]))
+                        end
+                        lines!(ax, centers, medians; color = run_colors[label],
+                            linewidth = 3, label = legend_run_label(label))
+                        scatter!(ax, centers, medians;
+                            color = run_colors[label], markersize = 7)
                     end
-                    lines!(ax, centers, medians; color = MHD_COLORS[2], linewidth = 3)
-                    scatter!(ax, centers, medians; color = MHD_COLORS[2], markersize = 7)
                 end
             else
                 ax = Axis(fig_dust_statistics[1, index], xlabel = L"100p_{\mathrm d}\;[\%]",
                     ylabel = L"\mathrm{PDF}(100p_{\mathrm d})")
-                if !isempty(dust_p_valid)
-                    upper = max(quantile(dust_p_valid, 0.999), 1.0e-6)
-                    hist!(ax, clamp.(dust_p_valid, 0, upper); bins = range(0, upper; length = 45),
-                        normalization = :pdf, color = (:seagreen3, 0.65), strokewidth = 1)
+                for label in comparison_run_labels
+                    dust_p_valid = dust_distribution_vectors[label].p
+                    isempty(dust_p_valid) && continue
+                    histogram = fit(Histogram,
+                        clamp.(dust_p_valid, 0, prevfloat(dust_pdf_upper)),
+                        dust_pdf_edges)
+                    centers = (dust_pdf_edges[1:end-1] .+ dust_pdf_edges[2:end]) ./ 2
+                    probability = histogram.weights ./
+                        max(sum(histogram.weights .* diff(dust_pdf_edges)), eps(Float64))
+                    stairs!(ax, centers, probability; color = run_colors[label],
+                        linewidth = 2.5, step = :center,
+                        label = legend_run_label(label))
                 end
             end
         end
+        Legend(fig_dust_statistics[2, 1:length(dust_stat_specs)],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true, framevisible = false)
     end
     fig_dust_p_column = polarization_column_figure(
         column_density, dust_fraction,
@@ -5641,20 +5749,22 @@ FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 FITSIO = "525bcba6-941b-5504-bd06-fd0dc1a4d2eb"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 LaTeXStrings = "b964fa9f-0449-5b57-a5c2-d3ea65f4040f"
+Pluto = "c3e4b0f8-55cb-11ea-2926-15256bba5781"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
-Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [compat]
-CairoMakie = "~0.15.13"
-FFTW = "~1.10.0"
-FITSIO = "~0.17.5"
-HDF5 = "~0.17.3"
-LaTeXStrings = "~1.4.0"
-PlutoUI = "~0.7.83"
-StatsBase = "~0.34.12"
+CairoMakie = "0.15"
+FFTW = "1.10"
+FITSIO = "0.17"
+HDF5 = "0.17"
+LaTeXStrings = "1.4"
+Pluto = "1"
+PlutoUI = "0.7"
+StatsBase = "0.34"
 julia = "1.11"
 """
 
@@ -5664,7 +5774,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.11.7"
 manifest_format = "2.0"
-project_hash = "1c4e4dab82bb5f78b563c3fcdbe363670c39251d"
+project_hash = "d35da2752d645b5b15e5516bc40c59ff87b7b4e8"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -5774,6 +5884,11 @@ git-tree-sha1 = "8c290a1b223deaeea9aea44b235d24546da8eb98"
 uuid = "18cc8868-cbac-4acf-b575-c8ff214dc66f"
 version = "1.4.0"
 
+[[deps.BitFlags]]
+git-tree-sha1 = "bbe1079eecf9c9fbb52765193ad2bae27ae09bc8"
+uuid = "d1d4a3ce-64b1-5f1a-9ba4-7e7e69966f35"
+version = "0.1.10"
+
 [[deps.Bzip2_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
 git-tree-sha1 = "1b96ea4a01afe0ea4090c5c8039690672dd13f2e"
@@ -5840,6 +5955,12 @@ weakdeps = ["SparseArrays"]
 
     [deps.ChainRulesCore.extensions]
     ChainRulesCoreSparseArraysExt = "SparseArrays"
+
+[[deps.CodecZlib]]
+deps = ["TranscodingStreams", "Zlib_jll"]
+git-tree-sha1 = "962834c22b66e32aa10f7611c08c8ca4e20749a9"
+uuid = "944b1d66-785c-5afd-91f1-9de20f533193"
+version = "0.7.8"
 
 [[deps.CodecZstd]]
 deps = ["TranscodingStreams", "Zstd_jll"]
@@ -5919,6 +6040,18 @@ deps = ["Observables", "Preferences"]
 git-tree-sha1 = "7bc84b769c1d384315e7b5c4ac03a6c303e6cf35"
 uuid = "95dc2771-c249-4cd0-9c9f-1f3b4330693c"
 version = "0.1.8"
+
+[[deps.ConcurrentUtilities]]
+deps = ["Serialization", "Sockets"]
+git-tree-sha1 = "21d088c496ea22914fe80906eb5bce65755e5ec8"
+uuid = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
+version = "2.5.1"
+
+[[deps.Configurations]]
+deps = ["ExproniconLite", "OrderedCollections", "TOML"]
+git-tree-sha1 = "4358750bb58a3caefd5f37a4a0c5bfdbbf075252"
+uuid = "5218b696-f38b-4ac9-8b61-a12ec717816d"
+version = "0.17.6"
 
 [[deps.ConstructionBase]]
 git-tree-sha1 = "b4b092499347b18a015186eae3042f72267106cb"
@@ -6025,11 +6158,27 @@ git-tree-sha1 = "83231673ea4d3d6008ac74dc5079e77ab2209d8f"
 uuid = "429591f6-91af-11e9-00e2-59fbe8cec110"
 version = "2.2.9"
 
+[[deps.ExceptionUnwrapping]]
+deps = ["Test"]
+git-tree-sha1 = "d36f682e590a83d63d1c7dbd287573764682d12a"
+uuid = "460bff9d-24e4-43bc-9d9f-a8973cb893f4"
+version = "0.1.11"
+
 [[deps.Expat_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
 git-tree-sha1 = "e6c4a6407a949e79a9d3f249bf49e6987c80e01f"
 uuid = "2e619515-83b5-522b-bb60-26c02a35a201"
 version = "2.8.2+0"
+
+[[deps.ExpressionExplorer]]
+git-tree-sha1 = "5f1c005ed214356bbe41d442cc1ccd416e510b7e"
+uuid = "21656369-7473-754a-2065-74616d696c43"
+version = "1.1.4"
+
+[[deps.ExproniconLite]]
+git-tree-sha1 = "c13f0b150373771b0fdc1713c97860f8df12e6c2"
+uuid = "55351af7-c7e9-48d6-89ff-24e801d99491"
+version = "0.10.14"
 
 [[deps.FFMPEG_jll]]
 deps = ["Artifacts", "Bzip2_jll", "FreeType2_jll", "FriBidi_jll", "JLLWrappers", "LAME_jll", "Libdl", "Ogg_jll", "OpenSSL_jll", "Opus_jll", "PCRE2_jll", "Zlib_jll", "libaom_jll", "libass_jll", "libfdk_aac_jll", "libva_jll", "libvorbis_jll", "x264_jll", "x265_jll"]
@@ -6066,12 +6215,10 @@ deps = ["Pkg", "Requires", "UUIDs"]
 git-tree-sha1 = "6621fef488e496356c9c9625d0562c12a6070819"
 uuid = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 version = "1.20.0"
+weakdeps = ["HTTP"]
 
     [deps.FileIO.extensions]
     HTTPExt = "HTTP"
-
-    [deps.FileIO.weakdeps]
-    HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 
 [[deps.FilePaths]]
 deps = ["FilePathsBase", "MacroTools", "Reexport"]
@@ -6197,6 +6344,12 @@ git-tree-sha1 = "24f6def62397474a297bfcec22384101609142ed"
 uuid = "7746bdde-850d-59dc-9ae8-88ece973131d"
 version = "2.86.3+0"
 
+[[deps.GracefulPkg]]
+deps = ["Compat", "Pkg", "TOML"]
+git-tree-sha1 = "a854d6c0e9fb561b88cd20b4ad64f518cb1bfb8d"
+uuid = "828d9ff0-206c-6161-646e-6576656f7244"
+version = "2.4.3"
+
 [[deps.Graphics]]
 deps = ["Colors", "LinearAlgebra", "NaNMath"]
 git-tree-sha1 = "a641238db938fff9b2f60d08ed9030387daf428c"
@@ -6232,6 +6385,12 @@ deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LibCURL_jll
 git-tree-sha1 = "45337643a2d97262d5fe72ce1f13e8a662d13d62"
 uuid = "0234f1f7-429e-5d53-9886-15a909be8d59"
 version = "2.1.2+0"
+
+[[deps.HTTP]]
+deps = ["Base64", "CodecZlib", "ConcurrentUtilities", "Dates", "ExceptionUnwrapping", "Logging", "LoggingExtras", "MbedTLS", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "SimpleBufferStream", "Sockets", "URIs", "UUIDs"]
+git-tree-sha1 = "51059d23c8bb67911a2e6fd5130229113735fc7e"
+uuid = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+version = "1.11.0"
 
 [[deps.HarfBuzz_jll]]
 deps = ["Artifacts", "Cairo_jll", "Fontconfig_jll", "FreeType2_jll", "Glib_jll", "Graphite2_jll", "JLLWrappers", "Libdl", "Libffi_jll"]
@@ -6471,10 +6630,24 @@ git-tree-sha1 = "b7970cef8ae1c990ba0c09cd8bdc1145e006632f"
 uuid = "1d63c593-3942-5779-bab2-d838dc0a180e"
 version = "22.1.7+0"
 
+[[deps.LRUCache]]
+git-tree-sha1 = "5519b95a490ff5fe629c4a7aa3b3dfc9160498b3"
+uuid = "8ac3fa9e-de4c-5943-b1dc-09c6b5f20637"
+version = "1.6.2"
+weakdeps = ["Serialization"]
+
+    [deps.LRUCache.extensions]
+    SerializationExt = ["Serialization"]
+
 [[deps.LaTeXStrings]]
 git-tree-sha1 = "dda21b8cbd6a6c40d9d02a73230f9d70fed6918c"
 uuid = "b964fa9f-0449-5b57-a5c2-d3ea65f4040f"
 version = "1.4.0"
+
+[[deps.LazilyInitializedFields]]
+git-tree-sha1 = "0f2da712350b020bc3957f269c9caad516383ee0"
+uuid = "0e77f7df-68c5-4e49-93ce-4cd80f5598bf"
+version = "1.3.0"
 
 [[deps.LazyArtifacts]]
 deps = ["Artifacts", "Pkg"]
@@ -6576,6 +6749,12 @@ version = "1.0.1"
 uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
 
+[[deps.LoggingExtras]]
+deps = ["Dates", "Logging"]
+git-tree-sha1 = "f00544d95982ea270145636c181ceda21c4e2575"
+uuid = "e6f89c97-d47a-5376-807f-9c37f3926c36"
+version = "1.2.0"
+
 [[deps.MIMEs]]
 git-tree-sha1 = "c64d943587f7187e751162b3b84445bbbd79f691"
 uuid = "6c6e2e6c-3030-632d-7369-2d6c69616d65"
@@ -6628,6 +6807,12 @@ version = "0.24.13"
     [deps.Makie.weakdeps]
     DynamicQuantities = "06fc5a27-2a28-4c7c-a15d-362465fb6821"
 
+[[deps.Malt]]
+deps = ["Distributed", "Logging", "RelocatableFolders", "Serialization", "Sockets"]
+git-tree-sha1 = "c2335b4e291f2422e2be8abf8936ccad58a98992"
+uuid = "36869731-bdee-424d-aa32-cab38c994e3b"
+version = "1.4.1"
+
 [[deps.MappedArrays]]
 git-tree-sha1 = "0ee4497a4e80dbd29c058fcee6493f5219556f40"
 uuid = "dbb5928d-eab1-5f90-85c2-b9b0edb7c900"
@@ -6643,6 +6828,12 @@ deps = ["AbstractTrees", "Automa", "DataStructures", "FreeTypeAbstraction", "Geo
 git-tree-sha1 = "aa1078778be5a8e5259ff04fbc3d258b3e78d464"
 uuid = "0a4f8689-d25c-4efe-a92b-7142dfc1aa53"
 version = "0.6.9"
+
+[[deps.MbedTLS]]
+deps = ["Dates", "MbedTLS_jll", "MozillaCACerts_jll", "NetworkOptions", "Random", "Sockets"]
+git-tree-sha1 = "8785729fa736197687541f7053f6d8ab7fc44f92"
+uuid = "739be429-bea8-5141-9913-cc70e7f3736d"
+version = "1.1.10"
 
 [[deps.MbedTLS_jll]]
 deps = ["Artifacts", "Libdl"]
@@ -6674,6 +6865,12 @@ version = "0.3.4"
 [[deps.MozillaCACerts_jll]]
 uuid = "14a3606d-f60d-562e-9121-12d972cd8159"
 version = "2023.12.12"
+
+[[deps.MsgPack]]
+deps = ["Serialization"]
+git-tree-sha1 = "f5db02ae992c260e4826fe78c942954b48e1d9c2"
+uuid = "99f44e22-a591-53d1-9472-aa23ef4bd671"
+version = "1.2.1"
 
 [[deps.MuladdMacro]]
 deps = ["PrecompileTools"]
@@ -6751,6 +6948,12 @@ git-tree-sha1 = "6d6c0ca4824268c1a7dca1f4721c535ac63d9074"
 uuid = "fe0851c0-eecd-5654-98d4-656369965a5c"
 version = "5.0.11+0"
 
+[[deps.OpenSSL]]
+deps = ["BitFlags", "Dates", "MozillaCACerts_jll", "NetworkOptions", "OpenSSL_jll", "Sockets"]
+git-tree-sha1 = "1d1aaa7d449b58415f97d2839c318b70ffb525a0"
+uuid = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
+version = "1.6.1"
+
 [[deps.OpenSSL_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
 git-tree-sha1 = "d8cce34295c55f47be683580f44791716045b8fe"
@@ -6770,9 +6973,9 @@ uuid = "91d4177d-7536-5919-b921-800302f37372"
 version = "1.6.1+0"
 
 [[deps.OrderedCollections]]
-git-tree-sha1 = "05f45c2e0de6259db764adbfd2f1dc6d3f8de13c"
+git-tree-sha1 = "94ba93778373a53bfd5a0caaf7d809c445292ff4"
 uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
-version = "2.0.1"
+version = "1.8.2"
 
 [[deps.PCRE2_jll]]
 deps = ["Artifacts", "Libdl"]
@@ -6846,6 +7049,18 @@ git-tree-sha1 = "26ca162858917496748aad52bb5d3be4d26a228a"
 uuid = "995b91a9-d308-5afd-9ec6-746e21dbc043"
 version = "1.4.4"
 
+[[deps.Pluto]]
+deps = ["Base64", "Configurations", "Dates", "Downloads", "ExpressionExplorer", "FileWatching", "GracefulPkg", "HTTP", "HypertextLiteral", "InteractiveUtils", "LRUCache", "Logging", "LoggingExtras", "MIMEs", "Malt", "Markdown", "MsgPack", "Pkg", "PlutoDependencyExplorer", "PrecompileSignatures", "PrecompileTools", "REPL", "Random", "RegistryInstances", "RelocatableFolders", "SHA", "Scratch", "Sockets", "TOML", "Tables", "URIs", "UUIDs"]
+git-tree-sha1 = "fe7515cf6ddb62e738d924e4ca2dddaa60ff80ba"
+uuid = "c3e4b0f8-55cb-11ea-2926-15256bba5781"
+version = "1.0.3"
+
+[[deps.PlutoDependencyExplorer]]
+deps = ["ExpressionExplorer", "InteractiveUtils", "Markdown"]
+git-tree-sha1 = "c3e5073a977b1c58b2d55c1ec187c3737e64e6af"
+uuid = "72656b73-756c-7461-726b-72656b6b696b"
+version = "1.2.2"
+
 [[deps.PlutoUI]]
 deps = ["AbstractPlutoDingetjes", "Base64", "ColorTypes", "Dates", "Downloads", "FixedPointNumbers", "Hyperscript", "HypertextLiteral", "IOCapture", "InteractiveUtils", "Logging", "MIMEs", "Markdown", "Random", "Reexport", "URIs", "UUIDs"]
 git-tree-sha1 = "e189d0623e7ce9c37389bac17e80aac3b0302e75"
@@ -6856,6 +7071,11 @@ version = "0.7.83"
 git-tree-sha1 = "77b3d3605fc1cd0b42d95eba87dfcd2bf67d5ff6"
 uuid = "647866c9-e3ac-4575-94e7-e3d426903924"
 version = "0.1.2"
+
+[[deps.PrecompileSignatures]]
+git-tree-sha1 = "18ef344185f25ee9d51d80e179f8dad33dc48eb1"
+uuid = "91cefc8d-f054-46dc-8f8c-26e11d7c5411"
+version = "3.0.3"
 
 [[deps.PrecompileTools]]
 deps = ["Preferences"]
@@ -6938,6 +7158,12 @@ weakdeps = ["FixedPointNumbers"]
 git-tree-sha1 = "45e428421666073eab6f2da5c9d310d99bb12f9b"
 uuid = "189a3867-3050-52da-a836-e630ba90ab69"
 version = "1.2.2"
+
+[[deps.RegistryInstances]]
+deps = ["LazilyInitializedFields", "Pkg", "TOML", "Tar"]
+git-tree-sha1 = "ffd19052caf598b8653b99404058fce14828be51"
+uuid = "2792f1a3-b283-48e8-9a74-f99dce5104f3"
+version = "0.1.0"
 
 [[deps.RelocatableFolders]]
 deps = ["SHA", "Scratch"]
@@ -7026,6 +7252,11 @@ deps = ["Statistics"]
 git-tree-sha1 = "3949ad92e1c9d2ff0cd4a1317d5ecbba682f4b92"
 uuid = "73760f76-fbc4-59ce-8f25-708e95d2df96"
 version = "0.4.1"
+
+[[deps.SimpleBufferStream]]
+git-tree-sha1 = "f305871d2f381d21527c770d4788c06c097c9bc1"
+uuid = "777ac1f9-54b0-4bf8-805c-2214025038e7"
+version = "1.2.0"
 
 [[deps.SimpleTraits]]
 deps = ["InteractiveUtils", "MacroTools"]

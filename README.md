@@ -16,20 +16,24 @@ The notebooks read HDF5 or FITS simulation snapshots, expose the main physical a
 | `starlightpol.jl` | Dichroic starlight polarization using cell-by-cell Mueller propagation, with structure functions for all projected Stokes and derived maps. |
 
 The five synthetic-observation notebooks compute axis-averaged, periodic, two-dimensional structure functions for every scalar sky map. Their common controls are in **Shared observational beam**: enable or disable the figures, select the order $p$, and choose the number of sampled separations. Polarization-angle increments use the shortest difference modulo $180^\circ$.
+
+All figures use LaTeX rendering consistently for x- and y-axis labels, numeric tick labels, and colorbar labels and ticks. Scientific-notation ticks are rendered as $a\times10^b$ rather than as plain-text Unicode.
 | `run_pluto.jl` | Interactive launcher that asks which notebook to open. |
 | `export_html.jl` | Executes one notebook from top to bottom and exports a self-contained HTML snapshot. |
 | `dynamo_diagnostics.jl` | Master notebook containing every analysis section. This is the source of truth for shared code. |
 | `split_notebooks.jl` | Regenerates the six focused notebooks from the master notebook and its dependency graph. |
-| `Project.toml`, `Manifest.toml` | Reproducible Julia environment and exact package versions. |
+| `Project.toml`, `Manifest-v1.11.toml`, `Manifest-v1.12.toml` | Reproducible environments with dependency versions resolved separately for Julia 1.11 and 1.12. |
 
 ## Requirements
 
-- Julia 1.11 (Julia 1.11.7 is the tested version).
+- Julia 1.11 or Julia 1.12 (tested with Julia 1.11.7 and 1.12.6).
 - A modern web browser.
 - Access to HDF5 or FITS simulation snapshots.
 - SSH access if Pluto is run on a remote server.
 
-The Julia packages are declared in `Project.toml`; no manual package-by-package installation is required.
+The Julia packages are declared in `Project.toml`; no manual package-by-package installation is required. Direct dependencies include Pluto, PlutoUI, CairoMakie, FFTW, FITSIO, HDF5, LaTeXStrings, StatsBase, and the required Julia standard libraries. `Manifest-v1.11.toml` and `Manifest-v1.12.toml` lock the complete dependency graph separately for the two supported Julia versions. Julia automatically selects the matching file.
+
+Each generated notebook also embeds the same `Project.toml` and `Manifest.toml`, so opening a focused notebook directly in Pluto uses the reproducible environment rather than an unrelated global Julia environment.
 
 ## Quick start on a local computer
 
@@ -40,7 +44,7 @@ git clone https://github.com/J-Berat/Houches2026.git
 cd Houches2026
 ```
 
-Install the project dependencies once after cloning (and again only when `Manifest.toml` changes):
+Install the project dependencies once after cloning (and again when the manifest for your Julia version changes):
 
 ```bash
 julia --project=. -e 'import Pkg; Pkg.instantiate()'
@@ -52,7 +56,7 @@ Start the interactive launcher:
 julia --project=. run_pluto.jl
 ```
 
-The launcher displays a numbered menu and opens the selected notebook without repeating the package-installation step. For example:
+At startup, the launcher prints the Julia version and the selected manifest. For Julia 1.11 it must report `Manifest-v1.11.toml`; for Julia 1.12 it must report `Manifest-v1.12.toml`. It then displays a numbered menu and opens the selected notebook without repeating the package-installation step. For example:
 
 ```text
 1. Dynamo
@@ -193,7 +197,7 @@ The notebooks start in lazy mode: expensive calculations do not run immediately.
 
 Pluto automatically evaluates every upstream dependency required by that result. This is usually faster and uses less memory than running the entire notebook.
 
-For comparative diagnostics, select the desired simulations under **Simulations in comparative plots**. The project enforces a maximum of three simultaneously opened simulations. Single-snapshot panels use the active **Run** and **Snapshot** selections.
+For comparative diagnostics, select any number of simulations under **Simulations in comparative plots**. One simulation is selected initially to keep startup light. Comparative PDFs, distributions, and histograms use the chosen snapshot index for every selected run; if a run is shorter, its last available snapshot is used. Spatial maps continue to use the active **Run** and **Snapshot** selections.
 
 ## Exporting a complete notebook to HTML
 
@@ -242,7 +246,7 @@ Boolean values such as `1`, `true`, `yes`, and `on` are accepted for `PLUTO_LAUN
 
 ### `julia` is not recognized
 
-Julia is not available on your `PATH`. Load the Julia module provided by the server, or install Julia 1.11 and start a new terminal. Confirm the installation with `julia --version`.
+Julia is not available on your `PATH`. Load the Julia module provided by the server, or install Julia 1.11/1.12 and start a new terminal. Confirm the installation with `julia --version`.
 
 ### Packages are missing
 
@@ -282,13 +286,13 @@ Read the accepted aliases shown in the mapping table, inspect the available-data
 
 ### Calculations use too much memory
 
-Keep lazy execution enabled, run only the needed result cells, reduce the number of selected maps or channels, and keep the simulation comparison limit at three or fewer.
+Keep lazy execution enabled, run only the needed result cells, and reduce the number of selected simulations, maps, or spectral channels when memory is limited.
 
 ## Reproducibility notes
 
 - Physical units and conversion factors are visible near the top of each notebook.
 - Density-weighted projections, periodic-boundary operations, and observational conventions are documented beside their controls.
-- `Manifest.toml` records the tested dependency versions.
+- `Manifest-v1.11.toml` and `Manifest-v1.12.toml` record dependency graphs resolved by the corresponding Julia versions. The generic `Manifest.toml` is kept only as a fallback for older tooling.
 - The instrument-noise options use an explicit random seed.
 - HTML export fails rather than silently publishing a notebook with errored cells.
 
@@ -299,6 +303,8 @@ Houches2026/
 ├── README.md
 ├── Project.toml
 ├── Manifest.toml
+├── Manifest-v1.11.toml
+├── Manifest-v1.12.toml
 ├── run_pluto.jl
 ├── export_html.jl
 ├── split_notebooks.jl

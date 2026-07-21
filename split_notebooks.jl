@@ -120,7 +120,10 @@ function build_notebook(source, spec)
             hero_code(spec.title, spec.summary, spec.filename)))
 
     output_path = joinpath(@__DIR__, spec.filename)
-    Pluto.save_notebook(Pluto.Notebook(output_cells, output_path), output_path)
+    output_notebook = Pluto.Notebook(output_cells, output_path)
+    output_notebook.nbpkg_ctx = source.nbpkg_ctx
+    output_notebook.nbpkg_ctx_instantiated = source.nbpkg_ctx_instantiated
+    Pluto.save_notebook(output_notebook, output_path)
     println(rpad(spec.filename, 20), length(output_cells), " cells")
 end
 

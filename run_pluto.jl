@@ -2,6 +2,14 @@ import Pkg
 
 Pkg.activate(@__DIR__)
 
+if VERSION < v"1.11" || VERSION >= v"1.13"
+    @warn "This repository is tested with Julia 1.11 and 1.12." julia_version = VERSION
+end
+
+active_manifest = Pkg.Types.Context().env.manifest_file
+println("Julia version: ", VERSION)
+println("Dependency manifest: ", basename(active_manifest))
+
 try
     @eval using Pluto
 catch
@@ -72,10 +80,10 @@ notebook = abspath(joinpath(@__DIR__, notebook_name))
 isfile(notebook) || error("Notebook not found: $notebook")
 
 parse_boolean(value) = lowercase(strip(value)) in ("1", "true", "yes", "y", "on")
-pluto_host = get(ENV, "PLUTO_HOST", "127.0.0.1")
-pluto_port = parse(Int, get(ENV, "PLUTO_PORT", "1234"))
+pluto_host = get(ENV, "HOST", "127.0.0.1")
+pluto_port = parse(Int, get(ENV, "PORT", "1234"))
 default_browser_setting = Sys.isapple() || Sys.iswindows()
-launch_browser = parse_boolean(get(ENV, "PLUTO_LAUNCH_BROWSER",
+launch_browser = parse_boolean(get(ENV, "LAUNCH_BROWSER",
     string(default_browser_setting)))
 
 println("Opening Pluto for: $notebook")

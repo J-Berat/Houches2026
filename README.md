@@ -41,12 +41,6 @@ cd Houches2026
 Start the interactive launcher:
 
 ```bash
-julia +1.11.7 --project=. run_pluto.jl
-```
-
-If Julia was not installed through `juliaup`, use this instead:
-
-```bash
 julia --project=. run_pluto.jl
 ```
 
@@ -66,7 +60,7 @@ Enter a number from 1 to 6. On macOS or Windows, the browser opens automatically
 You may also bypass the menu:
 
 ```bash
-julia +1.11.7 --project=. run_pluto.jl dust
+julia --project=. run_pluto.jl dust
 ```
 
 The argument may be `dynamo`, `dust`, `moose`, `shine`, `zeeman`, or `starlightpol`, with or without the `.jl` extension.
@@ -75,23 +69,25 @@ The argument may be `dynamo`, `dust`, `moose`, `shine`, `zeeman`, or `starlightp
 
 Pluto runs on the server, while the web interface is displayed in your local browser. Keep the SSH connection open for the entire session.
 
+On a shared server, **do not rely on Pluto's default port**. Choose an unused personal port for every session to avoid collisions with other users. The example below uses `15432`; replace it with another port if necessary. The same port number must be used in both the SSH tunnel and the `PLUTO_PORT` variable.
+
 ### 1. Open an SSH tunnel from your local computer
 
 ```bash
-ssh -L 1234:127.0.0.1:1234 PSMN_sr650node230
+ssh -L 15432:127.0.0.1:15432 PSMN_sr650node230
 ```
 
 ### 2. Start Pluto on the server
 
 ```bash
 cd /Xnfs/Houches2026/DynSim/notebooks
-julia +1.11.7 --project=. run_pluto.jl
+PLUTO_PORT=15432 julia --project=. run_pluto.jl
 ```
 
 Choose a notebook from the menu. Pluto prints a URL containing a session secret, similar to:
 
 ```text
-http://localhost:1234/?secret=...
+http://localhost:15432/?secret=...
 ```
 
 Open that exact URL in the browser on your local computer. The SSH tunnel securely forwards it to the server.
@@ -110,7 +106,7 @@ To select a repository before starting Pluto:
 
 ```bash
 export DYNAMO_DATA_REPOSITORY=/path/to/your/simulations
-julia +1.11.7 --project=. run_pluto.jl
+julia --project=. run_pluto.jl
 ```
 
 You can also change the path interactively in the notebook and click **Load path**.
@@ -187,7 +183,7 @@ For comparative diagnostics, select the desired simulations under **Simulations 
 The HTML exporter evaluates every cell and stops if any cell fails. Select a notebook with `DYNAMO_NOTEBOOK`:
 
 ```bash
-DYNAMO_NOTEBOOK=dust.jl julia +1.11.7 --project=. export_html.jl
+DYNAMO_NOTEBOOK=dust.jl julia --project=. export_html.jl
 ```
 
 This creates `dust.html` beside the notebook. To choose another output path:
@@ -195,7 +191,7 @@ This creates `dust.html` beside the notebook. To choose another output path:
 ```bash
 DYNAMO_NOTEBOOK=dust.jl \
 DYNAMO_HTML_PATH=/path/to/results/dust.html \
-julia +1.11.7 --project=. export_html.jl
+julia --project=. export_html.jl
 ```
 
 The exported HTML is a read-only snapshot. Interactive controls require a live Pluto session.
@@ -205,7 +201,7 @@ The exported HTML is a read-only snapshot. Interactive controls require a live P
 Shared logic should be edited in `dynamo_diagnostics.jl`. Then regenerate all focused notebooks with:
 
 ```bash
-julia +1.11.7 --project=. split_notebooks.jl
+julia --project=. split_notebooks.jl
 ```
 
 The generator uses Pluto's dependency graph to include only the cells needed by each focused notebook.
@@ -220,43 +216,43 @@ The generator uses Pluto's dependency graph to include only the cells needed by 
 | `DYNAMO_NOTEBOOK` | Notebook used by the launcher or HTML exporter | Interactive menu for launcher; `dynamo.jl` for exporter |
 | `DYNAMO_HTML_PATH` | HTML export destination | `<notebook-name>.html` |
 | `PLUTO_HOST` | Pluto listening address | `127.0.0.1` |
-| `PLUTO_PORT` | Pluto web-interface port | `1234` |
+| `PLUTO_PORT` | Pluto web-interface port | `1234` locally; set an unused personal port explicitly on a shared server |
 | `PLUTO_LAUNCH_BROWSER` | Whether the launcher opens a browser | `true` on macOS/Windows, `false` on Linux |
 
 Boolean values such as `1`, `true`, `yes`, and `on` are accepted for `PLUTO_LAUNCH_BROWSER`.
 
 ## Troubleshooting
 
-### `julia +1.11.7` is not recognized
+### `julia` is not recognized
 
-Use `julia --project=.` instead, or install Julia 1.11 with `juliaup`.
+Julia is not available on your `PATH`. Load the Julia module provided by the server, or install Julia 1.11 and start a new terminal. Confirm the installation with `julia --version`.
 
 ### Packages are missing
 
 Run:
 
 ```bash
-julia +1.11.7 --project=. -e 'import Pkg; Pkg.instantiate()'
+julia --project=. -e 'import Pkg; Pkg.instantiate()'
 ```
 
 ### The browser cannot reach Pluto on the server
 
 Confirm that:
 
-- the SSH session with `-L 1234:127.0.0.1:1234` is still open;
-- Pluto is running on port 1234;
+- the SSH session containing the port-forwarding option is still open;
+- the local forwarding port, remote forwarding port, and `PLUTO_PORT` value are identical;
 - you opened the complete URL printed by Pluto, including its `?secret=...` token.
 
-If port 1234 is already used, choose another port on both sides:
+If the selected port is already used, stop Pluto and choose a different number on both sides. For example:
 
 ```bash
-ssh -L 1240:127.0.0.1:1240 PSMN_sr650node230
+ssh -L 16543:127.0.0.1:16543 PSMN_sr650node230
 ```
 
 Then, on the server:
 
 ```bash
-PLUTO_PORT=1240 julia +1.11.7 --project=. run_pluto.jl
+PLUTO_PORT=16543 julia --project=. run_pluto.jl
 ```
 
 ### No snapshots are found

@@ -1218,7 +1218,7 @@ begin
         md"""
         ### HDF5 field mapping
 
-        Reference file: `$(HDF5_REFERENCE_FILE)`
+        Reference file: **$(HDF5_REFERENCE_FILE)**
 
         Automatic mapping is used only for a **single** alias match. If the result is ambiguous or absent, explicitly choose the intended dataset. A manual choice overrides aliases.
 
@@ -1352,8 +1352,7 @@ md"""
 | Navigation | Control |
 |:--|:--|
 | Run | $(@bind selected_run PlutoUI.Select(run_labels; default = run_labels[cld(length(run_labels), 2)])) |
-| Maximum simulations opened | $(@bind maximum_open_cubes PlutoUI.NumberField(1:min(3, length(run_labels)); default = min(3, length(run_labels)))) |
-| Simulations in comparative plots | $(@bind comparison_run_selection PlutoUI.MultiSelect(run_labels; default = run_labels[1:min(3, length(run_labels))])) |
+| Simulations in comparative plots | $(@bind comparison_run_selection PlutoUI.MultiSelect(run_labels; default = [run_labels[cld(length(run_labels), 2)]])) |
 | Snapshot | $(@bind selected_snapshot PlutoUI.Slider(1:length(run_files[selected_run]); default = length(run_files[selected_run]), show_value = true)) |
 | Line of sight | $(@bind los_name PlutoUI.Select(["x", "y", "z"]; default = "z")) |
 """

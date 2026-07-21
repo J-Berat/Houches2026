@@ -1218,7 +1218,7 @@ begin
         md"""
         ### HDF5 field mapping
 
-        Reference file: `$(HDF5_REFERENCE_FILE)`
+        Reference file: **$(HDF5_REFERENCE_FILE)**
 
         Automatic mapping is used only for a **single** alias match. If the result is ambiguous or absent, explicitly choose the intended dataset. A manual choice overrides aliases.
 
@@ -1354,7 +1354,7 @@ Markdown.parse("""
 | Item | Active value |
 |:--|:--|
 | Comparison parameter | $(comparison_parameter) |
-| Resolved data root | `$(ROOT)` |
+| Resolved data root | **$(ROOT)** |
 | Discovered runs | $(run_summary) |
 """)
 
@@ -1371,7 +1371,7 @@ Comparative figures automatically detect the parameter varied from the selected 
 For a multi-extension FITS snapshot, use `EXTNAME` values such as `RHO`, `PRESSURE`, `VX`, `VY`, `VZ`, and either `BX`, `BY`, `BZ` or the face pairs `BX_L/BX_R`, `BY_L/BY_R`, `BZ_L/BZ_R`. The same names may be used as filenames inside one directory per snapshot. `L` and `TIME` are optional image extensions; the loader also accepts `LBOX`, `BOXSIZE`, `CDELT1..3`, `TIME`, `T`, or `SIMTIME` header keywords. If time metadata are absent, the final number in the filename or snapshot-directory name is used.
 
 > **Analysis scope.** The **Run** and **Snapshot** controls select the active three-dimensional cube used by maps, PDFs, spectra, structure functions, and synthetic observations. **Simulations in comparative plots** independently selects the runs used by time histories, growth-rate relations, phase curves, and comparative energy or enstrophy diagnostics.
-The **Maximum simulations opened** control limits the active cube plus the comparative simulations evaluated in the notebook. At most three simulations can be opened and compared at once.
+At startup, the active run is the only simulation selected for comparative plots. Add as many runs as needed with **Simulations in comparative plots**; every selected run is included.
 
 - The adiabatic index $\gamma$ sets the sound-speed and thermal-energy convention.
 - The mean particle mass $\mu m_{\mathrm H}$ defines $n=\rho/(\mu m_{\mathrm H})$ and $T=\mu m_{\mathrm H}P/(k_{\mathrm B}\rho)$.
@@ -1385,8 +1385,7 @@ md"""
 | Navigation | Control |
 |:--|:--|
 | Run | $(@bind selected_run PlutoUI.Select(run_labels; default = run_labels[cld(length(run_labels), 2)])) |
-| Maximum simulations opened | $(@bind maximum_open_cubes PlutoUI.NumberField(1:min(3, length(run_labels)); default = min(3, length(run_labels)))) |
-| Simulations in comparative plots | $(@bind comparison_run_selection PlutoUI.MultiSelect(run_labels; default = run_labels[1:min(3, length(run_labels))])) |
+| Simulations in comparative plots | $(@bind comparison_run_selection PlutoUI.MultiSelect(run_labels; default = [run_labels[cld(length(run_labels), 2)]])) |
 | Snapshot | $(@bind selected_snapshot PlutoUI.Slider(1:length(run_files[selected_run]); default = length(run_files[selected_run]), show_value = true)) |
 | Line of sight | $(@bind los_name PlutoUI.Select(["x", "y", "z"]; default = "z")) |
 """
@@ -1411,22 +1410,15 @@ md"""
 begin
     requested_comparison_run_labels =
         [label for label in run_labels if label in comparison_run_selection]
-    open_cube_limit = min(clamp(Int(maximum_open_cubes), 1, length(run_labels)), 3)
     requested_open_labels = unique(vcat([selected_run], requested_comparison_run_labels))
-    analysis_series_labels = requested_open_labels[1:min(open_cube_limit, length(requested_open_labels))]
-    comparison_run_labels =
-        [label for label in requested_comparison_run_labels if label in analysis_series_labels]
+    analysis_series_labels = requested_open_labels
+    comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
-    comparison_selection_truncated =
-        length(requested_open_labels) > length(analysis_series_labels)
     active_time_value = run_times[selected_run][selected_snapshot] * time_unit_Myr
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
     open_cubes_text = join(analysis_series_labels, ", ")
-    cube_limit_status = comparison_selection_truncated ?
-        "$(length(analysis_series_labels)) / $(open_cube_limit) — extra selections ignored" :
-        "$(length(analysis_series_labels)) / $(open_cube_limit)"
     active_snapshot_format = snapshot_format(run_files[selected_run][selected_snapshot])
     Markdown.parse("""
     ### Active selection
@@ -1438,7 +1430,7 @@ begin
     | Input format | **$(active_snapshot_format)** |
     | Physical time | **$(active_time_text)** ``\\mathrm{Myr}`` |
     | Line of sight | **$(los_name)** |
-    | Cubes opened / limit | **$(cube_limit_status)** |
+    | Cubes opened | **$(length(analysis_series_labels))** |
     | Open cubes | **$(open_cubes_text)** |
     | Comparative simulations | **$(comparison_runs_text)** |
     | Family comparison variable | **$(comparison_parameter)** |
@@ -1858,7 +1850,7 @@ begin
 
     | Property | Value |
     |:--|:--|
-    | Source | `$(source_text)` |
+    | Source | **$(source_text)** |
     | Grid shape | **$(join(size(cube.rho), " × "))** |
     | Physical box | **$(@sprintf("%.5g × %.5g × %.5g", cube.L...))** ``\\mathrm{pc}^3`` |
     | Approximate field memory | **$(@sprintf("%.2f", cube_memory_mib)) MiB** |

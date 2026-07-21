@@ -1844,6 +1844,9 @@ This order captures beam depolarization and avoids the incorrect operation of sm
 | Major-axis FWHM | $(@bind observational_beam_fwhm_major PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
 | Minor-axis FWHM | $(@bind observational_beam_fwhm_minor PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
 | Position angle [$^\circ$] | $(@bind observational_beam_pa_deg PlutoUI.Slider(0.0:1.0:180.0; default = 0.0, show_value = true)) |
+| Display observable structure functions | $(@bind display_observational_structure_functions PlutoUI.CheckBox(default = true)) |
+| Observable structure-function order $p$ | $(@bind observational_structure_order PlutoUI.Slider(1:4; default = 2, show_value = true)) |
+| Number of observable separation samples | $(@bind observational_structure_samples PlutoUI.Slider(4:2:20; default = 10, show_value = true)) |
 """
 
 # ╔═╡ 47b786d6-c7b5-44f4-946a-b8c485ad6380
@@ -1906,6 +1909,73 @@ begin
                 cube_xyν[:, :, channel], major, minor, observational_beam_pa_deg)
         end
         output
+    end
+
+    "Axis-averaged periodic scalar structure function of a two-dimensional map."
+    function scalar_structure_function_2d(field, lags, order; period = nothing)
+        ndims(field) == 2 || error("Projected structure functions require a 2-D map.")
+        data = Float64.(field)
+        shifted = similar(data)
+        values = zeros(Float64, length(lags))
+        for (lag_index, lag) in pairs(lags)
+            moment_sum = 0.0
+            moment_count = 0
+            for dimension in 1:2
+                shift = ntuple(d -> d == dimension ? lag : 0, 2)
+                circshift!(shifted, data, shift)
+                for index in eachindex(data)
+                    increment = shifted[index] - data[index]
+                    if !isnothing(period)
+                        increment = mod(increment + period / 2, period) - period / 2
+                    end
+                    moment = abs(increment)^order
+                    if isfinite(moment)
+                        moment_sum += moment
+                        moment_count += 1
+                    end
+                end
+            end
+            values[lag_index] = moment_count > 0 ? moment_sum / moment_count : NaN
+        end
+        values
+    end
+
+    "Plot projected structure functions for a collection of observable maps."
+    function observational_structure_figure(specs, c, plane_dims, order, samples;
+            heading = "Projected observable structure functions")
+        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
+        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
+            length = Int(samples)))))
+        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
+            for dimension in plane_dims)
+        separations_pc = lags .* pixel_scale_pc
+        ncols = min(2, length(specs))
+        nrows = cld(length(specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 55))
+        Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
+        for (spec_index, spec) in enumerate(specs)
+            row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
+            axis = Axis(figure[row, column],
+                xlabel = L"\ell\;[\mathrm{pc}]",
+                ylabel = latexstring("S_{", order, "}(\\ell)"),
+                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
+            values = scalar_structure_function_2d(spec.data, lags, order;
+                period = spec.period)
+            valid = isfinite.(values) .& (values .> 0)
+            if any(valid)
+                lines!(axis, separations_pc[valid], values[valid];
+                    color = spec.color, linewidth = 2.5)
+                scatter!(axis, separations_pc[valid], values[valid];
+                    color = spec.color, markersize = 6)
+            else
+                text!(axis, 0.5, 0.5; text = "constant or invalid map",
+                    space = :relative, align = (:center, :center))
+            end
+        end
+        figure
     end
 
     function moose_instrument_transfer(map_size, largest_scale_pix, smallest_scale_pix)
@@ -2229,6 +2299,23 @@ begin
     display_dust_statistics ? fig_dust_statistics : nothing
 end
 
+# ╔═╡ a0010001-6f8c-4d0c-9a10-000000000001
+begin
+    dust_structure_specs = [
+        (data = dust_I, label = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[1], period = nothing),
+        (data = dust_Q, label = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[2], period = nothing),
+        (data = dust_U, label = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[3], period = nothing),
+        (data = dust_P, label = L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[4], period = nothing),
+        (data = dust_fraction, label = L"p_{\mathrm d}", color = MHD_COLORS[5], period = nothing),
+        (data = dust_angle_deg, label = L"\psi_{\mathrm d}\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
+    ]
+    fig_dust_structure = display_observational_structure_functions ?
+        observational_structure_figure(dust_structure_specs, cube, sky_dims,
+            observational_structure_order, observational_structure_samples;
+            heading = "Dust observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_dust_structure : nothing
+end
+
 # ╔═╡ Cell order:
 # ╟─34d6b5f4-9c2d-42d5-9034-543aeb8ae151
 # ╟─8f1f1d9a-e6df-4dd1-b5b3-2d2c52c86686
@@ -2251,3 +2338,4 @@ end
 # ╟─130ccf03-d7cc-4b71-9210-dbc0e43dfa82
 # ╟─5b3f6a91-246e-4cc3-8f68-164f7ff2f07c
 # ╟─61c3b28c-9d62-4689-a85d-bc827e89641d
+# ╠═a0010001-6f8c-4d0c-9a10-000000000001

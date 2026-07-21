@@ -9,11 +9,13 @@ The notebooks read HDF5 or FITS simulation snapshots, expose the main physical a
 | File | Purpose |
 |---|---|
 | `dynamo.jl` | General MHD diagnostics: maps, PDFs, phase diagrams, magnetic growth, energy ratios, vorticity, spectra, and structure functions. |
-| `dust.jl` | Synthetic thermal-dust Stokes emission and polarization diagnostics. |
-| `moose.jl` | MOOSE synchrotron emission, Faraday rotation, interferometric filtering, and RM synthesis. |
-| `shine.jl` | SHINE synthetic H I 21-cm emission, phase-separated columns, velocity moments, spectra, and RGB composites. |
-| `zeeman.jl` | Synthetic H I Stokes-I/V spectra and Zeeman magnetic-field recovery. |
-| `starlightpol.jl` | Dichroic starlight polarization using cell-by-cell Mueller propagation. |
+| `dust.jl` | Synthetic thermal-dust Stokes emission, polarization diagnostics, and structure functions for every projected observable. |
+| `moose.jl` | MOOSE synchrotron emission, Faraday rotation, interferometric filtering, RM synthesis, and projected-observable structure functions. |
+| `shine.jl` | SHINE synthetic H I 21-cm emission, phase-separated columns, velocity moments, spectra, RGB composites, and structure functions for all scalar maps. |
+| `zeeman.jl` | Synthetic H I Stokes-I/V spectra, Zeeman magnetic-field recovery, and structure functions for all Zeeman maps. |
+| `starlightpol.jl` | Dichroic starlight polarization using cell-by-cell Mueller propagation, with structure functions for all projected Stokes and derived maps. |
+
+The five synthetic-observation notebooks compute axis-averaged, periodic, two-dimensional structure functions for every scalar sky map. Their common controls are in **Shared observational beam**: enable or disable the figures, select the order $p$, and choose the number of sampled separations. Polarization-angle increments use the shortest difference modulo $180^\circ$.
 | `run_pluto.jl` | Interactive launcher that asks which notebook to open. |
 | `export_html.jl` | Executes one notebook from top to bottom and exports a self-contained HTML snapshot. |
 | `dynamo_diagnostics.jl` | Master notebook containing every analysis section. This is the source of truth for shared code. |

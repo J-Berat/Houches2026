@@ -1844,6 +1844,9 @@ This order captures beam depolarization and avoids the incorrect operation of sm
 | Major-axis FWHM | $(@bind observational_beam_fwhm_major PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
 | Minor-axis FWHM | $(@bind observational_beam_fwhm_minor PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
 | Position angle [$^\circ$] | $(@bind observational_beam_pa_deg PlutoUI.Slider(0.0:1.0:180.0; default = 0.0, show_value = true)) |
+| Display observable structure functions | $(@bind display_observational_structure_functions PlutoUI.CheckBox(default = true)) |
+| Observable structure-function order $p$ | $(@bind observational_structure_order PlutoUI.Slider(1:4; default = 2, show_value = true)) |
+| Number of observable separation samples | $(@bind observational_structure_samples PlutoUI.Slider(4:2:20; default = 10, show_value = true)) |
 """
 
 # ╔═╡ 47b786d6-c7b5-44f4-946a-b8c485ad6380
@@ -1906,6 +1909,73 @@ begin
                 cube_xyν[:, :, channel], major, minor, observational_beam_pa_deg)
         end
         output
+    end
+
+    "Axis-averaged periodic scalar structure function of a two-dimensional map."
+    function scalar_structure_function_2d(field, lags, order; period = nothing)
+        ndims(field) == 2 || error("Projected structure functions require a 2-D map.")
+        data = Float64.(field)
+        shifted = similar(data)
+        values = zeros(Float64, length(lags))
+        for (lag_index, lag) in pairs(lags)
+            moment_sum = 0.0
+            moment_count = 0
+            for dimension in 1:2
+                shift = ntuple(d -> d == dimension ? lag : 0, 2)
+                circshift!(shifted, data, shift)
+                for index in eachindex(data)
+                    increment = shifted[index] - data[index]
+                    if !isnothing(period)
+                        increment = mod(increment + period / 2, period) - period / 2
+                    end
+                    moment = abs(increment)^order
+                    if isfinite(moment)
+                        moment_sum += moment
+                        moment_count += 1
+                    end
+                end
+            end
+            values[lag_index] = moment_count > 0 ? moment_sum / moment_count : NaN
+        end
+        values
+    end
+
+    "Plot projected structure functions for a collection of observable maps."
+    function observational_structure_figure(specs, c, plane_dims, order, samples;
+            heading = "Projected observable structure functions")
+        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
+        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
+            length = Int(samples)))))
+        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
+            for dimension in plane_dims)
+        separations_pc = lags .* pixel_scale_pc
+        ncols = min(2, length(specs))
+        nrows = cld(length(specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 55))
+        Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
+        for (spec_index, spec) in enumerate(specs)
+            row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
+            axis = Axis(figure[row, column],
+                xlabel = L"\ell\;[\mathrm{pc}]",
+                ylabel = latexstring("S_{", order, "}(\\ell)"),
+                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
+            values = scalar_structure_function_2d(spec.data, lags, order;
+                period = spec.period)
+            valid = isfinite.(values) .& (values .> 0)
+            if any(valid)
+                lines!(axis, separations_pc[valid], values[valid];
+                    color = spec.color, linewidth = 2.5)
+                scatter!(axis, separations_pc[valid], values[valid];
+                    color = spec.color, markersize = 6)
+            else
+                text!(axis, 0.5, 0.5; text = "constant or invalid map",
+                    space = :relative, align = (:center, :center))
+            end
+        end
+        figure
     end
 
     function moose_instrument_transfer(map_size, largest_scale_pix, smallest_scale_pix)
@@ -2280,6 +2350,25 @@ begin
     display_starlight_profiles ? fig_starlight_profiles : nothing
 end
 
+# ╔═╡ a0020002-6f8c-4d0c-9a10-000000000002
+begin
+    starlight_structure_specs = [
+        (data = starlight_I_normalized, label = L"I/I_0", color = MHD_COLORS[1], period = nothing),
+        (data = starlight_Q_normalized, label = L"Q/I_0", color = MHD_COLORS[2], period = nothing),
+        (data = starlight_U_normalized, label = L"U/I_0", color = MHD_COLORS[3], period = nothing),
+        (data = starlight_V_map ./ starlight_I0, label = L"V/I_0", color = MHD_COLORS[4], period = nothing),
+        (data = starlight_p_map, label = L"p_\star", color = MHD_COLORS[5], period = nothing),
+        (data = starlight_angle_deg, label = L"\psi_\star\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
+        (data = starlight_tau_map, label = L"\tau_V", color = MHD_COLORS[1], period = nothing),
+        (data = starlight_blos_map_uG, label = L"\langle B_{\mathrm{LOS}}\rangle_n\;[\mu\mathrm{G}]", color = MHD_COLORS[2], period = nothing),
+    ]
+    fig_starlight_structure = display_observational_structure_functions ?
+        observational_structure_figure(starlight_structure_specs, cube, sky_dims,
+            observational_structure_order, observational_structure_samples;
+            heading = "Starlight observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_starlight_structure : nothing
+end
+
 # ╔═╡ 7e8d4ac1-7b6e-44a8-981b-9c3a19c8de10
 begin
     fig_starlight_p_column = polarization_column_figure(
@@ -2311,4 +2400,5 @@ end
 # ╟─d1e7626c-81d7-48cd-90be-695a13aa9997
 # ╟─bcc9a131-9df2-455a-bdac-586323fd58d0
 # ╟─0c8f7453-06e8-47ea-ae0f-4f09a89b16ae
+# ╠═a0020002-6f8c-4d0c-9a10-000000000002
 # ╟─7e8d4ac1-7b6e-44a8-981b-9c3a19c8de10

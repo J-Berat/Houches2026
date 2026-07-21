@@ -3472,6 +3472,9 @@ This order captures beam depolarization and avoids the incorrect operation of sm
 | Major-axis FWHM | $(@bind observational_beam_fwhm_major PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
 | Minor-axis FWHM | $(@bind observational_beam_fwhm_minor PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
 | Position angle [$^\circ$] | $(@bind observational_beam_pa_deg PlutoUI.Slider(0.0:1.0:180.0; default = 0.0, show_value = true)) |
+| Display observable structure functions | $(@bind display_observational_structure_functions PlutoUI.CheckBox(default = true)) |
+| Observable structure-function order $p$ | $(@bind observational_structure_order PlutoUI.Slider(1:4; default = 2, show_value = true)) |
+| Number of observable separation samples | $(@bind observational_structure_samples PlutoUI.Slider(4:2:20; default = 10, show_value = true)) |
 """
 
 # ╔═╡ 47b786d6-c7b5-44f4-946a-b8c485ad6380
@@ -3534,6 +3537,73 @@ begin
                 cube_xyν[:, :, channel], major, minor, observational_beam_pa_deg)
         end
         output
+    end
+
+    "Axis-averaged periodic scalar structure function of a two-dimensional map."
+    function scalar_structure_function_2d(field, lags, order; period = nothing)
+        ndims(field) == 2 || error("Projected structure functions require a 2-D map.")
+        data = Float64.(field)
+        shifted = similar(data)
+        values = zeros(Float64, length(lags))
+        for (lag_index, lag) in pairs(lags)
+            moment_sum = 0.0
+            moment_count = 0
+            for dimension in 1:2
+                shift = ntuple(d -> d == dimension ? lag : 0, 2)
+                circshift!(shifted, data, shift)
+                for index in eachindex(data)
+                    increment = shifted[index] - data[index]
+                    if !isnothing(period)
+                        increment = mod(increment + period / 2, period) - period / 2
+                    end
+                    moment = abs(increment)^order
+                    if isfinite(moment)
+                        moment_sum += moment
+                        moment_count += 1
+                    end
+                end
+            end
+            values[lag_index] = moment_count > 0 ? moment_sum / moment_count : NaN
+        end
+        values
+    end
+
+    "Plot projected structure functions for a collection of observable maps."
+    function observational_structure_figure(specs, c, plane_dims, order, samples;
+            heading = "Projected observable structure functions")
+        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
+        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
+            length = Int(samples)))))
+        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
+            for dimension in plane_dims)
+        separations_pc = lags .* pixel_scale_pc
+        ncols = min(2, length(specs))
+        nrows = cld(length(specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 55))
+        Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
+        for (spec_index, spec) in enumerate(specs)
+            row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
+            axis = Axis(figure[row, column],
+                xlabel = L"\ell\;[\mathrm{pc}]",
+                ylabel = latexstring("S_{", order, "}(\\ell)"),
+                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
+            values = scalar_structure_function_2d(spec.data, lags, order;
+                period = spec.period)
+            valid = isfinite.(values) .& (values .> 0)
+            if any(valid)
+                lines!(axis, separations_pc[valid], values[valid];
+                    color = spec.color, linewidth = 2.5)
+                scatter!(axis, separations_pc[valid], values[valid];
+                    color = spec.color, markersize = 6)
+            else
+                text!(axis, 0.5, 0.5; text = "constant or invalid map",
+                    space = :relative, align = (:center, :center))
+            end
+        end
+        figure
     end
 
     function moose_instrument_transfer(map_size, largest_scale_pix, smallest_scale_pix)
@@ -3855,6 +3925,23 @@ begin
         column_density, dust_fraction,
         L"100p_{\mathrm d}\;[\%]", MHD_COLORS[2])
     display_dust_statistics ? fig_dust_statistics : nothing
+end
+
+# ╔═╡ a0010001-6f8c-4d0c-9a10-000000000001
+begin
+    dust_structure_specs = [
+        (data = dust_I, label = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[1], period = nothing),
+        (data = dust_Q, label = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[2], period = nothing),
+        (data = dust_U, label = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[3], period = nothing),
+        (data = dust_P, label = L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[4], period = nothing),
+        (data = dust_fraction, label = L"p_{\mathrm d}", color = MHD_COLORS[5], period = nothing),
+        (data = dust_angle_deg, label = L"\psi_{\mathrm d}\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
+    ]
+    fig_dust_structure = display_observational_structure_functions ?
+        observational_structure_figure(dust_structure_specs, cube, sky_dims,
+            observational_structure_order, observational_structure_samples;
+            heading = "Dust observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_dust_structure : nothing
 end
 
 # ╔═╡ 6f4e2d11-2a88-41f4-93dc-01b51d86fb4f
@@ -4184,6 +4271,25 @@ begin
     display_starlight_p_column ? fig_starlight_p_column : nothing
 end
 
+# ╔═╡ a0020002-6f8c-4d0c-9a10-000000000002
+begin
+    starlight_structure_specs = [
+        (data = starlight_I_normalized, label = L"I/I_0", color = MHD_COLORS[1], period = nothing),
+        (data = starlight_Q_normalized, label = L"Q/I_0", color = MHD_COLORS[2], period = nothing),
+        (data = starlight_U_normalized, label = L"U/I_0", color = MHD_COLORS[3], period = nothing),
+        (data = starlight_V_map ./ starlight_I0, label = L"V/I_0", color = MHD_COLORS[4], period = nothing),
+        (data = starlight_p_map, label = L"p_\star", color = MHD_COLORS[5], period = nothing),
+        (data = starlight_angle_deg, label = L"\psi_\star\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
+        (data = starlight_tau_map, label = L"\tau_V", color = MHD_COLORS[1], period = nothing),
+        (data = starlight_blos_map_uG, label = L"\langle B_{\mathrm{LOS}}\rangle_n\;[\mu\mathrm{G}]", color = MHD_COLORS[2], period = nothing),
+    ]
+    fig_starlight_structure = display_observational_structure_functions ?
+        observational_structure_figure(starlight_structure_specs, cube, sky_dims,
+            observational_structure_order, observational_structure_samples;
+            heading = "Starlight observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_starlight_structure : nothing
+end
+
 # ╔═╡ 67f95c39-1888-4d23-a2c2-2ee3a6cd7f0f
 md"""
 ---
@@ -4411,6 +4517,22 @@ begin
     | Stokes-``V`` derivative fit | **$(zeeman_fit_text)** ``\\mu\\mathrm{G}`` |
     | ``\\mathrm{H\\,I}``-weighted splitting | **$(zeeman_split_text)** ``\\mathrm{Hz}`` |
     """)
+end
+
+# ╔═╡ a0030003-6f8c-4d0c-9a10-000000000003
+begin
+    zeeman_structure_specs = [
+        (data = zeeman_Bmap_uG, label = L"\langle B_{\mathrm{LOS}}\rangle_{\mathrm{HI}}\;[\mu\mathrm{G}]", color = MHD_COLORS[1], period = nothing),
+        (data = zeeman_split_map_Hz, label = L"\Delta\nu_Z\;[\mathrm{Hz}]", color = MHD_COLORS[2], period = nothing),
+        (data = zeeman_NHI_map, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
+        (data = zeeman_Ipeak_map_K, label = L"\max_v I(v)\;[\mathrm{K}]", color = MHD_COLORS[4], period = nothing),
+        (data = zeeman_pV_map, label = L"p_V", color = MHD_COLORS[5], period = nothing),
+    ]
+    fig_zeeman_structure = display_observational_structure_functions ?
+        observational_structure_figure(zeeman_structure_specs, cube, sky_dims,
+            observational_structure_order, observational_structure_samples;
+            heading = "Zeeman observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_zeeman_structure : nothing
 end
 
 # ╔═╡ 62b61ef2-8e5d-4fe9-a435-e18fb5be9461
@@ -4651,6 +4773,24 @@ begin
         end
     end
     display_moose_tomography ? fig_moose_tomography : nothing
+end
+
+# ╔═╡ a0040004-6f8c-4d0c-9a10-000000000004
+begin
+    moose_structure_specs = [
+        (data = moose_phi_map, label = L"\phi\;[\mathrm{rad\,m}^{-2}]", color = MHD_COLORS[1], period = nothing),
+        (data = moose_I_K, label = L"T_{\mathrm{syn}}\;[\mathrm{K}]", color = MHD_COLORS[2], period = nothing),
+        (data = moose_Q_K, label = L"Q_\nu\;[\mathrm{K}]", color = MHD_COLORS[3], period = nothing),
+        (data = moose_U_K, label = L"U_\nu\;[\mathrm{K}]", color = MHD_COLORS[4], period = nothing),
+        (data = moose_P_K, label = L"P_\nu\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
+        (data = moose_fraction, label = L"P_\nu/I_\nu", color = MHD_COLORS[6], period = nothing),
+        (data = moose_pmax_K, label = L"p_{\max}\;[\mathrm{K}]", color = MHD_COLORS[1], period = nothing),
+    ]
+    fig_moose_structure = display_observational_structure_functions ?
+        observational_structure_figure(moose_structure_specs, cube, sky_dims,
+            observational_structure_order, observational_structure_samples;
+            heading = "MOOSE observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_moose_structure : nothing
 end
 
 # ╔═╡ ab1a7df4-ae91-47db-cb4e-cf6d42fb0143
@@ -5054,6 +5194,30 @@ begin
     display_shine_spectrum ? fig_shine_spectrum : nothing
 end
 
+# ╔═╡ a0050005-6f8c-4d0c-9a10-000000000005
+begin
+    shine_structure_specs = [
+        (data = shine_NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[1], period = nothing),
+        (data = shine_NCNM, label = L"N_{\mathrm{CNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[2], period = nothing),
+        (data = shine_NLNM, label = L"N_{\mathrm{LNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
+        (data = shine_NWNM, label = L"N_{\mathrm{WNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[4], period = nothing),
+        (data = shine_peakTb, label = L"\max_v T_B\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
+        (data = shine_mom0, label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", color = MHD_COLORS[6], period = nothing),
+        (data = shine_mom1, label = L"M_1\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[1], period = nothing),
+        (data = shine_mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[2], period = nothing),
+        (data = shine_peak_tau, label = L"\max_v\tau_{21}", color = MHD_COLORS[3], period = nothing),
+        (data = shine_fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", color = MHD_COLORS[4], period = nothing),
+        (data = shine_rgb_blue_map, label = L"W_{\mathrm{blue}}\;[\mathrm{K\,km\,s}^{-1}]", color = :dodgerblue3, period = nothing),
+        (data = shine_rgb_green_map, label = L"W_{\mathrm{green}}\;[\mathrm{K\,km\,s}^{-1}]", color = :seagreen3, period = nothing),
+        (data = shine_rgb_red_map, label = L"W_{\mathrm{red}}\;[\mathrm{K\,km\,s}^{-1}]", color = :firebrick3, period = nothing),
+    ]
+    fig_shine_structure = display_observational_structure_functions ?
+        observational_structure_figure(shine_structure_specs, cube, sky_dims,
+            observational_structure_order, observational_structure_samples;
+            heading = "SHINE observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_shine_structure : nothing
+end
+
 # ╔═╡ 14e7606a-3a13-4c8e-b860-e40dc63a6fa2
 md"""
 ---
@@ -5372,20 +5536,25 @@ begin
         "power_spectra" => "Power spectra",
         "structure_functions" => "Structure functions",
         "dust_polarization" => "Dust-polarization maps",
+        "dust_structure" => "Dust observable structure functions",
         "dust_pixel_spectrum" => "Dust I, Q, U spectrum at selected pixel",
         "dust_statistics" => "Dust-polarization statistics",
         "dust_p_column" => "Dust polarization fraction versus NH",
         "starlight_maps" => "Dichroic starlight-polarization maps",
+        "starlight_structure" => "Starlight observable structure functions",
         "starlight_profiles" => "Dichroic starlight sight-line profiles",
         "starlight_p_column" => "Starlight polarization fraction versus NH",
         "zeeman_maps" => "Zeeman-splitting maps",
+        "zeeman_structure" => "Zeeman observable structure functions",
         "zeeman_spectra" => "Zeeman Stokes spectra",
         "zeeman_p_column" => "Zeeman circular-polarization fraction versus NHI",
         "moose" => "MOOSE post-processing",
+        "moose_structure" => "MOOSE observable structure functions",
         "moose_tomography" => "MOOSE F(phi) and pmax",
         "moose_p_column" => "Faraday polarization fraction versus NH",
         "polarization_intensity" => "Polarization fraction versus intensity 2D histograms",
         "shine" => "SHINE H I maps",
+        "shine_structure" => "SHINE observable structure functions",
         "shine_rgb" => "SHINE H I velocity RGB composite",
         "shine_spectrum" => "SHINE H I spectrum",
         "polarization_time" => "Polarization fractions versus time",
@@ -5407,20 +5576,25 @@ begin
         "power_spectra" => fig_spectra,
         "structure_functions" => fig_structure,
         "dust_polarization" => fig_dust,
+        "dust_structure" => fig_dust_structure,
         "dust_pixel_spectrum" => fig_dust_pixel_spectrum,
         "dust_statistics" => fig_dust_statistics,
         "dust_p_column" => fig_dust_p_column,
         "starlight_maps" => fig_starlight_maps,
+        "starlight_structure" => fig_starlight_structure,
         "starlight_profiles" => fig_starlight_profiles,
         "starlight_p_column" => fig_starlight_p_column,
         "zeeman_maps" => fig_zeeman_maps,
+        "zeeman_structure" => fig_zeeman_structure,
         "zeeman_spectra" => fig_zeeman_spectra,
         "zeeman_p_column" => fig_zeeman_p_column,
         "moose" => fig_moose,
+        "moose_structure" => fig_moose_structure,
         "moose_tomography" => fig_moose_tomography,
         "moose_p_column" => fig_moose_p_column,
         "polarization_intensity" => fig_polarization_intensity,
         "shine" => fig_shine,
+        "shine_structure" => fig_shine_structure,
         "shine_rgb" => fig_shine_rgb,
         "shine_spectrum" => fig_shine_spectrum,
         "polarization_time" => fig_polarization_time,
@@ -7425,28 +7599,33 @@ version = "4.1.0+0"
 # ╟─130ccf03-d7cc-4b71-9210-dbc0e43dfa82
 # ╟─5b3f6a91-246e-4cc3-8f68-164f7ff2f07c
 # ╟─61c3b28c-9d62-4689-a85d-bc827e89641d
+# ╠═a0010001-6f8c-4d0c-9a10-000000000001
 # ╟─6f4e2d11-2a88-41f4-93dc-01b51d86fb4f
 # ╠═a2d5319b-06f4-4efc-b3d7-3a9719292305
 # ╟─d1e7626c-81d7-48cd-90be-695a13aa9997
 # ╟─bcc9a131-9df2-455a-bdac-586323fd58d0
 # ╟─0c8f7453-06e8-47ea-ae0f-4f09a89b16ae
+# ╠═a0020002-6f8c-4d0c-9a10-000000000002
 # ╟─7e8d4ac1-7b6e-44a8-981b-9c3a19c8de10
 # ╟─67f95c39-1888-4d23-a2c2-2ee3a6cd7f0f
 # ╟─76b9cf43-a13e-44c8-97d6-4760cc3aa486
 # ╟─82e22c29-1cf5-47dc-a54c-68577f8069bc
 # ╟─8f9e5bd2-8c7f-45b9-a92c-ad4b20d9ef21
 # ╟─fd817f74-8bc0-4df7-85ad-45a95522f80a
+# ╠═a0030003-6f8c-4d0c-9a10-000000000003
 # ╟─62b61ef2-8e5d-4fe9-a435-e18fb5be9461
 # ╟─0e8d9cab-aef2-42cd-959d-973764340f08
 # ╟─9a0f6ce3-9d80-46ca-ba3d-be5c31eaf032
 # ╟─c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
 # ╟─e9c46999-b6cb-4bf4-93ff-e23d727698e1
+# ╠═a0040004-6f8c-4d0c-9a10-000000000004
 # ╟─ab1a7df4-ae91-47db-cb4e-cf6d42fb0143
 # ╟─bc2b8e05-bfa2-48ec-dc5f-d07e530c1254
 # ╟─478ec2f3-e057-4720-809c-17ca0a3dac21
 # ╟─bcc05889-02bb-47cf-b672-139e8efe4137
 # ╠═5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
 # ╟─27e51ba5-4592-4766-9dde-0de383a889a0
+# ╠═a0050005-6f8c-4d0c-9a10-000000000005
 # ╟─14e7606a-3a13-4c8e-b860-e40dc63a6fa2
 # ╟─b37d82bc-7819-47f9-b0ab-4de2f124f3cc
 # ╠═b47871f8-13c9-41b8-9f42-f74e90bac653

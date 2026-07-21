@@ -1844,6 +1844,9 @@ This order captures beam depolarization and avoids the incorrect operation of sm
 | Major-axis FWHM | $(@bind observational_beam_fwhm_major PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
 | Minor-axis FWHM | $(@bind observational_beam_fwhm_minor PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
 | Position angle [$^\circ$] | $(@bind observational_beam_pa_deg PlutoUI.Slider(0.0:1.0:180.0; default = 0.0, show_value = true)) |
+| Display observable structure functions | $(@bind display_observational_structure_functions PlutoUI.CheckBox(default = true)) |
+| Observable structure-function order $p$ | $(@bind observational_structure_order PlutoUI.Slider(1:4; default = 2, show_value = true)) |
+| Number of observable separation samples | $(@bind observational_structure_samples PlutoUI.Slider(4:2:20; default = 10, show_value = true)) |
 """
 
 # ╔═╡ 47b786d6-c7b5-44f4-946a-b8c485ad6380
@@ -1906,6 +1909,73 @@ begin
                 cube_xyν[:, :, channel], major, minor, observational_beam_pa_deg)
         end
         output
+    end
+
+    "Axis-averaged periodic scalar structure function of a two-dimensional map."
+    function scalar_structure_function_2d(field, lags, order; period = nothing)
+        ndims(field) == 2 || error("Projected structure functions require a 2-D map.")
+        data = Float64.(field)
+        shifted = similar(data)
+        values = zeros(Float64, length(lags))
+        for (lag_index, lag) in pairs(lags)
+            moment_sum = 0.0
+            moment_count = 0
+            for dimension in 1:2
+                shift = ntuple(d -> d == dimension ? lag : 0, 2)
+                circshift!(shifted, data, shift)
+                for index in eachindex(data)
+                    increment = shifted[index] - data[index]
+                    if !isnothing(period)
+                        increment = mod(increment + period / 2, period) - period / 2
+                    end
+                    moment = abs(increment)^order
+                    if isfinite(moment)
+                        moment_sum += moment
+                        moment_count += 1
+                    end
+                end
+            end
+            values[lag_index] = moment_count > 0 ? moment_sum / moment_count : NaN
+        end
+        values
+    end
+
+    "Plot projected structure functions for a collection of observable maps."
+    function observational_structure_figure(specs, c, plane_dims, order, samples;
+            heading = "Projected observable structure functions")
+        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
+        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
+            length = Int(samples)))))
+        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
+            for dimension in plane_dims)
+        separations_pc = lags .* pixel_scale_pc
+        ncols = min(2, length(specs))
+        nrows = cld(length(specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 55))
+        Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
+        for (spec_index, spec) in enumerate(specs)
+            row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
+            axis = Axis(figure[row, column],
+                xlabel = L"\ell\;[\mathrm{pc}]",
+                ylabel = latexstring("S_{", order, "}(\\ell)"),
+                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
+            values = scalar_structure_function_2d(spec.data, lags, order;
+                period = spec.period)
+            valid = isfinite.(values) .& (values .> 0)
+            if any(valid)
+                lines!(axis, separations_pc[valid], values[valid];
+                    color = spec.color, linewidth = 2.5)
+                scatter!(axis, separations_pc[valid], values[valid];
+                    color = spec.color, markersize = 6)
+            else
+                text!(axis, 0.5, 0.5; text = "constant or invalid map",
+                    space = :relative, align = (:center, :center))
+            end
+        end
+        figure
     end
 
     function moose_instrument_transfer(map_size, largest_scale_pix, smallest_scale_pix)
@@ -2257,6 +2327,30 @@ begin
     display_shine_spectrum ? fig_shine_spectrum : nothing
 end
 
+# ╔═╡ a0050005-6f8c-4d0c-9a10-000000000005
+begin
+    shine_structure_specs = [
+        (data = shine_NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[1], period = nothing),
+        (data = shine_NCNM, label = L"N_{\mathrm{CNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[2], period = nothing),
+        (data = shine_NLNM, label = L"N_{\mathrm{LNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
+        (data = shine_NWNM, label = L"N_{\mathrm{WNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[4], period = nothing),
+        (data = shine_peakTb, label = L"\max_v T_B\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
+        (data = shine_mom0, label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", color = MHD_COLORS[6], period = nothing),
+        (data = shine_mom1, label = L"M_1\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[1], period = nothing),
+        (data = shine_mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[2], period = nothing),
+        (data = shine_peak_tau, label = L"\max_v\tau_{21}", color = MHD_COLORS[3], period = nothing),
+        (data = shine_fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", color = MHD_COLORS[4], period = nothing),
+        (data = shine_rgb_blue_map, label = L"W_{\mathrm{blue}}\;[\mathrm{K\,km\,s}^{-1}]", color = :dodgerblue3, period = nothing),
+        (data = shine_rgb_green_map, label = L"W_{\mathrm{green}}\;[\mathrm{K\,km\,s}^{-1}]", color = :seagreen3, period = nothing),
+        (data = shine_rgb_red_map, label = L"W_{\mathrm{red}}\;[\mathrm{K\,km\,s}^{-1}]", color = :firebrick3, period = nothing),
+    ]
+    fig_shine_structure = display_observational_structure_functions ?
+        observational_structure_figure(shine_structure_specs, cube, sky_dims,
+            observational_structure_order, observational_structure_samples;
+            heading = "SHINE observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_shine_structure : nothing
+end
+
 # ╔═╡ Cell order:
 # ╟─34d6b5f4-9c2d-42d5-9034-543aeb8ae151
 # ╟─8f1f1d9a-e6df-4dd1-b5b3-2d2c52c86686
@@ -2279,3 +2373,4 @@ end
 # ╟─bcc05889-02bb-47cf-b672-139e8efe4137
 # ╠═5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
 # ╟─27e51ba5-4592-4766-9dde-0de383a889a0
+# ╠═a0050005-6f8c-4d0c-9a10-000000000005

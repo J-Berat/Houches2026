@@ -1,9 +1,23 @@
 import Pkg
 
 Pkg.activate(@__DIR__)
-Pkg.instantiate()
 
-using Pluto
+try
+    @eval using Pluto
+catch
+    println(stderr, "\nThe Julia environment is not installed yet.")
+    println(stderr, "Run this command once, then start the launcher again:")
+    println(stderr, "  julia --project=. -e 'import Pkg; Pkg.instantiate()'\n")
+    rethrow()
+end
+
+# Pluto 1.0.3 references this dependency constant without its module prefix
+# when lazy startup is enabled. Define the missing alias only for affected
+# versions; later Pluto releases that define it themselves are left unchanged.
+if !isdefined(Pluto, :DEFAULT_PRECEDENCE_HEURISTIC)
+    @eval Pluto const DEFAULT_PRECEDENCE_HEURISTIC =
+        PlutoDependencyExplorer.DEFAULT_PRECEDENCE_HEURISTIC
+end
 
 const AVAILABLE_NOTEBOOKS = [
     ("Dynamo — MHD diagnostics", "dynamo.jl"),

@@ -38,13 +38,19 @@ git clone https://github.com/J-Berat/Houches2026.git
 cd Houches2026
 ```
 
+Install the project dependencies once after cloning (and again only when `Manifest.toml` changes):
+
+```bash
+julia --project=. -e 'import Pkg; Pkg.instantiate()'
+```
+
 Start the interactive launcher:
 
 ```bash
 julia --project=. run_pluto.jl
 ```
 
-The launcher installs any missing dependencies, displays a numbered menu, and opens the selected notebook. For example:
+The launcher displays a numbered menu and opens the selected notebook without repeating the package-installation step. For example:
 
 ```text
 1. Dynamo
@@ -78,6 +84,15 @@ ssh -L 15432:127.0.0.1:15432 PSMN_sr650node230
 ```
 
 ### 2. Start Pluto on the server
+
+The first time only, install the environment:
+
+```bash
+cd /Xnfs/Houches2026/DynSim/notebooks
+julia --project=. -e 'import Pkg; Pkg.instantiate()'
+```
+
+After that one-time setup, start the launcher directly:
 
 ```bash
 cd /Xnfs/Houches2026/DynSim/notebooks
@@ -229,7 +244,7 @@ Julia is not available on your `PATH`. Load the Julia module provided by the ser
 
 ### Packages are missing
 
-Run:
+Run the installation command once from the repository directory:
 
 ```bash
 julia --project=. -e 'import Pkg; Pkg.instantiate()'

@@ -64,6 +64,24 @@ begin
     as_latex(label::AbstractString) = latexstring(label)
 
     """
+    Create a Makie axis whose labels and numeric tick labels are always
+    rendered by MathTeXEngine, including axes with locally customized ticks.
+    """
+    function latex_axis(parent; xlabel = L"", ylabel = L"",
+            xtickformat = latex_ticklabels, ytickformat = latex_ticklabels,
+            kwargs...)
+        Axis(parent;
+            xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
+            xtickformat, ytickformat, kwargs...)
+    end
+
+    function latex_colorbar(parent, plot; label = L"",
+            tickformat = latex_ticklabels, kwargs...)
+        Colorbar(parent, plot;
+            label = as_latex(label), tickformat, kwargs...)
+    end
+
+    """
     Render a completed Makie figure once before handing it to Pluto.
 
     This prevents CairoMakie's reactive text pipeline from drawing a multi-group
@@ -742,20 +760,7 @@ end
 md"""
 # Interactive MHD diagnostics
 
-Explore three-dimensional magnetohydrodynamic simulation cubes with reactive controls and publication-ready Makie figures. Selecting a repository, run, snapshot, or line of sight updates every dependent diagnostic automatically.
-
-> **Reactive mode.** Open `dynamo_diagnostics.jl` with Pluto to use checkboxes, sliders, repository selection, and live figure export. `dynamo_diagnostics.html` is a read-only snapshot because a standalone HTML file cannot execute the Julia calculations.
-
-> **Lazy startup.** Start the notebook with `run_pluto.jl`. No calculation cell runs automatically. Select only the cell or group of cells you need, then press **Shift+Enter** or use Pluto's **Run selected cells** command. Pluto will evaluate the required upstream dependencies automatically.
-
-The notebook contains four complementary analysis groups:
-
-- **Spatial diagnostics:** projected thermodynamic, magnetic, kinematic, and energy maps.
-- **Statistical diagnostics:** PDFs, phase diagrams, power spectra, structure functions, and vorticity.
-- **Evolution diagnostics:** sonic and Alfvénic Mach numbers, magnetic amplification, and energy partition.
-- **Synthetic observations:** thermal-dust emission, dichroic starlight polarization, $\mathrm{H\,I}$ Zeeman splitting, MOOSE Faraday tomography, and SHINE $\mathrm{H\,I}$ emission.
-
-Unless noted otherwise, projected means are density weighted. Spatial derivatives and increments assume periodic boundaries. Every dimensional quantity is converted to the physical units shown on its axis or colorbar.
+Select the data, simulation, snapshot, and line of sight below. Run a result cell with **Shift+Enter**; Pluto evaluates its required dependencies automatically.
 """
 
 # ╔═╡ bdc11245-d76c-45fe-b79d-7b64861f5f53
@@ -783,14 +788,9 @@ md"""
 
 ### Data repository
 
-1. Enter any repository, family, simulation, `DataCubes`, or direct snapshot-directory path.
-2. Select **Load repository**. HDF5 and FITS runs and snapshots are discovered recursively.
-
 | Data source | Control |
 |:--|:--|
 | Data path | $(@bind data_repository PlutoUI.confirm(PlutoUI.TextField(90; default = DEFAULT_DATA_REPOSITORY, placeholder = "/path/to/data"); label = "Load path")) |
-
-Any folder name and nesting structure is accepted. FITS snapshots may be multi-extension files or directories containing one named FITS image per physical field.
 """
 
 # ╔═╡ 98360288-85ca-4551-bdde-c12c7a329302
@@ -1358,22 +1358,7 @@ Markdown.parse("""
 md"""
 ### Navigation and physical units
 
-Choose the data cube and projection direction in the first table. Because the HDF5 files do not provide unit attributes, the second table defines the conversion from stored values to physical units. The default density scale is $10^{-12}\,\mathrm{g\,cm^{-3}}$ per stored unit; pressure, velocity, magnetic field, length, and time default to $\mathrm{erg\,cm^{-3}}$, $\mathrm{km\,s^{-1}}$, $\mathrm{G}$, $\mathrm{pc}$, and $\mathrm{Myr}$.
-
-Comparative figures automatically detect the parameter varied from the selected path: Mach number for `VaryingMach`, grid resolution $N^3$ for `VaryingRes`, and $\chi=E_{\mathrm{comp}}/E_{\mathrm{sol}}$ for `VaryingRatio`.
-
-#### FITS field convention
-
-For a multi-extension FITS snapshot, use `EXTNAME` values such as `RHO`, `PRESSURE`, `VX`, `VY`, `VZ`, and either `BX`, `BY`, `BZ` or the face pairs `BX_L/BX_R`, `BY_L/BY_R`, `BZ_L/BZ_R`. The same names may be used as filenames inside one directory per snapshot. `L` and `TIME` are optional image extensions; the loader also accepts `LBOX`, `BOXSIZE`, `CDELT1..3`, `TIME`, `T`, or `SIMTIME` header keywords. If time metadata are absent, the final number in the filename or snapshot-directory name is used.
-
-> **Analysis scope.** The **Run** and **Snapshot** controls select the active three-dimensional cube used by maps, PDFs, spectra, structure functions, and synthetic observations. **Simulations in comparative plots** independently selects the runs used by time histories, growth-rate relations, phase curves, and comparative energy or enstrophy diagnostics.
-At startup, the active run is the only simulation selected for comparative plots. Add as many runs as needed with **Simulations in comparative plots**; every selected run is included.
-
-- The adiabatic index $\gamma$ sets the sound-speed and thermal-energy convention.
-- The mean particle mass $\mu m_{\mathrm H}$ defines $n=\rho/(\mu m_{\mathrm H})$ and $T=\mu m_{\mathrm H}P/(k_{\mathrm B}\rho)$.
-- Magnetic energy and Alfvén speed use Gaussian CGS units: $E_{\mathrm B}=B^2/(8\pi)$ and $v_{\mathrm A}=B/\sqrt{4\pi\rho}$.
-- **PDF weighting** selects equal-volume cell weighting or mass weighting.
-- **Number of bins** controls the resolution of PDFs and density-binned diagnostics.
+**Run** selects the active cube. **Simulations in comparative plots** starts with that single run and can contain any number of simulations.
 """
 
 # ╔═╡ e734297f-506e-45e1-8cb7-b2ae671893eb
@@ -1701,9 +1686,10 @@ begin
                 fontsize = 20)
             return fig
         end
-        axis = Axis(fig[1, 1],
+        axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
+            xticks = DECADE_TICKS,
             xminorticks = IntervalsBetween(9), xminorticksvisible = true)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -1906,8 +1892,6 @@ md"""
 
 ### Heatmap selection
 
-Each selected field creates one projected map for the active snapshot and line of sight. **Display** adds or removes a panel. **Logarithmic scale** transforms the displayed field before plotting; signed $B_{\mathrm{LOS}}$ values use a symmetric logarithm.
-
 **Display projected maps:** $(@bind display_projected_maps PlutoUI.CheckBox(default = true))
 
 | Field | Display | Logarithmic scale |
@@ -1937,7 +1921,6 @@ Each selected field creates one projected map for the active snapshot and line o
 | LIC texture seed | $(@bind lic_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Heatmap contrast percentile | $(@bind color_percentile PlutoUI.Slider(90.0:0.5:100.0; default = 99.0, show_value = true)) |
 
-The energy maps show line-of-sight integrals, $\int E\,\mathrm{d}\ell$, and therefore represent energy per projected area. Arrows and line-integral convolution (LIC) trace the density-weighted plane-of-sky magnetic field. LIC follows the projected field periodically in both directions; its length, iterations, amplitude weighting, opacity, and deterministic seed are adjustable. **Contrast percentile** clips extreme values to preserve structure in the bulk of each map.
 """
 
 # ╔═╡ 76d249f9-d6fd-4513-aa76-7fb386058c37
@@ -1990,7 +1973,7 @@ begin
         for (index, spec) in enumerate(heatmap_specs)
             row, col = cld(index, ncols), mod1(index, ncols)
             panel = fig_maps[row, col] = GridLayout()
-            ax = Axis(panel[1, 1],
+            ax = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
@@ -2002,7 +1985,7 @@ begin
                 heatmap!(ax, sky_coordinates[1], sky_coordinates[2], projected_B_lic;
                     colormap = lic_colors, colorrange = (0.0, 1.0), transparency = true)
             end
-            Colorbar(panel[1, 2], hm, label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], hm, label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 20)
 
             if spec.overlay_B && show_projected_B
@@ -2110,8 +2093,10 @@ begin
     else
         fig_pdf = Figure(size = (420length(pdf_specs), 430))
         for (j, spec) in enumerate(pdf_specs)
-            ax = Axis(fig_pdf[1, j], xlabel = spec.xlabel,
-                ylabel = L"\mathrm{d}\mathcal{P}/\mathrm{d}\log_{10}X", xscale = log10)
+            ax = latex_axis(fig_pdf[1, j], xlabel = spec.xlabel,
+                ylabel = L"\mathrm{d}\mathcal{P}/\mathrm{d}\log_{10}X", xscale = log10,
+                xticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), xminorticksvisible = true)
             for label in comparison_run_labels
                 logx, probability = spec.pdfs[label]
                 stairs!(ax, 10.0 .^ logx, probability;
@@ -2214,7 +2199,7 @@ begin
     phase_heatmap = nothing
     for (panel_index, label) in enumerate(comparison_run_labels)
         phase_data = phase_data_by_run[label]
-        phase_axis = Axis(fig_phase[1, panel_index],
+        phase_axis = latex_axis(fig_phase[1, panel_index],
             xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
             ylabel = L"\log_{10}\!\left[(P/k_B)/(\mathrm{K\,cm}^{-3})\right]",
             title = latex_run_label(label))
@@ -2237,7 +2222,7 @@ begin
         ylims!(phase_axis, first(phase_data.ycenters) - phase_dy / 2,
             last(phase_data.ycenters) + phase_dy / 2)
     end
-    Colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
+    latex_colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
         label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)
     colsize!(fig_phase.layout, phase_panel_count + 1, 22)
     display_phase_diagram ? fig_phase : nothing
@@ -2550,14 +2535,19 @@ begin
         for (index, key) in enumerate(time_panel_keys)
             row, col = cld(index, time_ncols), mod1(index, time_ncols)
             time_axes[key] = key == :mach ?
-                Axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}") :
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}") :
                 key == :alfven ?
-                Axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}_{\mathrm{A}}") :
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}_{\mathrm{A}}") :
                 key == :magnetic ?
-                Axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
-                    ylabel = L"B\;[\mu\mathrm{G}]", yscale = log_B_time ? log10 : identity) :
-                Axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
-                    ylabel = L"E_B/E_{\mathrm{kin}}", yscale = log10)
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
+                    ylabel = L"B\;[\mu\mathrm{G}]", yscale = log_B_time ? log10 : identity,
+                    yticks = log_B_time ? DECADE_TICKS : automatic,
+                    yminorticks = log_B_time ? IntervalsBetween(9) : IntervalsBetween(5),
+                    yminorticksvisible = true) :
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
+                    ylabel = L"E_B/E_{\mathrm{kin}}", yscale = log10,
+                    yticks = DECADE_TICKS,
+                    yminorticks = IntervalsBetween(9), yminorticksvisible = true)
         end
         for label in comparison_run_labels
             s = all_series[label]
@@ -2676,7 +2666,7 @@ begin
         gamma_ncols = length(gamma_panel_specs) == 1 ? 1 : min(3, length(gamma_panel_specs))
         fig_gamma_relations = Figure(size = (430gamma_ncols, 450))
         for (panel_index, spec) in enumerate(gamma_panel_specs)
-            gamma_axis = Axis(fig_gamma_relations[1, panel_index],
+            gamma_axis = latex_axis(fig_gamma_relations[1, panel_index],
                 xlabel = spec.xlabel, ylabel = L"\Gamma_B\;[\mathrm{Myr}^{-1}]")
             hlines!(gamma_axis, [0.0]; color = (:gray35, 0.65),
                 linestyle = :dash, linewidth = 1.5)
@@ -2726,7 +2716,7 @@ begin
         normalized_B_ncols = length(normalized_B_panel_specs)
         fig_normalized_B_relations = Figure(size = (430normalized_B_ncols, 500))
         for (panel_index, spec) in enumerate(normalized_B_panel_specs)
-            axis = Axis(fig_normalized_B_relations[1, panel_index],
+            axis = latex_axis(fig_normalized_B_relations[1, panel_index],
                 xlabel = spec.xlabel, ylabel = L"\ln(B/B_0)")
             hlines!(axis, [0.0]; color = (:gray35, 0.65), linestyle = :dash, linewidth = 1.4)
             for label in normalized_B_runs
@@ -2776,7 +2766,7 @@ begin
         growth_column = 0
         if show_growth_fit_panel
             growth_column += 1
-            ag1 = Axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
+            ag1 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
                 ylabel = L"\ln(B/B_0)")
             lines!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run],
                 linewidth = 2.5, label = "Data")
@@ -2797,7 +2787,7 @@ begin
         end
         if show_growth_theory_panel
             growth_column += 1
-            ag2 = Axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
+            ag2 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
                 ylabel = L"\ln(B/B_0)")
             lines!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run],
                 linewidth = 2.5, label = "Data")
@@ -2842,9 +2832,12 @@ begin
         phase_B_ylabel = phase_B_statistic == "Mean field ⟨B⟩" ?
             L"\langle |B|\rangle_{\mathrm{phase}}\;[\mu\mathrm{G}]" :
             L"B_{\mathrm{rms,phase}}\;[\mu\mathrm{G}]"
-        phase_B_axis = Axis(fig_phase_B_time[1, 1],
+        phase_B_axis = latex_axis(fig_phase_B_time[1, 1],
             xlabel = L"t\;[\mathrm{Myr}]", ylabel = phase_B_ylabel,
-            yscale = log_phase_B_time ? log10 : identity)
+            yscale = log_phase_B_time ? log10 : identity,
+            yticks = log_phase_B_time ? DECADE_TICKS : automatic,
+            yminorticks = log_phase_B_time ? IntervalsBetween(9) : IntervalsBetween(5),
+            yminorticksvisible = true)
         statistic_suffix = phase_B_statistic == "Mean field ⟨B⟩" ? "mean" : "rms"
         for label in comparison_run_labels, spec in phase_B_specs
             phase_B_series = phase_B_series_by_run[label]
@@ -2900,20 +2893,20 @@ begin
         if show_logB_map
             logB_column += 1
             map_panel = fig_logB[1, logB_column] = GridLayout()
-            axmap = Axis(map_panel[1, 1],
+            axmap = latex_axis(map_panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             limB = max(maximum(abs, filter(isfinite, vec(logB_map)); init = 0.0),
                 sqrt(eps(Float64)))
             hb = heatmap!(axmap, sky_coordinates[1], sky_coordinates[2], logB_map;
                 colormap = :balance, colorrange = (-limB, limB))
-            Colorbar(map_panel[1, 2], hb,
+            latex_colorbar(map_panel[1, 2], hb,
                 label = L"\log_{10}(B/\langle B\rangle)", tickformat = latex_ticklabels)
             colsize!(map_panel, 2, 22)
         end
         if show_logB_histogram
             logB_column += 1
-            axhist = Axis(fig_logB[1, logB_column],
+            axhist = latex_axis(fig_logB[1, logB_column],
                 xlabel = L"\log_{10}(B/\langle B\rangle)", ylabel = L"\mathcal{P}")
             for label in comparison_run_labels
                 logB_ratio_x, logB_ratio_p = normalized_B_pdfs[label]
@@ -3061,9 +3054,12 @@ begin
             ylabel = key == :kin_mag ? L"E_{\mathrm{kin}}/E_{\mathrm{mag}}" :
                 key == :therm_mag ? L"E_{\mathrm{therm}}/E_{\mathrm{mag}}" :
                 L"E_{\mathrm{kin}}/E_{\mathrm{therm}}"
-            energy_axes[key] = Axis(fig_energy[1, index],
+            energy_axes[key] = latex_axis(fig_energy[1, index],
                 xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = ylabel,
-                xscale = log10, yscale = log10)
+                xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
             hlines!(energy_axes[key], [1.0]; color = (:gray45, 0.55),
                 linestyle = :dash, linewidth = 1.5)
         end
@@ -3109,8 +3105,10 @@ begin
     else
         fig_energy_time = Figure(size = (500length(energy_time_specs), 470))
         for (index, spec) in enumerate(energy_time_specs)
-            ax = Axis(fig_energy_time[1, index],
-                xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel, yscale = log10)
+            ax = latex_axis(fig_energy_time[1, index],
+                xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel, yscale = log10,
+                yticks = DECADE_TICKS,
+                yminorticks = IntervalsBetween(9), yminorticksvisible = true)
             hlines!(ax, [1.0]; color = (:gray45, 0.55), linestyle = :dash, linewidth = 1.5)
             for label in comparison_run_labels
                 series = all_series[label]
@@ -3210,12 +3208,12 @@ begin
         fig_vorticity = Figure(size = (620length(vorticity_map_specs), 520))
         for (index, spec) in enumerate(vorticity_map_specs)
             panel = fig_vorticity[1, index] = GridLayout()
-            axis = Axis(panel[1, 1],
+            axis = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             heat = heatmap!(axis, sky_coordinates[1], sky_coordinates[2], spec.data;
                 colormap = spec.colormap)
-            Colorbar(panel[1, 2], heat; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], heat; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
@@ -3296,10 +3294,11 @@ begin
         fig_enstrophy_density = Figure(size = (610length(enstrophy_density_panels), 500))
         for (panel_index, panel_kind) in enumerate(enstrophy_density_panels)
             if panel_kind == :profiles
-                axis = Axis(fig_enstrophy_density[1, panel_index],
+                axis = latex_axis(fig_enstrophy_density[1, panel_index],
                     xlabel = L"n\;[\mathrm{cm}^{-3}]",
                     ylabel = L"\langle\mathcal{E}_{\omega}\rangle_n\;[\mathrm{Myr}^{-2}]",
                     xscale = log10, yscale = log10,
+                    xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                     xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                     xminorticksvisible = true, yminorticksvisible = true)
                 for label in comparison_run_labels
@@ -3314,8 +3313,9 @@ begin
             else
                 panel = fig_enstrophy_density[1, panel_index] = GridLayout()
                 parameter_positions = collect(1:length(comparison_run_labels))
-                axis = Axis(panel[1, 1], xlabel = enstrophy_parameter_axis_label,
+                axis = latex_axis(panel[1, 1], xlabel = enstrophy_parameter_axis_label,
                     ylabel = L"n\;[\mathrm{cm}^{-3}]", yscale = log10,
+                    yticks = DECADE_TICKS,
                     yminorticks = IntervalsBetween(9), yminorticksvisible = true,
                     xticks = parameter_positions,
                     xtickformat = values -> [
@@ -3325,7 +3325,7 @@ begin
                 log_enstrophy = safe_log10.(enstrophy_profile_matrix')
                 heat = heatmap!(axis, parameter_positions, density_number_centers,
                     log_enstrophy; colormap = :magma)
-                Colorbar(panel[1, 2], heat;
+                latex_colorbar(panel[1, 2], heat;
                     label = L"\log_{10}\!\left(\langle\mathcal{E}_{\omega}\rangle_n/\mathrm{Myr}^{-2}\right)",
                     tickformat = latex_ticklabels)
                 colsize!(panel, 2, 22)
@@ -3374,7 +3374,7 @@ begin
     else
         fig_spectra = Figure(size = (400length(spectrum_specs), 390))
         for (index, spec) in enumerate(spectrum_specs)
-            axis = Axis(fig_spectra[1, index], xlabel = L"k\;[\mathrm{pc}^{-1}]",
+            axis = latex_axis(fig_spectra[1, index], xlabel = L"k\;[\mathrm{pc}^{-1}]",
                 ylabel = spec.ylabel, xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
@@ -3481,7 +3481,7 @@ begin
     else
         fig_structure = Figure(size = (400length(structure_specs), 390))
         for (index, spec) in enumerate(structure_specs)
-            axis = Axis(fig_structure[1, index], xlabel = L"\ell\;[\mathrm{pc}]",
+            axis = latex_axis(fig_structure[1, index], xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = spec.ylabel, xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
@@ -3501,15 +3501,7 @@ md"""
 
 ## 12. Shared observational beam
 
-The optional point-spread function is an elliptical Gaussian beam. Its major and minor FWHM can be specified in sky pixels or parsecs, and its position angle is measured counter-clockwise from the first displayed sky axis. The convolution is performed in Fourier space with periodic boundaries, consistently with the periodic simulation domain.
-
-For polarized observations, the beam is applied to the linear Stokes quantities $I$, $Q$, and $U$ before computing
-
-```math
-P=\sqrt{Q^2+U^2},\qquad p=P/I.
-```
-
-This order captures beam depolarization and avoids the incorrect operation of smoothing $P$ or $p$ directly.
+Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
 
 | Gaussian PSF setting | Control |
 |:--|:--|
@@ -3629,7 +3621,7 @@ begin
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
         for (spec_index, spec) in enumerate(specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
-            axis = Axis(figure[row, column],
+            axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
                 title = as_latex(spec.label), xscale = log10, yscale = log10,
@@ -3711,9 +3703,7 @@ md"""
 
 ## 13. Thermal-dust polarization
 
-This section implements the line-of-sight geometry used by `GammaDust.jl`, `PhiDust.jl`, and `DustIQU.jl`. The magnetic inclination and polarization position angle satisfy $\gamma_{\mathrm d}=\arcsin(B_{\mathrm{LOS}}/|B|)$ and $\psi=\operatorname{atan2}(B_2,B_1)+\pi/2$. Optically thin emission follows $I_\nu,Q_\nu,U_\nu\propto B_\nu(T_{\mathrm d})\sigma_\nu n_{\mathrm H}\,\mathrm d\ell$, with the standard Stokes-$I$ correction $1-p_0(\cos^2\gamma_{\mathrm d}-2/3)$.
-
-The polarization-fraction PDF and the $p$--$N_{\mathrm H}$ distribution compare all selected simulations with shared histogram bins and one color per run.
+Optically thin thermal-dust Stokes emission. Statistical plots compare all selected simulations with shared bins.
 
 | Dust figure | Display |
 |:--|:--:|
@@ -3825,7 +3815,7 @@ begin
         for (index, spec) in enumerate(dust_map_specs)
             row, col = cld(index, dust_ncols), mod1(index, dust_ncols)
             panel = fig_dust[row, col] = GridLayout()
-            ax = Axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+            ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             dust_range = isnothing(spec.fixed_range) ?
                 robust_colorrange(spec.data, color_percentile; diverging = spec.diverging) : spec.fixed_range
@@ -3836,7 +3826,7 @@ begin
                 [sky_coordinates[2][Int(dust_sky_j)]];
                 marker = :cross, markersize = 18, strokewidth = 3,
                 color = :white)
-            Colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
             if spec.vectors
                 stride = Int(dust_vector_stride)
@@ -3903,7 +3893,7 @@ begin
         fig_dust_pixel_spectrum = Figure(
             size = (430length(dust_pixel_spectrum_specs), 390))
         for (index, spec) in enumerate(dust_pixel_spectrum_specs)
-            axis = Axis(fig_dust_pixel_spectrum[1, index],
+            axis = latex_axis(fig_dust_pixel_spectrum[1, index],
                 xlabel = L"\nu\;[\mathrm{GHz}]", ylabel = spec.ylabel,
                 xscale = log_dust_frequency_axis ? log10 : identity,
                 xticks = log_dust_frequency_axis ? DECADE_TICKS : automatic,
@@ -3979,8 +3969,9 @@ begin
         dust_pdf_edges = range(0, dust_pdf_upper; length = 45)
         for (index, statistic) in enumerate(dust_stat_specs)
             if statistic == :column_relation
-                ax = Axis(fig_dust_statistics[1, index], xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
+                ax = latex_axis(fig_dust_statistics[1, index], xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
                     ylabel = L"100p_{\mathrm d}\;[\%]", xscale = log10,
+                    xticks = DECADE_TICKS,
                     xminorticks = IntervalsBetween(9), xminorticksvisible = true)
                 for label in comparison_run_labels
                     dust_N_valid = dust_distribution_vectors[label].N
@@ -4006,7 +3997,7 @@ begin
                     end
                 end
             else
-                ax = Axis(fig_dust_statistics[1, index], xlabel = L"100p_{\mathrm d}\;[\%]",
+                ax = latex_axis(fig_dust_statistics[1, index], xlabel = L"100p_{\mathrm d}\;[\%]",
                     ylabel = L"\mathrm{PDF}(100p_{\mathrm d})")
                 for label in comparison_run_labels
                     dust_p_valid = dust_distribution_vectors[label].p
@@ -4058,16 +4049,7 @@ md"""
 
 ## 14. Dichroic starlight polarization
 
-This section adapts the cell-by-cell Mueller propagation implemented by `StarlightPol` to the active simulation cube. The observer is placed at the zero edge of the selected line of sight, and every sky pixel contains one background star at the selected distance. Samples behind the star are ignored.
-
-The first plotted sky coordinate defines local east and the second defines local north. The magnetic position angle therefore follows the IAU convention, north through east,
-
-```math
-\psi_B=\operatorname{atan2}(B_{\rm east},B_{\rm north}),\qquad
-\gamma_B=\arccos\!\left(B_{\rm LOS}/|B|\right).
-```
-
-For each cell, $\tau_V=n_{\rm H}\,\Delta\ell/(N_{\rm H}/A_V)$ and the differential dichroism is $\Delta\tau=\tau_V\ln[(1+p_0)/(1-p_0)]$. The local Mueller matrix is applied sequentially to the incident stellar Stokes vector. Output Stokes parameters are normalized to the selected incident intensity.
+Cell-by-cell dichroic Mueller propagation toward background stars at the selected distance.
 
 | Starlight figure | Display |
 |:--|:--:|
@@ -4290,7 +4272,7 @@ begin
         for (index, spec) in enumerate(starlight_map_specs)
             row, col = cld(index, starlight_map_ncols), mod1(index, starlight_map_ncols)
             panel = fig_starlight_maps[row, col] = GridLayout()
-            axis = Axis(panel[1, 1],
+            axis = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             colorrange = isnothing(spec.fixed_range) ?
@@ -4303,7 +4285,7 @@ begin
                 [sky_coordinates[2][Int(starlight_sky_j)]];
                 marker = :star5, markersize = 17, color = :white,
                 strokecolor = :black, strokewidth = 1.2)
-            Colorbar(panel[1, 2], heat; label = as_latex(spec.label),
+            latex_colorbar(panel[1, 2], heat; label = as_latex(spec.label),
                 tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
@@ -4354,7 +4336,7 @@ begin
         for (index, spec) in enumerate(starlight_profile_specs)
             row, col = cld(index, starlight_profile_ncols),
                 mod1(index, starlight_profile_ncols)
-            axis = Axis(fig_starlight_profiles[row, col],
+            axis = latex_axis(fig_starlight_profiles[row, col],
                 xlabel = L"d\;[\mathrm{pc}]", ylabel = spec.ylabel)
             spec.signed && hlines!(axis, [0.0]; color = (:gray45, 0.55),
                 linestyle = :dash, linewidth = 1.3)
@@ -4404,17 +4386,13 @@ md"""
 
 ## 15. H I Zeeman splitting
 
-This synthetic observation uses the optically thin $\mathrm{H\,I}$ 21-cm relation $N_{\mathrm{HI}}=1.823\times10^{18}\int T_B\,\mathrm{d}v$ and the weak-splitting approximation $V(\nu)=z_BB_{\mathrm{LOS}}(\mathrm{d}I/\mathrm{d}\nu)/2$. The default splitting coefficient is $z_B=2.80\,\mathrm{Hz}\,\mu\mathrm{G}^{-1}$. Select a sky pixel to compare the $\mathrm{H\,I}$-weighted field with the value recovered from the Stokes-$V$ derivative fit.
+Weak-splitting $\mathrm{H\,I}$ Zeeman synthesis. Select a sky pixel to compare the true weighted field with the Stokes-$V$ fit.
 
 | Zeeman figure | Display |
 |:--|:--:|
 | Zeeman maps | $(@bind display_zeeman_maps PlutoUI.CheckBox(default = true)) |
 | Stokes spectra | $(@bind display_zeeman_spectra PlutoUI.CheckBox(default = true)) |
 | Circular-polarization fraction versus $N_{\rm HI}$ | $(@bind display_zeeman_p_column PlutoUI.CheckBox(default = true)) |
-
-The Zeeman relation uses $p_V=\max_v|V(v)|/\max_v I(v)$. This peak definition preserves the antisymmetric Stokes-$V$ signal, whose signed velocity integral is approximately zero.
-
-Here $\rho/(1.4m_{\mathrm H})$ is the hydrogen-nuclei abundance implied by a standard helium correction (equivalently $X\rho/m_{\mathrm H}$ with $X\simeq0.71$), not an independently computed atomic-hydrogen density. The **Neutral H I fraction** therefore acts as an effective atomic fraction: the label $N_{\mathrm{HI}}$ is physically appropriate only when that factor is chosen consistently with the ionized and molecular hydrogen fractions of the simulation.
 
 | Zeeman setting | Control |
 |:--|:--|
@@ -4513,14 +4491,14 @@ begin
         fig_zeeman_maps = Figure(size = (540length(zeeman_map_specs), 410))
         for (index, spec) in enumerate(zeeman_map_specs)
             panel = fig_zeeman_maps[1, index] = GridLayout()
-            ax = Axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+            ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
                 colormap = spec.colormap,
                 colorrange = robust_colorrange(spec.data, color_percentile; diverging = true))
             scatter!(ax, [sky_coordinates[1][zeeman_i]], [sky_coordinates[2][zeeman_j]];
                 marker = :cross, markersize = 20, strokewidth = 3, color = :white)
-            Colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
@@ -4539,11 +4517,11 @@ begin
         fig_zeeman_spectra = Figure(size = (560length(zeeman_spectrum_specs), 390))
         for (index, spectrum) in enumerate(zeeman_spectrum_specs)
             if spectrum == :I
-                ax = Axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
+                ax = latex_axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
                     ylabel = L"I_\nu\;[\mathrm{K}]")
                 lines!(ax, zeeman_velocity_axis, zeeman_I_K; color = MHD_COLORS[1], linewidth = 2.5)
             else
-                ax = Axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
+                ax = latex_axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
                     ylabel = L"V_\nu\;[\mathrm{mK}]")
                 lines!(ax, zeeman_velocity_axis, 1.0e3 .* zeeman_V_K; color = MHD_COLORS[2], linewidth = 2.5)
                 show_zeeman_fit && lines!(ax, zeeman_velocity_axis, 1.0e3 .* zeeman_Vfit_K;
@@ -4649,11 +4627,7 @@ md"""
 
 ## 16. MOOSE Faraday post-processing
 
-This section follows the physical core of **Mock Observation Of Synchrotron Emission (MOOSE)**. It computes electron density, cumulative Faraday rotation, synchrotron brightness, complex polarization, RM-synthesis spectra $F(\phi)$, and the peak polarized-intensity map $\mathrm{p}_{\max}$. The line-of-sight Faraday depth is $\phi=0.812\int n_eB_{\mathrm{LOS}}\,\mathrm{d}\ell$ in $\mathrm{rad\,m^{-2}}$.
-
-The synchrotron normalization converts $B_\perp^{(p+1)/2}\,\mathrm{d}\ell$ to brightness temperature and should be adjusted to the cosmic-ray electron normalization of the experiment.
-
-The interferometric option reproduces the supplied MOOSE `instrument_bandpass_L` and `apply_to_array_xy` convention: a binary Fourier mask removes scales larger than $L_{\rm large}$ and scales smaller than $L_{\rm small}$, up to the Nyquist frequency. The processing order is Fourier filtering of $I/Q/U$, optional Gaussian restoring beam, then independent Gaussian noise in $Q$ and $U$ with $\sigma=P_{\rm rms}/{\rm SNR}_\nu$. The same response is propagated through the frequency cube before RM synthesis, $F(\phi)$, and $p_{\max}$.
+Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis.
 
 | MOOSE figure | Display |
 |:--|:--:|
@@ -4765,13 +4739,13 @@ begin
         for (index, spec) in enumerate(moose_specs)
             row, col = cld(index, moose_ncols), mod1(index, moose_ncols)
             panel = fig_moose[row, col] = GridLayout()
-            ax = Axis(panel[1, 1],
+            ax = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             moose_colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
                 colormap = spec.colormap, colorrange = moose_colorrange)
-            Colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
@@ -4854,7 +4828,7 @@ begin
         for (index, product) in enumerate(moose_tomography_specs)
             if product == :pmax
                 panel = fig_moose_tomography[1, index] = GridLayout()
-                ax = Axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+                ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                     ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
                 hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], moose_pmax_K;
                     colormap = :viridis,
@@ -4862,11 +4836,11 @@ begin
                 scatter!(ax, [sky_coordinates[1][Int(moose_sky_i)]],
                     [sky_coordinates[2][Int(moose_sky_j)]];
                     marker = :cross, markersize = 20, strokewidth = 3, color = :white)
-                Colorbar(panel[1, 2], hm; label = L"p_{\max}=\max_\phi|F(\phi)|\;[\mathrm{K}]",
+                latex_colorbar(panel[1, 2], hm; label = L"p_{\max}=\max_\phi|F(\phi)|\;[\mathrm{K}]",
                     tickformat = latex_ticklabels)
                 colsize!(panel, 2, 22)
             else
-                ax = Axis(fig_moose_tomography[1, index],
+                ax = latex_axis(fig_moose_tomography[1, index],
                     xlabel = L"\phi\;[\mathrm{rad\,m}^{-2}]", ylabel = L"F(\phi)\;[\mathrm{K}]")
                 spectrum = @view moose_F_complex[Int(moose_sky_i), Int(moose_sky_j), :]
                 show_moose_F_abs && lines!(ax, moose_phi_axis, abs.(spectrum);
@@ -4989,7 +4963,7 @@ begin
                 Label(panel[1, 1], L"\mathrm{No\ valid\ samples.}"; fontsize = 18)
                 continue
             end
-            axis = Axis(panel[1, 1], xlabel = spec.xlabel, ylabel = spec.ylabel,
+            axis = latex_axis(panel[1, 1], xlabel = spec.xlabel, ylabel = spec.ylabel,
                 xscale = log_polarization_intensity ? log10 : identity,
                 xticks = log_polarization_intensity ? DECADE_TICKS : automatic,
                 xminorticks = log_polarization_intensity ? IntervalsBetween(9) : IntervalsBetween(5),
@@ -4997,7 +4971,7 @@ begin
             heat = heatmap!(axis, xedges, yedges, log_probability;
                 colormap = :magma,
                 colorrange = robust_colorrange(log_probability, color_percentile))
-            Colorbar(panel[1, 2], heat;
+            latex_colorbar(panel[1, 2], heat;
                 label = L"\log_{10}\mathcal{P}_{\mathrm{bin}}",
                 tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
@@ -5012,7 +4986,7 @@ md"""
 
 ## 18. SHINE H I post-processing
 
-This section follows the supplied **Synthetic H I Neutral Emission (SHINE)** pipeline. Neutral hydrogen is separated into CNM, LNM, and WNM components before solving the 21-cm transfer equation from the front to the back of every sightline. For cell $k$ and velocity channel $v$, $\tau_k(v)=N_k(v)/(1.823\times10^{18}T_k)$ and $\Delta T_B=T_k(1-e^{-\tau_k})e^{-\tau_{\mathrm{front}}}$.
+Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 
 **Display SHINE H I maps:** $(@bind display_shine PlutoUI.CheckBox(default = true))  
 **Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))  
@@ -5174,7 +5148,7 @@ begin
         for (index, spec) in enumerate(shine_specs)
             row, col = cld(index, shine_ncols), mod1(index, shine_ncols)
             panel = fig_shine[row, col] = GridLayout()
-            ax = Axis(panel[1, 1],
+            ax = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
@@ -5183,7 +5157,7 @@ begin
             scatter!(ax, [sky_coordinates[1][Int(shine_sky_i)]],
                 [sky_coordinates[2][Int(shine_sky_j)]];
                 marker = :cross, markersize = 18, strokewidth = 3, color = :white)
-            Colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
@@ -5242,7 +5216,7 @@ begin
     shine_rgb_image = RGBf.(shine_rgb_red, shine_rgb_green, shine_rgb_blue)
 
     fig_shine_rgb = Figure(size = (820, 670))
-    shine_rgb_axis = Axis(fig_shine_rgb[1, 1],
+    shine_rgb_axis = latex_axis(fig_shine_rgb[1, 1],
         xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
         ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"),
         title = L"\mathrm{H\,I\ velocity\ composite}")
@@ -5284,14 +5258,14 @@ begin
         fig_shine_spectrum = Figure(size = (570length(shine_spectrum_specs), 390))
         for (index, spectrum_type) in enumerate(shine_spectrum_specs)
             if spectrum_type == :brightness
-                ax = Axis(fig_shine_spectrum[1, index],
+                ax = latex_axis(fig_shine_spectrum[1, index],
                     xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]", ylabel = L"T_B\;[\mathrm{K}]")
                 show_shine_Tb_spectrum && lines!(ax, shine_velocity_axis,
                     @view(shine_Tb[Int(shine_sky_i), Int(shine_sky_j), :]);
                     color = MHD_COLORS[1], linewidth = 2.5, label = "T_B")
                 axislegend(ax; position = :rt, framevisible = false)
             else
-                ax = Axis(fig_shine_spectrum[1, index],
+                ax = latex_axis(fig_shine_spectrum[1, index],
                     xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]", ylabel = L"\tau_{21}")
                 lines!(ax, shine_velocity_axis,
                     @view(shine_tau[Int(shine_sky_i), Int(shine_sky_j), :]);
@@ -5565,7 +5539,7 @@ begin
 
         for (panel_index, spec) in enumerate(polarization_time_panel_specs)
             row, column = cld(panel_index, panel_columns), mod1(panel_index, panel_columns)
-            axis = Axis(fig_polarization_time[row, column],
+            axis = latex_axis(fig_polarization_time[row, column],
                 xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel)
             all_percentages = Float64[]
             for label in comparison_run_labels

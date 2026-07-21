@@ -64,6 +64,24 @@ begin
     as_latex(label::AbstractString) = latexstring(label)
 
     """
+    Create a Makie axis whose labels and numeric tick labels are always
+    rendered by MathTeXEngine, including axes with locally customized ticks.
+    """
+    function latex_axis(parent; xlabel = L"", ylabel = L"",
+            xtickformat = latex_ticklabels, ytickformat = latex_ticklabels,
+            kwargs...)
+        Axis(parent;
+            xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
+            xtickformat, ytickformat, kwargs...)
+    end
+
+    function latex_colorbar(parent, plot; label = L"",
+            tickformat = latex_ticklabels, kwargs...)
+        Colorbar(parent, plot;
+            label = as_latex(label), tickformat, kwargs...)
+    end
+
+    """
     Render a completed Makie figure once before handing it to Pluto.
 
     This prevents CairoMakie's reactive text pipeline from drawing a multi-group
@@ -776,14 +794,9 @@ md"""
 
 ### Data repository
 
-1. Enter any repository, family, simulation, `DataCubes`, or direct snapshot-directory path.
-2. Select **Load repository**. HDF5 and FITS runs and snapshots are discovered recursively.
-
 | Data source | Control |
 |:--|:--|
 | Data path | $(@bind data_repository PlutoUI.confirm(PlutoUI.TextField(90; default = DEFAULT_DATA_REPOSITORY, placeholder = "/path/to/data"); label = "Load path")) |
-
-Any folder name and nesting structure is accepted. FITS snapshots may be multi-extension files or directories containing one named FITS image per physical field.
 """
 
 # ╔═╡ 98360288-85ca-4551-bdde-c12c7a329302
@@ -1661,9 +1674,10 @@ begin
                 fontsize = 20)
             return fig
         end
-        axis = Axis(fig[1, 1],
+        axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
+            xticks = DECADE_TICKS,
             xminorticks = IntervalsBetween(9), xminorticksvisible = true)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -1815,8 +1829,6 @@ md"""
 
 ### Heatmap selection
 
-Each selected field creates one projected map for the active snapshot and line of sight. **Display** adds or removes a panel. **Logarithmic scale** transforms the displayed field before plotting; signed $B_{\mathrm{LOS}}$ values use a symmetric logarithm.
-
 **Display projected maps:** $(@bind display_projected_maps PlutoUI.CheckBox(default = true))
 
 | Field | Display | Logarithmic scale |
@@ -1846,7 +1858,6 @@ Each selected field creates one projected map for the active snapshot and line o
 | LIC texture seed | $(@bind lic_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Heatmap contrast percentile | $(@bind color_percentile PlutoUI.Slider(90.0:0.5:100.0; default = 99.0, show_value = true)) |
 
-The energy maps show line-of-sight integrals, $\int E\,\mathrm{d}\ell$, and therefore represent energy per projected area. Arrows and line-integral convolution (LIC) trace the density-weighted plane-of-sky magnetic field. LIC follows the projected field periodically in both directions; its length, iterations, amplitude weighting, opacity, and deterministic seed are adjustable. **Contrast percentile** clips extreme values to preserve structure in the bulk of each map.
 """
 
 # ╔═╡ 496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
@@ -1912,15 +1923,7 @@ md"""
 
 ## 12. Shared observational beam
 
-The optional point-spread function is an elliptical Gaussian beam. Its major and minor FWHM can be specified in sky pixels or parsecs, and its position angle is measured counter-clockwise from the first displayed sky axis. The convolution is performed in Fourier space with periodic boundaries, consistently with the periodic simulation domain.
-
-For polarized observations, the beam is applied to the linear Stokes quantities $I$, $Q$, and $U$ before computing
-
-```math
-P=\sqrt{Q^2+U^2},\qquad p=P/I.
-```
-
-This order captures beam depolarization and avoids the incorrect operation of smoothing $P$ or $p$ directly.
+Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
 
 | Gaussian PSF setting | Control |
 |:--|:--|
@@ -2040,7 +2043,7 @@ begin
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
         for (spec_index, spec) in enumerate(specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
-            axis = Axis(figure[row, column],
+            axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
                 title = as_latex(spec.label), xscale = log10, yscale = log10,
@@ -2122,11 +2125,7 @@ md"""
 
 ## 16. MOOSE Faraday post-processing
 
-This section follows the physical core of **Mock Observation Of Synchrotron Emission (MOOSE)**. It computes electron density, cumulative Faraday rotation, synchrotron brightness, complex polarization, RM-synthesis spectra $F(\phi)$, and the peak polarized-intensity map $\mathrm{p}_{\max}$. The line-of-sight Faraday depth is $\phi=0.812\int n_eB_{\mathrm{LOS}}\,\mathrm{d}\ell$ in $\mathrm{rad\,m^{-2}}$.
-
-The synchrotron normalization converts $B_\perp^{(p+1)/2}\,\mathrm{d}\ell$ to brightness temperature and should be adjusted to the cosmic-ray electron normalization of the experiment.
-
-The interferometric option reproduces the supplied MOOSE `instrument_bandpass_L` and `apply_to_array_xy` convention: a binary Fourier mask removes scales larger than $L_{\rm large}$ and scales smaller than $L_{\rm small}$, up to the Nyquist frequency. The processing order is Fourier filtering of $I/Q/U$, optional Gaussian restoring beam, then independent Gaussian noise in $Q$ and $U$ with $\sigma=P_{\rm rms}/{\rm SNR}_\nu$. The same response is propagated through the frequency cube before RM synthesis, $F(\phi)$, and $p_{\max}$.
+Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis.
 
 | MOOSE figure | Display |
 |:--|:--:|
@@ -2238,13 +2237,13 @@ begin
         for (index, spec) in enumerate(moose_specs)
             row, col = cld(index, moose_ncols), mod1(index, moose_ncols)
             panel = fig_moose[row, col] = GridLayout()
-            ax = Axis(panel[1, 1],
+            ax = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             moose_colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
                 colormap = spec.colormap, colorrange = moose_colorrange)
-            Colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
@@ -2327,7 +2326,7 @@ begin
         for (index, product) in enumerate(moose_tomography_specs)
             if product == :pmax
                 panel = fig_moose_tomography[1, index] = GridLayout()
-                ax = Axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+                ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                     ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
                 hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], moose_pmax_K;
                     colormap = :viridis,
@@ -2335,11 +2334,11 @@ begin
                 scatter!(ax, [sky_coordinates[1][Int(moose_sky_i)]],
                     [sky_coordinates[2][Int(moose_sky_j)]];
                     marker = :cross, markersize = 20, strokewidth = 3, color = :white)
-                Colorbar(panel[1, 2], hm; label = L"p_{\max}=\max_\phi|F(\phi)|\;[\mathrm{K}]",
+                latex_colorbar(panel[1, 2], hm; label = L"p_{\max}=\max_\phi|F(\phi)|\;[\mathrm{K}]",
                     tickformat = latex_ticklabels)
                 colsize!(panel, 2, 22)
             else
-                ax = Axis(fig_moose_tomography[1, index],
+                ax = latex_axis(fig_moose_tomography[1, index],
                     xlabel = L"\phi\;[\mathrm{rad\,m}^{-2}]", ylabel = L"F(\phi)\;[\mathrm{K}]")
                 spectrum = @view moose_F_complex[Int(moose_sky_i), Int(moose_sky_j), :]
                 show_moose_F_abs && lines!(ax, moose_phi_axis, abs.(spectrum);
@@ -2372,6 +2371,47 @@ begin
             observational_structure_order, observational_structure_samples;
             heading = "MOOSE observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_moose_structure : nothing
+end
+
+# ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
+begin
+    export_figure_options = [
+        "moose" => "MOOSE maps",
+        "moose_structure" => "MOOSE observable structure functions",
+        "moose_tomography" => "MOOSE Faraday tomography",
+        "moose_p_column" => "Faraday polarization versus column density",
+    ]
+    export_figure_registry = Dict(
+        "moose" => fig_moose,
+        "moose_structure" => fig_moose_structure,
+        "moose_tomography" => fig_moose_tomography,
+        "moose_p_column" => fig_moose_p_column,
+    )
+    nothing
+end
+
+# ╔═╡ e1000002-6f8c-4d0c-9a10-000000000002
+md"""
+---
+
+## Figure export
+
+| Export setting | Control |
+|:--|:--|
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "moose")) |
+| Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
+"""
+
+# ╔═╡ e1000003-6f8c-4d0c-9a10-000000000003
+begin
+    export_extension = lowercase(export_figure_format)
+    export_mime = export_figure_format == "PNG" ? MIME"image/png"() : MIME"application/pdf"()
+    export_buffer = IOBuffer()
+    show(export_buffer, export_mime, export_figure_registry[export_figure_key])
+    export_bytes = take!(export_buffer)
+    export_run_slug = replace(lowercase(selected_run), r"[^a-z0-9]+" => "_")
+    export_filename = "moose_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
+    PlutoUI.DownloadButton(export_bytes, export_filename)
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -4423,5 +4463,8 @@ version = "4.1.0+0"
 # ╟─c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
 # ╟─e9c46999-b6cb-4bf4-93ff-e23d727698e1
 # ╠═a0040004-6f8c-4d0c-9a10-000000000004
+# ╠═e1000001-6f8c-4d0c-9a10-000000000001
+# ╠═e1000002-6f8c-4d0c-9a10-000000000002
+# ╠═e1000003-6f8c-4d0c-9a10-000000000003
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

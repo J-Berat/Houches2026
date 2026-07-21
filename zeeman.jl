@@ -64,6 +64,24 @@ begin
     as_latex(label::AbstractString) = latexstring(label)
 
     """
+    Create a Makie axis whose labels and numeric tick labels are always
+    rendered by MathTeXEngine, including axes with locally customized ticks.
+    """
+    function latex_axis(parent; xlabel = L"", ylabel = L"",
+            xtickformat = latex_ticklabels, ytickformat = latex_ticklabels,
+            kwargs...)
+        Axis(parent;
+            xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
+            xtickformat, ytickformat, kwargs...)
+    end
+
+    function latex_colorbar(parent, plot; label = L"",
+            tickformat = latex_ticklabels, kwargs...)
+        Colorbar(parent, plot;
+            label = as_latex(label), tickformat, kwargs...)
+    end
+
+    """
     Render a completed Makie figure once before handing it to Pluto.
 
     This prevents CairoMakie's reactive text pipeline from drawing a multi-group
@@ -776,14 +794,9 @@ md"""
 
 ### Data repository
 
-1. Enter any repository, family, simulation, `DataCubes`, or direct snapshot-directory path.
-2. Select **Load repository**. HDF5 and FITS runs and snapshots are discovered recursively.
-
 | Data source | Control |
 |:--|:--|
 | Data path | $(@bind data_repository PlutoUI.confirm(PlutoUI.TextField(90; default = DEFAULT_DATA_REPOSITORY, placeholder = "/path/to/data"); label = "Load path")) |
-
-Any folder name and nesting structure is accepted. FITS snapshots may be multi-extension files or directories containing one named FITS image per physical field.
 """
 
 # ╔═╡ 98360288-85ca-4551-bdde-c12c7a329302
@@ -1661,9 +1674,10 @@ begin
                 fontsize = 20)
             return fig
         end
-        axis = Axis(fig[1, 1],
+        axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
+            xticks = DECADE_TICKS,
             xminorticks = IntervalsBetween(9), xminorticksvisible = true)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -1815,8 +1829,6 @@ md"""
 
 ### Heatmap selection
 
-Each selected field creates one projected map for the active snapshot and line of sight. **Display** adds or removes a panel. **Logarithmic scale** transforms the displayed field before plotting; signed $B_{\mathrm{LOS}}$ values use a symmetric logarithm.
-
 **Display projected maps:** $(@bind display_projected_maps PlutoUI.CheckBox(default = true))
 
 | Field | Display | Logarithmic scale |
@@ -1846,7 +1858,6 @@ Each selected field creates one projected map for the active snapshot and line o
 | LIC texture seed | $(@bind lic_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Heatmap contrast percentile | $(@bind color_percentile PlutoUI.Slider(90.0:0.5:100.0; default = 99.0, show_value = true)) |
 
-The energy maps show line-of-sight integrals, $\int E\,\mathrm{d}\ell$, and therefore represent energy per projected area. Arrows and line-integral convolution (LIC) trace the density-weighted plane-of-sky magnetic field. LIC follows the projected field periodically in both directions; its length, iterations, amplitude weighting, opacity, and deterministic seed are adjustable. **Contrast percentile** clips extreme values to preserve structure in the bulk of each map.
 """
 
 # ╔═╡ 62440e86-b560-44ad-bb0a-43ae62e73fc3
@@ -1855,15 +1866,7 @@ md"""
 
 ## 12. Shared observational beam
 
-The optional point-spread function is an elliptical Gaussian beam. Its major and minor FWHM can be specified in sky pixels or parsecs, and its position angle is measured counter-clockwise from the first displayed sky axis. The convolution is performed in Fourier space with periodic boundaries, consistently with the periodic simulation domain.
-
-For polarized observations, the beam is applied to the linear Stokes quantities $I$, $Q$, and $U$ before computing
-
-```math
-P=\sqrt{Q^2+U^2},\qquad p=P/I.
-```
-
-This order captures beam depolarization and avoids the incorrect operation of smoothing $P$ or $p$ directly.
+Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
 
 | Gaussian PSF setting | Control |
 |:--|:--|
@@ -1983,7 +1986,7 @@ begin
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
         for (spec_index, spec) in enumerate(specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
-            axis = Axis(figure[row, column],
+            axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
                 title = as_latex(spec.label), xscale = log10, yscale = log10,
@@ -2065,17 +2068,13 @@ md"""
 
 ## 15. H I Zeeman splitting
 
-This synthetic observation uses the optically thin $\mathrm{H\,I}$ 21-cm relation $N_{\mathrm{HI}}=1.823\times10^{18}\int T_B\,\mathrm{d}v$ and the weak-splitting approximation $V(\nu)=z_BB_{\mathrm{LOS}}(\mathrm{d}I/\mathrm{d}\nu)/2$. The default splitting coefficient is $z_B=2.80\,\mathrm{Hz}\,\mu\mathrm{G}^{-1}$. Select a sky pixel to compare the $\mathrm{H\,I}$-weighted field with the value recovered from the Stokes-$V$ derivative fit.
+Weak-splitting $\mathrm{H\,I}$ Zeeman synthesis. Select a sky pixel to compare the true weighted field with the Stokes-$V$ fit.
 
 | Zeeman figure | Display |
 |:--|:--:|
 | Zeeman maps | $(@bind display_zeeman_maps PlutoUI.CheckBox(default = true)) |
 | Stokes spectra | $(@bind display_zeeman_spectra PlutoUI.CheckBox(default = true)) |
 | Circular-polarization fraction versus $N_{\rm HI}$ | $(@bind display_zeeman_p_column PlutoUI.CheckBox(default = true)) |
-
-The Zeeman relation uses $p_V=\max_v|V(v)|/\max_v I(v)$. This peak definition preserves the antisymmetric Stokes-$V$ signal, whose signed velocity integral is approximately zero.
-
-Here $\rho/(1.4m_{\mathrm H})$ is the hydrogen-nuclei abundance implied by a standard helium correction (equivalently $X\rho/m_{\mathrm H}$ with $X\simeq0.71$), not an independently computed atomic-hydrogen density. The **Neutral H I fraction** therefore acts as an effective atomic fraction: the label $N_{\mathrm{HI}}$ is physically appropriate only when that factor is chosen consistently with the ionized and molecular hydrogen fractions of the simulation.
 
 | Zeeman setting | Control |
 |:--|:--|
@@ -2174,14 +2173,14 @@ begin
         fig_zeeman_maps = Figure(size = (540length(zeeman_map_specs), 410))
         for (index, spec) in enumerate(zeeman_map_specs)
             panel = fig_zeeman_maps[1, index] = GridLayout()
-            ax = Axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+            ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
                 colormap = spec.colormap,
                 colorrange = robust_colorrange(spec.data, color_percentile; diverging = true))
             scatter!(ax, [sky_coordinates[1][zeeman_i]], [sky_coordinates[2][zeeman_j]];
                 marker = :cross, markersize = 20, strokewidth = 3, color = :white)
-            Colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
@@ -2200,11 +2199,11 @@ begin
         fig_zeeman_spectra = Figure(size = (560length(zeeman_spectrum_specs), 390))
         for (index, spectrum) in enumerate(zeeman_spectrum_specs)
             if spectrum == :I
-                ax = Axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
+                ax = latex_axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
                     ylabel = L"I_\nu\;[\mathrm{K}]")
                 lines!(ax, zeeman_velocity_axis, zeeman_I_K; color = MHD_COLORS[1], linewidth = 2.5)
             else
-                ax = Axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
+                ax = latex_axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
                     ylabel = L"V_\nu\;[\mathrm{mK}]")
                 lines!(ax, zeeman_velocity_axis, 1.0e3 .* zeeman_V_K; color = MHD_COLORS[2], linewidth = 2.5)
                 show_zeeman_fit && lines!(ax, zeeman_velocity_axis, 1.0e3 .* zeeman_Vfit_K;
@@ -2302,6 +2301,47 @@ begin
             observational_structure_order, observational_structure_samples;
             heading = "Zeeman observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_zeeman_structure : nothing
+end
+
+# ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
+begin
+    export_figure_options = [
+        "zeeman_maps" => "Zeeman maps",
+        "zeeman_structure" => "Zeeman observable structure functions",
+        "zeeman_spectra" => "Zeeman Stokes spectra",
+        "zeeman_p_column" => "Zeeman polarization versus column density",
+    ]
+    export_figure_registry = Dict(
+        "zeeman_maps" => fig_zeeman_maps,
+        "zeeman_structure" => fig_zeeman_structure,
+        "zeeman_spectra" => fig_zeeman_spectra,
+        "zeeman_p_column" => fig_zeeman_p_column,
+    )
+    nothing
+end
+
+# ╔═╡ e1000002-6f8c-4d0c-9a10-000000000002
+md"""
+---
+
+## Figure export
+
+| Export setting | Control |
+|:--|:--|
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "zeeman_maps")) |
+| Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
+"""
+
+# ╔═╡ e1000003-6f8c-4d0c-9a10-000000000003
+begin
+    export_extension = lowercase(export_figure_format)
+    export_mime = export_figure_format == "PNG" ? MIME"image/png"() : MIME"application/pdf"()
+    export_buffer = IOBuffer()
+    show(export_buffer, export_mime, export_figure_registry[export_figure_key])
+    export_bytes = take!(export_buffer)
+    export_run_slug = replace(lowercase(selected_run), r"[^a-z0-9]+" => "_")
+    export_filename = "zeeman_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
+    PlutoUI.DownloadButton(export_bytes, export_filename)
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -4352,5 +4392,8 @@ version = "4.1.0+0"
 # ╟─8f9e5bd2-8c7f-45b9-a92c-ad4b20d9ef21
 # ╟─fd817f74-8bc0-4df7-85ad-45a95522f80a
 # ╠═a0030003-6f8c-4d0c-9a10-000000000003
+# ╠═e1000001-6f8c-4d0c-9a10-000000000001
+# ╠═e1000002-6f8c-4d0c-9a10-000000000002
+# ╠═e1000003-6f8c-4d0c-9a10-000000000003
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

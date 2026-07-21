@@ -64,6 +64,24 @@ begin
     as_latex(label::AbstractString) = latexstring(label)
 
     """
+    Create a Makie axis whose labels and numeric tick labels are always
+    rendered by MathTeXEngine, including axes with locally customized ticks.
+    """
+    function latex_axis(parent; xlabel = L"", ylabel = L"",
+            xtickformat = latex_ticklabels, ytickformat = latex_ticklabels,
+            kwargs...)
+        Axis(parent;
+            xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
+            xtickformat, ytickformat, kwargs...)
+    end
+
+    function latex_colorbar(parent, plot; label = L"",
+            tickformat = latex_ticklabels, kwargs...)
+        Colorbar(parent, plot;
+            label = as_latex(label), tickformat, kwargs...)
+    end
+
+    """
     Render a completed Makie figure once before handing it to Pluto.
 
     This prevents CairoMakie's reactive text pipeline from drawing a multi-group
@@ -776,14 +794,9 @@ md"""
 
 ### Data repository
 
-1. Enter any repository, family, simulation, `DataCubes`, or direct snapshot-directory path.
-2. Select **Load repository**. HDF5 and FITS runs and snapshots are discovered recursively.
-
 | Data source | Control |
 |:--|:--|
 | Data path | $(@bind data_repository PlutoUI.confirm(PlutoUI.TextField(90; default = DEFAULT_DATA_REPOSITORY, placeholder = "/path/to/data"); label = "Load path")) |
-
-Any folder name and nesting structure is accepted. FITS snapshots may be multi-extension files or directories containing one named FITS image per physical field.
 """
 
 # ╔═╡ 98360288-85ca-4551-bdde-c12c7a329302
@@ -1351,22 +1364,7 @@ Markdown.parse("""
 md"""
 ### Navigation and physical units
 
-Choose the data cube and projection direction in the first table. Because the HDF5 files do not provide unit attributes, the second table defines the conversion from stored values to physical units. The default density scale is $10^{-12}\,\mathrm{g\,cm^{-3}}$ per stored unit; pressure, velocity, magnetic field, length, and time default to $\mathrm{erg\,cm^{-3}}$, $\mathrm{km\,s^{-1}}$, $\mathrm{G}$, $\mathrm{pc}$, and $\mathrm{Myr}$.
-
-Comparative figures automatically detect the parameter varied from the selected path: Mach number for `VaryingMach`, grid resolution $N^3$ for `VaryingRes`, and $\chi=E_{\mathrm{comp}}/E_{\mathrm{sol}}$ for `VaryingRatio`.
-
-#### FITS field convention
-
-For a multi-extension FITS snapshot, use `EXTNAME` values such as `RHO`, `PRESSURE`, `VX`, `VY`, `VZ`, and either `BX`, `BY`, `BZ` or the face pairs `BX_L/BX_R`, `BY_L/BY_R`, `BZ_L/BZ_R`. The same names may be used as filenames inside one directory per snapshot. `L` and `TIME` are optional image extensions; the loader also accepts `LBOX`, `BOXSIZE`, `CDELT1..3`, `TIME`, `T`, or `SIMTIME` header keywords. If time metadata are absent, the final number in the filename or snapshot-directory name is used.
-
-> **Analysis scope.** The **Run** and **Snapshot** controls select the active three-dimensional cube used by maps, PDFs, spectra, structure functions, and synthetic observations. **Simulations in comparative plots** independently selects the runs used by time histories, growth-rate relations, phase curves, and comparative energy or enstrophy diagnostics.
-At startup, the active run is the only simulation selected for comparative plots. Add as many runs as needed with **Simulations in comparative plots**; every selected run is included.
-
-- The adiabatic index $\gamma$ sets the sound-speed and thermal-energy convention.
-- The mean particle mass $\mu m_{\mathrm H}$ defines $n=\rho/(\mu m_{\mathrm H})$ and $T=\mu m_{\mathrm H}P/(k_{\mathrm B}\rho)$.
-- Magnetic energy and Alfvén speed use Gaussian CGS units: $E_{\mathrm B}=B^2/(8\pi)$ and $v_{\mathrm A}=B/\sqrt{4\pi\rho}$.
-- **PDF weighting** selects equal-volume cell weighting or mass weighting.
-- **Number of bins** controls the resolution of PDFs and density-binned diagnostics.
+**Run** selects the active cube. **Simulations in comparative plots** starts with that single run and can contain any number of simulations.
 """
 
 # ╔═╡ e734297f-506e-45e1-8cb7-b2ae671893eb
@@ -1694,9 +1692,10 @@ begin
                 fontsize = 20)
             return fig
         end
-        axis = Axis(fig[1, 1],
+        axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
+            xticks = DECADE_TICKS,
             xminorticks = IntervalsBetween(9), xminorticksvisible = true)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -1899,8 +1898,6 @@ md"""
 
 ### Heatmap selection
 
-Each selected field creates one projected map for the active snapshot and line of sight. **Display** adds or removes a panel. **Logarithmic scale** transforms the displayed field before plotting; signed $B_{\mathrm{LOS}}$ values use a symmetric logarithm.
-
 **Display projected maps:** $(@bind display_projected_maps PlutoUI.CheckBox(default = true))
 
 | Field | Display | Logarithmic scale |
@@ -1930,7 +1927,6 @@ Each selected field creates one projected map for the active snapshot and line o
 | LIC texture seed | $(@bind lic_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Heatmap contrast percentile | $(@bind color_percentile PlutoUI.Slider(90.0:0.5:100.0; default = 99.0, show_value = true)) |
 
-The energy maps show line-of-sight integrals, $\int E\,\mathrm{d}\ell$, and therefore represent energy per projected area. Arrows and line-integral convolution (LIC) trace the density-weighted plane-of-sky magnetic field. LIC follows the projected field periodically in both directions; its length, iterations, amplitude weighting, opacity, and deterministic seed are adjustable. **Contrast percentile** clips extreme values to preserve structure in the bulk of each map.
 """
 
 # ╔═╡ 76d249f9-d6fd-4513-aa76-7fb386058c37
@@ -1983,7 +1979,7 @@ begin
         for (index, spec) in enumerate(heatmap_specs)
             row, col = cld(index, ncols), mod1(index, ncols)
             panel = fig_maps[row, col] = GridLayout()
-            ax = Axis(panel[1, 1],
+            ax = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
@@ -1995,7 +1991,7 @@ begin
                 heatmap!(ax, sky_coordinates[1], sky_coordinates[2], projected_B_lic;
                     colormap = lic_colors, colorrange = (0.0, 1.0), transparency = true)
             end
-            Colorbar(panel[1, 2], hm, label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], hm, label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 20)
 
             if spec.overlay_B && show_projected_B
@@ -2103,8 +2099,10 @@ begin
     else
         fig_pdf = Figure(size = (420length(pdf_specs), 430))
         for (j, spec) in enumerate(pdf_specs)
-            ax = Axis(fig_pdf[1, j], xlabel = spec.xlabel,
-                ylabel = L"\mathrm{d}\mathcal{P}/\mathrm{d}\log_{10}X", xscale = log10)
+            ax = latex_axis(fig_pdf[1, j], xlabel = spec.xlabel,
+                ylabel = L"\mathrm{d}\mathcal{P}/\mathrm{d}\log_{10}X", xscale = log10,
+                xticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), xminorticksvisible = true)
             for label in comparison_run_labels
                 logx, probability = spec.pdfs[label]
                 stairs!(ax, 10.0 .^ logx, probability;
@@ -2207,7 +2205,7 @@ begin
     phase_heatmap = nothing
     for (panel_index, label) in enumerate(comparison_run_labels)
         phase_data = phase_data_by_run[label]
-        phase_axis = Axis(fig_phase[1, panel_index],
+        phase_axis = latex_axis(fig_phase[1, panel_index],
             xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
             ylabel = L"\log_{10}\!\left[(P/k_B)/(\mathrm{K\,cm}^{-3})\right]",
             title = latex_run_label(label))
@@ -2230,7 +2228,7 @@ begin
         ylims!(phase_axis, first(phase_data.ycenters) - phase_dy / 2,
             last(phase_data.ycenters) + phase_dy / 2)
     end
-    Colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
+    latex_colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
         label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)
     colsize!(fig_phase.layout, phase_panel_count + 1, 22)
     display_phase_diagram ? fig_phase : nothing
@@ -2491,7 +2489,7 @@ begin
         gamma_ncols = length(gamma_panel_specs) == 1 ? 1 : min(3, length(gamma_panel_specs))
         fig_gamma_relations = Figure(size = (430gamma_ncols, 450))
         for (panel_index, spec) in enumerate(gamma_panel_specs)
-            gamma_axis = Axis(fig_gamma_relations[1, panel_index],
+            gamma_axis = latex_axis(fig_gamma_relations[1, panel_index],
                 xlabel = spec.xlabel, ylabel = L"\Gamma_B\;[\mathrm{Myr}^{-1}]")
             hlines!(gamma_axis, [0.0]; color = (:gray35, 0.65),
                 linestyle = :dash, linewidth = 1.5)
@@ -2565,7 +2563,7 @@ begin
         normalized_B_ncols = length(normalized_B_panel_specs)
         fig_normalized_B_relations = Figure(size = (430normalized_B_ncols, 500))
         for (panel_index, spec) in enumerate(normalized_B_panel_specs)
-            axis = Axis(fig_normalized_B_relations[1, panel_index],
+            axis = latex_axis(fig_normalized_B_relations[1, panel_index],
                 xlabel = spec.xlabel, ylabel = L"\ln(B/B_0)")
             hlines!(axis, [0.0]; color = (:gray35, 0.65), linestyle = :dash, linewidth = 1.4)
             for label in normalized_B_runs
@@ -2615,7 +2613,7 @@ begin
         growth_column = 0
         if show_growth_fit_panel
             growth_column += 1
-            ag1 = Axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
+            ag1 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
                 ylabel = L"\ln(B/B_0)")
             lines!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run],
                 linewidth = 2.5, label = "Data")
@@ -2636,7 +2634,7 @@ begin
         end
         if show_growth_theory_panel
             growth_column += 1
-            ag2 = Axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
+            ag2 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
                 ylabel = L"\ln(B/B_0)")
             lines!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run],
                 linewidth = 2.5, label = "Data")
@@ -2699,14 +2697,19 @@ begin
         for (index, key) in enumerate(time_panel_keys)
             row, col = cld(index, time_ncols), mod1(index, time_ncols)
             time_axes[key] = key == :mach ?
-                Axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}") :
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}") :
                 key == :alfven ?
-                Axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}_{\mathrm{A}}") :
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}_{\mathrm{A}}") :
                 key == :magnetic ?
-                Axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
-                    ylabel = L"B\;[\mu\mathrm{G}]", yscale = log_B_time ? log10 : identity) :
-                Axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
-                    ylabel = L"E_B/E_{\mathrm{kin}}", yscale = log10)
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
+                    ylabel = L"B\;[\mu\mathrm{G}]", yscale = log_B_time ? log10 : identity,
+                    yticks = log_B_time ? DECADE_TICKS : automatic,
+                    yminorticks = log_B_time ? IntervalsBetween(9) : IntervalsBetween(5),
+                    yminorticksvisible = true) :
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
+                    ylabel = L"E_B/E_{\mathrm{kin}}", yscale = log10,
+                    yticks = DECADE_TICKS,
+                    yminorticks = IntervalsBetween(9), yminorticksvisible = true)
         end
         for label in comparison_run_labels
             s = all_series[label]
@@ -2835,9 +2838,12 @@ begin
         phase_B_ylabel = phase_B_statistic == "Mean field ⟨B⟩" ?
             L"\langle |B|\rangle_{\mathrm{phase}}\;[\mu\mathrm{G}]" :
             L"B_{\mathrm{rms,phase}}\;[\mu\mathrm{G}]"
-        phase_B_axis = Axis(fig_phase_B_time[1, 1],
+        phase_B_axis = latex_axis(fig_phase_B_time[1, 1],
             xlabel = L"t\;[\mathrm{Myr}]", ylabel = phase_B_ylabel,
-            yscale = log_phase_B_time ? log10 : identity)
+            yscale = log_phase_B_time ? log10 : identity,
+            yticks = log_phase_B_time ? DECADE_TICKS : automatic,
+            yminorticks = log_phase_B_time ? IntervalsBetween(9) : IntervalsBetween(5),
+            yminorticksvisible = true)
         statistic_suffix = phase_B_statistic == "Mean field ⟨B⟩" ? "mean" : "rms"
         for label in comparison_run_labels, spec in phase_B_specs
             phase_B_series = phase_B_series_by_run[label]
@@ -2893,20 +2899,20 @@ begin
         if show_logB_map
             logB_column += 1
             map_panel = fig_logB[1, logB_column] = GridLayout()
-            axmap = Axis(map_panel[1, 1],
+            axmap = latex_axis(map_panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             limB = max(maximum(abs, filter(isfinite, vec(logB_map)); init = 0.0),
                 sqrt(eps(Float64)))
             hb = heatmap!(axmap, sky_coordinates[1], sky_coordinates[2], logB_map;
                 colormap = :balance, colorrange = (-limB, limB))
-            Colorbar(map_panel[1, 2], hb,
+            latex_colorbar(map_panel[1, 2], hb,
                 label = L"\log_{10}(B/\langle B\rangle)", tickformat = latex_ticklabels)
             colsize!(map_panel, 2, 22)
         end
         if show_logB_histogram
             logB_column += 1
-            axhist = Axis(fig_logB[1, logB_column],
+            axhist = latex_axis(fig_logB[1, logB_column],
                 xlabel = L"\log_{10}(B/\langle B\rangle)", ylabel = L"\mathcal{P}")
             for label in comparison_run_labels
                 logB_ratio_x, logB_ratio_p = normalized_B_pdfs[label]
@@ -3054,9 +3060,12 @@ begin
             ylabel = key == :kin_mag ? L"E_{\mathrm{kin}}/E_{\mathrm{mag}}" :
                 key == :therm_mag ? L"E_{\mathrm{therm}}/E_{\mathrm{mag}}" :
                 L"E_{\mathrm{kin}}/E_{\mathrm{therm}}"
-            energy_axes[key] = Axis(fig_energy[1, index],
+            energy_axes[key] = latex_axis(fig_energy[1, index],
                 xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = ylabel,
-                xscale = log10, yscale = log10)
+                xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
             hlines!(energy_axes[key], [1.0]; color = (:gray45, 0.55),
                 linestyle = :dash, linewidth = 1.5)
         end
@@ -3102,8 +3111,10 @@ begin
     else
         fig_energy_time = Figure(size = (500length(energy_time_specs), 470))
         for (index, spec) in enumerate(energy_time_specs)
-            ax = Axis(fig_energy_time[1, index],
-                xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel, yscale = log10)
+            ax = latex_axis(fig_energy_time[1, index],
+                xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel, yscale = log10,
+                yticks = DECADE_TICKS,
+                yminorticks = IntervalsBetween(9), yminorticksvisible = true)
             hlines!(ax, [1.0]; color = (:gray45, 0.55), linestyle = :dash, linewidth = 1.5)
             for label in comparison_run_labels
                 series = all_series[label]
@@ -3203,12 +3214,12 @@ begin
         fig_vorticity = Figure(size = (620length(vorticity_map_specs), 520))
         for (index, spec) in enumerate(vorticity_map_specs)
             panel = fig_vorticity[1, index] = GridLayout()
-            axis = Axis(panel[1, 1],
+            axis = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             heat = heatmap!(axis, sky_coordinates[1], sky_coordinates[2], spec.data;
                 colormap = spec.colormap)
-            Colorbar(panel[1, 2], heat; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            latex_colorbar(panel[1, 2], heat; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
@@ -3289,10 +3300,11 @@ begin
         fig_enstrophy_density = Figure(size = (610length(enstrophy_density_panels), 500))
         for (panel_index, panel_kind) in enumerate(enstrophy_density_panels)
             if panel_kind == :profiles
-                axis = Axis(fig_enstrophy_density[1, panel_index],
+                axis = latex_axis(fig_enstrophy_density[1, panel_index],
                     xlabel = L"n\;[\mathrm{cm}^{-3}]",
                     ylabel = L"\langle\mathcal{E}_{\omega}\rangle_n\;[\mathrm{Myr}^{-2}]",
                     xscale = log10, yscale = log10,
+                    xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                     xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                     xminorticksvisible = true, yminorticksvisible = true)
                 for label in comparison_run_labels
@@ -3307,8 +3319,9 @@ begin
             else
                 panel = fig_enstrophy_density[1, panel_index] = GridLayout()
                 parameter_positions = collect(1:length(comparison_run_labels))
-                axis = Axis(panel[1, 1], xlabel = enstrophy_parameter_axis_label,
+                axis = latex_axis(panel[1, 1], xlabel = enstrophy_parameter_axis_label,
                     ylabel = L"n\;[\mathrm{cm}^{-3}]", yscale = log10,
+                    yticks = DECADE_TICKS,
                     yminorticks = IntervalsBetween(9), yminorticksvisible = true,
                     xticks = parameter_positions,
                     xtickformat = values -> [
@@ -3318,7 +3331,7 @@ begin
                 log_enstrophy = safe_log10.(enstrophy_profile_matrix')
                 heat = heatmap!(axis, parameter_positions, density_number_centers,
                     log_enstrophy; colormap = :magma)
-                Colorbar(panel[1, 2], heat;
+                latex_colorbar(panel[1, 2], heat;
                     label = L"\log_{10}\!\left(\langle\mathcal{E}_{\omega}\rangle_n/\mathrm{Myr}^{-2}\right)",
                     tickformat = latex_ticklabels)
                 colsize!(panel, 2, 22)
@@ -3367,7 +3380,7 @@ begin
     else
         fig_spectra = Figure(size = (400length(spectrum_specs), 390))
         for (index, spec) in enumerate(spectrum_specs)
-            axis = Axis(fig_spectra[1, index], xlabel = L"k\;[\mathrm{pc}^{-1}]",
+            axis = latex_axis(fig_spectra[1, index], xlabel = L"k\;[\mathrm{pc}^{-1}]",
                 ylabel = spec.ylabel, xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
@@ -3474,7 +3487,7 @@ begin
     else
         fig_structure = Figure(size = (400length(structure_specs), 390))
         for (index, spec) in enumerate(structure_specs)
-            axis = Axis(fig_structure[1, index], xlabel = L"\ell\;[\mathrm{pc}]",
+            axis = latex_axis(fig_structure[1, index], xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = spec.ylabel, xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
@@ -3488,214 +3501,67 @@ begin
     display_structure_functions ? fig_structure : nothing
 end
 
-# ╔═╡ 62440e86-b560-44ad-bb0a-43ae62e73fc3
+# ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
+begin
+    export_figure_options = [
+        "heatmaps" => "Projected heatmaps",
+        "pdfs" => "Probability density functions",
+        "phase_diagram" => "Pressure-density phase diagram",
+        "time_evolution" => "Global time evolution",
+        "phase_magnetic_time" => "Magnetic field by thermal phase",
+        "magnetic_fit" => "Magnetic exponential fit",
+        "growth_rate_relations" => "Growth rate versus time and Mach numbers",
+        "normalized_magnetic_relations" => "Normalized magnetic evolution",
+        "normalized_magnetic_field" => "Normalized magnetic-field distribution",
+        "energy_ratios" => "Energy ratios by density",
+        "energy_time" => "Energy ratios versus time",
+        "vorticity" => "Vorticity map",
+        "enstrophy_density" => "Enstrophy by density",
+        "power_spectra" => "Power spectra",
+        "structure_functions" => "Structure functions",
+    ]
+    export_figure_registry = Dict(
+        "heatmaps" => fig_maps,
+        "pdfs" => fig_pdf,
+        "phase_diagram" => fig_phase,
+        "time_evolution" => fig_time,
+        "phase_magnetic_time" => fig_phase_B_time,
+        "magnetic_fit" => fig_growth,
+        "growth_rate_relations" => fig_gamma_relations,
+        "normalized_magnetic_relations" => fig_normalized_B_relations,
+        "normalized_magnetic_field" => fig_logB,
+        "energy_ratios" => fig_energy,
+        "energy_time" => fig_energy_time,
+        "vorticity" => fig_vorticity,
+        "enstrophy_density" => fig_enstrophy_density,
+        "power_spectra" => fig_spectra,
+        "structure_functions" => fig_structure,
+    )
+    nothing
+end
+
+# ╔═╡ e1000002-6f8c-4d0c-9a10-000000000002
 md"""
 ---
 
-## 12. Shared observational beam
+## Figure export
 
-The optional point-spread function is an elliptical Gaussian beam. Its major and minor FWHM can be specified in sky pixels or parsecs, and its position angle is measured counter-clockwise from the first displayed sky axis. The convolution is performed in Fourier space with periodic boundaries, consistently with the periodic simulation domain.
-
-For polarized observations, the beam is applied to the linear Stokes quantities $I$, $Q$, and $U$ before computing
-
-```math
-P=\sqrt{Q^2+U^2},\qquad p=P/I.
-```
-
-This order captures beam depolarization and avoids the incorrect operation of smoothing $P$ or $p$ directly.
-
-| Gaussian PSF setting | Control |
+| Export setting | Control |
 |:--|:--|
-| Apply Gaussian beam | $(@bind apply_observational_beam PlutoUI.CheckBox(default = false)) |
-| Beam-width unit | $(@bind observational_beam_unit PlutoUI.Select(["Sky pixels" => "pixel", "Parsecs" => "pc"]; default = "pixel")) |
-| Major-axis FWHM | $(@bind observational_beam_fwhm_major PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
-| Minor-axis FWHM | $(@bind observational_beam_fwhm_minor PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
-| Position angle [$^\circ$] | $(@bind observational_beam_pa_deg PlutoUI.Slider(0.0:1.0:180.0; default = 0.0, show_value = true)) |
-| Display observable structure functions | $(@bind display_observational_structure_functions PlutoUI.CheckBox(default = true)) |
-| Observable structure-function order $p$ | $(@bind observational_structure_order PlutoUI.Slider(1:4; default = 2, show_value = true)) |
-| Number of observable separation samples | $(@bind observational_structure_samples PlutoUI.Slider(4:2:20; default = 10, show_value = true)) |
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "heatmaps")) |
+| Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
 """
 
-# ╔═╡ 47b786d6-c7b5-44f4-946a-b8c485ad6380
+# ╔═╡ e1000003-6f8c-4d0c-9a10-000000000003
 begin
-    function observational_beam_width_pixels(c, plane_dims)
-        major = max(Float64(observational_beam_fwhm_major), eps(Float64))
-        minor = max(Float64(observational_beam_fwhm_minor), eps(Float64))
-        if observational_beam_unit == "pc"
-            dx = c.L[plane_dims[1]] / size(c.rho, plane_dims[1])
-            dy = c.L[plane_dims[2]] / size(c.rho, plane_dims[2])
-            reference_pixel = sqrt(dx * dy)
-            major /= reference_pixel
-            minor /= reference_pixel
-        end
-        max(major, minor), min(major, minor)
-    end
-
-    function gaussian_beam_transfer(map_size, fwhm_major_pix, fwhm_minor_pix, pa_deg)
-        nx, ny = map_size
-        sigma_major = Float64(fwhm_major_pix) / (2sqrt(2log(2)))
-        sigma_minor = Float64(fwhm_minor_pix) / (2sqrt(2log(2)))
-        angle = deg2rad(Float64(pa_deg))
-        cosine, sine = cos(angle), sin(angle)
-        frequency_x = reshape(Float64.(FFTW.fftfreq(nx, 1.0)), nx, 1)
-        frequency_y = reshape(Float64.(FFTW.fftfreq(ny, 1.0)), 1, ny)
-        frequency_major = cosine .* frequency_x .+ sine .* frequency_y
-        frequency_minor = -sine .* frequency_x .+ cosine .* frequency_y
-        exp.(-2pi^2 .* (sigma_major^2 .* frequency_major .^ 2 .+
-            sigma_minor^2 .* frequency_minor .^ 2))
-    end
-
-    function apply_gaussian_beam_2d(image, fwhm_major_pix, fwhm_minor_pix, pa_deg)
-        transfer = gaussian_beam_transfer(size(image), fwhm_major_pix,
-            fwhm_minor_pix, pa_deg)
-        valid = isfinite.(image)
-        all(valid) && begin
-            filtered = ifft(fft(image) .* transfer)
-            return eltype(image) <: Real ? real.(filtered) : filtered
-        end
-        filled = ifelse.(valid, image, zero(eltype(image)))
-        filtered = ifft(fft(filled) .* transfer)
-        normalization = real.(ifft(fft(Float64.(valid)) .* transfer))
-        output = eltype(image) <: Real ? real.(filtered) : filtered
-        map((value, weight) -> weight > sqrt(eps(Float64)) ? value / weight :
-            convert(eltype(output), NaN), output, normalization)
-    end
-
-    function apply_observational_beam_2d(image, c, plane_dims)
-        apply_observational_beam || return copy(image)
-        major, minor = observational_beam_width_pixels(c, plane_dims)
-        apply_gaussian_beam_2d(image, major, minor, observational_beam_pa_deg)
-    end
-
-    function apply_observational_beam_cube(cube_xyν, c, plane_dims)
-        apply_observational_beam || return copy(cube_xyν)
-        major, minor = observational_beam_width_pixels(c, plane_dims)
-        output = similar(cube_xyν, promote_type(eltype(cube_xyν), Float64))
-        @views for channel in axes(cube_xyν, 3)
-            output[:, :, channel] .= apply_gaussian_beam_2d(
-                cube_xyν[:, :, channel], major, minor, observational_beam_pa_deg)
-        end
-        output
-    end
-
-    "Axis-averaged periodic scalar structure function of a two-dimensional map."
-    function scalar_structure_function_2d(field, lags, order; period = nothing)
-        ndims(field) == 2 || error("Projected structure functions require a 2-D map.")
-        data = Float64.(field)
-        shifted = similar(data)
-        values = zeros(Float64, length(lags))
-        for (lag_index, lag) in pairs(lags)
-            moment_sum = 0.0
-            moment_count = 0
-            for dimension in 1:2
-                shift = ntuple(d -> d == dimension ? lag : 0, 2)
-                circshift!(shifted, data, shift)
-                for index in eachindex(data)
-                    increment = shifted[index] - data[index]
-                    if !isnothing(period)
-                        increment = mod(increment + period / 2, period) - period / 2
-                    end
-                    moment = abs(increment)^order
-                    if isfinite(moment)
-                        moment_sum += moment
-                        moment_count += 1
-                    end
-                end
-            end
-            values[lag_index] = moment_count > 0 ? moment_sum / moment_count : NaN
-        end
-        values
-    end
-
-    "Plot projected structure functions for a collection of observable maps."
-    function observational_structure_figure(specs, c, plane_dims, order, samples;
-            heading = "Projected observable structure functions")
-        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
-        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
-            length = Int(samples)))))
-        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
-            for dimension in plane_dims)
-        separations_pc = lags .* pixel_scale_pc
-        ncols = min(2, length(specs))
-        nrows = cld(length(specs), ncols)
-        figure = Figure(size = (540ncols, 390nrows + 55))
-        Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
-        for (spec_index, spec) in enumerate(specs)
-            row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
-            axis = Axis(figure[row, column],
-                xlabel = L"\ell\;[\mathrm{pc}]",
-                ylabel = latexstring("S_{", order, "}(\\ell)"),
-                title = as_latex(spec.label), xscale = log10, yscale = log10,
-                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
-                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
-                xminorticksvisible = true, yminorticksvisible = true)
-            values = scalar_structure_function_2d(spec.data, lags, order;
-                period = spec.period)
-            valid = isfinite.(values) .& (values .> 0)
-            if any(valid)
-                lines!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, linewidth = 2.5)
-                scatter!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, markersize = 6)
-            else
-                text!(axis, 0.5, 0.5; text = "constant or invalid map",
-                    space = :relative, align = (:center, :center))
-            end
-        end
-        figure
-    end
-
-    function moose_instrument_transfer(map_size, largest_scale_pix, smallest_scale_pix)
-        nx, ny = map_size
-        largest = max(Float64(largest_scale_pix), eps(Float64))
-        smallest = max(Float64(smallest_scale_pix), 2.0)
-        frequency_x = reshape(Float64.(FFTW.fftfreq(nx, 1.0)), nx, 1)
-        frequency_y = reshape(Float64.(FFTW.fftfreq(ny, 1.0)), 1, ny)
-        frequency2 = frequency_x .^ 2 .+ frequency_y .^ 2
-        low_frequency = 1 / largest
-        high_frequency = min(1 / smallest, 0.5)
-        Float64.((frequency2 .>= low_frequency^2) .&
-            (frequency2 .<= high_frequency^2))
-    end
-
-    function apply_moose_interferometer_2d(image, transfer)
-        size(image) == size(transfer) || error("MOOSE transfer-mask shape mismatch.")
-        finite_image = ifelse.(isfinite.(image), image, zero(eltype(image)))
-        filtered = ifft(fft(finite_image) .* transfer)
-        eltype(image) <: Real ? real.(filtered) : filtered
-    end
-
-    function apply_moose_interferometer_cube(cube_xyν, transfer)
-        output = similar(cube_xyν, promote_type(eltype(cube_xyν), Float64))
-        @views for channel in axes(cube_xyν, 3)
-            output[:, :, channel] .= apply_moose_interferometer_2d(
-                cube_xyν[:, :, channel], transfer)
-        end
-        output
-    end
-
-    function add_moose_qu_noise!(Q, U, snr, rng)
-        signal_to_noise = Float64(snr)
-        isfinite(signal_to_noise) && signal_to_noise > 0 ||
-            error("MOOSE Q/U signal-to-noise ratio must be finite and positive.")
-        if ndims(Q) == 2
-            polarized_rms = sqrt(finite_mean(abs2.(Q); default = 0.0) +
-                finite_mean(abs2.(U); default = 0.0))
-            sigma = polarized_rms / signal_to_noise
-            sigma > 0 && (Q .+= sigma .* randn(rng, size(Q));
-                U .+= sigma .* randn(rng, size(U)))
-        else
-            @views for channel in axes(Q, 3)
-                Qchannel, Uchannel = Q[:, :, channel], U[:, :, channel]
-                polarized_rms = sqrt(finite_mean(abs2.(Qchannel); default = 0.0) +
-                    finite_mean(abs2.(Uchannel); default = 0.0))
-                sigma = polarized_rms / signal_to_noise
-                sigma > 0 && (Qchannel .+= sigma .* randn(rng, size(Qchannel));
-                    Uchannel .+= sigma .* randn(rng, size(Uchannel)))
-            end
-        end
-        Q, U
-    end
+    export_extension = lowercase(export_figure_format)
+    export_mime = export_figure_format == "PNG" ? MIME"image/png"() : MIME"application/pdf"()
+    export_buffer = IOBuffer()
+    show(export_buffer, export_mime, export_figure_registry[export_figure_key])
+    export_bytes = take!(export_buffer)
+    export_run_slug = replace(lowercase(selected_run), r"[^a-z0-9]+" => "_")
+    export_filename = "dynamo_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
+    PlutoUI.DownloadButton(export_bytes, export_filename)
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -5781,7 +5647,8 @@ version = "4.1.0+0"
 # ╠═24e60849-1c70-4df3-bd17-57d29949b7a6
 # ╠═4b16d83f-4a1d-49e7-9270-8f573fd46835
 # ╠═d69dd1ce-312a-48e0-a478-b470b299ed1b
-# ╟─62440e86-b560-44ad-bb0a-43ae62e73fc3
-# ╠═47b786d6-c7b5-44f4-946a-b8c485ad6380
+# ╠═e1000001-6f8c-4d0c-9a10-000000000001
+# ╠═e1000002-6f8c-4d0c-9a10-000000000002
+# ╠═e1000003-6f8c-4d0c-9a10-000000000003
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

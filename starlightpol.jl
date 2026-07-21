@@ -64,6 +64,24 @@ begin
     as_latex(label::AbstractString) = latexstring(label)
 
     """
+    Create a Makie axis whose labels and numeric tick labels are always
+    rendered by MathTeXEngine, including axes with locally customized ticks.
+    """
+    function latex_axis(parent; xlabel = L"", ylabel = L"",
+            xtickformat = latex_ticklabels, ytickformat = latex_ticklabels,
+            kwargs...)
+        Axis(parent;
+            xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
+            xtickformat, ytickformat, kwargs...)
+    end
+
+    function latex_colorbar(parent, plot; label = L"",
+            tickformat = latex_ticklabels, kwargs...)
+        Colorbar(parent, plot;
+            label = as_latex(label), tickformat, kwargs...)
+    end
+
+    """
     Render a completed Makie figure once before handing it to Pluto.
 
     This prevents CairoMakie's reactive text pipeline from drawing a multi-group
@@ -776,14 +794,9 @@ md"""
 
 ### Data repository
 
-1. Enter any repository, family, simulation, `DataCubes`, or direct snapshot-directory path.
-2. Select **Load repository**. HDF5 and FITS runs and snapshots are discovered recursively.
-
 | Data source | Control |
 |:--|:--|
 | Data path | $(@bind data_repository PlutoUI.confirm(PlutoUI.TextField(90; default = DEFAULT_DATA_REPOSITORY, placeholder = "/path/to/data"); label = "Load path")) |
-
-Any folder name and nesting structure is accepted. FITS snapshots may be multi-extension files or directories containing one named FITS image per physical field.
 """
 
 # ╔═╡ 98360288-85ca-4551-bdde-c12c7a329302
@@ -1661,9 +1674,10 @@ begin
                 fontsize = 20)
             return fig
         end
-        axis = Axis(fig[1, 1],
+        axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
+            xticks = DECADE_TICKS,
             xminorticks = IntervalsBetween(9), xminorticksvisible = true)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -1815,8 +1829,6 @@ md"""
 
 ### Heatmap selection
 
-Each selected field creates one projected map for the active snapshot and line of sight. **Display** adds or removes a panel. **Logarithmic scale** transforms the displayed field before plotting; signed $B_{\mathrm{LOS}}$ values use a symmetric logarithm.
-
 **Display projected maps:** $(@bind display_projected_maps PlutoUI.CheckBox(default = true))
 
 | Field | Display | Logarithmic scale |
@@ -1846,7 +1858,6 @@ Each selected field creates one projected map for the active snapshot and line o
 | LIC texture seed | $(@bind lic_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Heatmap contrast percentile | $(@bind color_percentile PlutoUI.Slider(90.0:0.5:100.0; default = 99.0, show_value = true)) |
 
-The energy maps show line-of-sight integrals, $\int E\,\mathrm{d}\ell$, and therefore represent energy per projected area. Arrows and line-integral convolution (LIC) trace the density-weighted plane-of-sky magnetic field. LIC follows the projected field periodically in both directions; its length, iterations, amplitude weighting, opacity, and deterministic seed are adjustable. **Contrast percentile** clips extreme values to preserve structure in the bulk of each map.
 """
 
 # ╔═╡ 62440e86-b560-44ad-bb0a-43ae62e73fc3
@@ -1855,15 +1866,7 @@ md"""
 
 ## 12. Shared observational beam
 
-The optional point-spread function is an elliptical Gaussian beam. Its major and minor FWHM can be specified in sky pixels or parsecs, and its position angle is measured counter-clockwise from the first displayed sky axis. The convolution is performed in Fourier space with periodic boundaries, consistently with the periodic simulation domain.
-
-For polarized observations, the beam is applied to the linear Stokes quantities $I$, $Q$, and $U$ before computing
-
-```math
-P=\sqrt{Q^2+U^2},\qquad p=P/I.
-```
-
-This order captures beam depolarization and avoids the incorrect operation of smoothing $P$ or $p$ directly.
+Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
 
 | Gaussian PSF setting | Control |
 |:--|:--|
@@ -1983,7 +1986,7 @@ begin
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
         for (spec_index, spec) in enumerate(specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
-            axis = Axis(figure[row, column],
+            axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
                 title = as_latex(spec.label), xscale = log10, yscale = log10,
@@ -2065,16 +2068,7 @@ md"""
 
 ## 14. Dichroic starlight polarization
 
-This section adapts the cell-by-cell Mueller propagation implemented by `StarlightPol` to the active simulation cube. The observer is placed at the zero edge of the selected line of sight, and every sky pixel contains one background star at the selected distance. Samples behind the star are ignored.
-
-The first plotted sky coordinate defines local east and the second defines local north. The magnetic position angle therefore follows the IAU convention, north through east,
-
-```math
-\psi_B=\operatorname{atan2}(B_{\rm east},B_{\rm north}),\qquad
-\gamma_B=\arccos\!\left(B_{\rm LOS}/|B|\right).
-```
-
-For each cell, $\tau_V=n_{\rm H}\,\Delta\ell/(N_{\rm H}/A_V)$ and the differential dichroism is $\Delta\tau=\tau_V\ln[(1+p_0)/(1-p_0)]$. The local Mueller matrix is applied sequentially to the incident stellar Stokes vector. Output Stokes parameters are normalized to the selected incident intensity.
+Cell-by-cell dichroic Mueller propagation toward background stars at the selected distance.
 
 | Starlight figure | Display |
 |:--|:--:|
@@ -2297,7 +2291,7 @@ begin
         for (index, spec) in enumerate(starlight_map_specs)
             row, col = cld(index, starlight_map_ncols), mod1(index, starlight_map_ncols)
             panel = fig_starlight_maps[row, col] = GridLayout()
-            axis = Axis(panel[1, 1],
+            axis = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             colorrange = isnothing(spec.fixed_range) ?
@@ -2310,7 +2304,7 @@ begin
                 [sky_coordinates[2][Int(starlight_sky_j)]];
                 marker = :star5, markersize = 17, color = :white,
                 strokecolor = :black, strokewidth = 1.2)
-            Colorbar(panel[1, 2], heat; label = as_latex(spec.label),
+            latex_colorbar(panel[1, 2], heat; label = as_latex(spec.label),
                 tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
@@ -2361,7 +2355,7 @@ begin
         for (index, spec) in enumerate(starlight_profile_specs)
             row, col = cld(index, starlight_profile_ncols),
                 mod1(index, starlight_profile_ncols)
-            axis = Axis(fig_starlight_profiles[row, col],
+            axis = latex_axis(fig_starlight_profiles[row, col],
                 xlabel = L"d\;[\mathrm{pc}]", ylabel = spec.ylabel)
             spec.signed && hlines!(axis, [0.0]; color = (:gray45, 0.55),
                 linestyle = :dash, linewidth = 1.3)
@@ -2403,6 +2397,47 @@ begin
         starlight_NH_map, starlight_p_map,
         L"100p_\star\;[\%]", MHD_COLORS[4])
     display_starlight_p_column ? fig_starlight_p_column : nothing
+end
+
+# ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
+begin
+    export_figure_options = [
+        "starlight_maps" => "Starlight-polarization maps",
+        "starlight_structure" => "Starlight observable structure functions",
+        "starlight_profiles" => "Starlight sight-line profiles",
+        "starlight_p_column" => "Starlight polarization versus column density",
+    ]
+    export_figure_registry = Dict(
+        "starlight_maps" => fig_starlight_maps,
+        "starlight_structure" => fig_starlight_structure,
+        "starlight_profiles" => fig_starlight_profiles,
+        "starlight_p_column" => fig_starlight_p_column,
+    )
+    nothing
+end
+
+# ╔═╡ e1000002-6f8c-4d0c-9a10-000000000002
+md"""
+---
+
+## Figure export
+
+| Export setting | Control |
+|:--|:--|
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "starlight_maps")) |
+| Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
+"""
+
+# ╔═╡ e1000003-6f8c-4d0c-9a10-000000000003
+begin
+    export_extension = lowercase(export_figure_format)
+    export_mime = export_figure_format == "PNG" ? MIME"image/png"() : MIME"application/pdf"()
+    export_buffer = IOBuffer()
+    show(export_buffer, export_mime, export_figure_registry[export_figure_key])
+    export_bytes = take!(export_buffer)
+    export_run_slug = replace(lowercase(selected_run), r"[^a-z0-9]+" => "_")
+    export_filename = "starlightpol_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
+    PlutoUI.DownloadButton(export_bytes, export_filename)
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -4454,5 +4489,8 @@ version = "4.1.0+0"
 # ╟─0c8f7453-06e8-47ea-ae0f-4f09a89b16ae
 # ╠═a0020002-6f8c-4d0c-9a10-000000000002
 # ╟─7e8d4ac1-7b6e-44a8-981b-9c3a19c8de10
+# ╠═e1000001-6f8c-4d0c-9a10-000000000001
+# ╠═e1000002-6f8c-4d0c-9a10-000000000002
+# ╠═e1000003-6f8c-4d0c-9a10-000000000003
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

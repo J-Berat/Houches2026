@@ -42,14 +42,13 @@ begin
 
     # Persistent caches. This cell has no reactive dependency, so Pluto runs it
     # once per session and the caches survive every widget change. RAW_CUBE_CACHE
-    # holds unit-free arrays exactly as stored on disk and is bounded by a memory
-    # budget; REDUCTION_CACHE holds the scalar summaries of a snapshot, which are
-    # small enough to keep for every snapshot of every run.
+    # holds at most one unit-free cube, exactly as stored on disk;
+    # REDUCTION_CACHE holds scalar summaries, which are small enough to keep for
+    # every snapshot of every run.
     const CACHE_LOCK = ReentrantLock()
     const RAW_CUBE_CACHE = Dict{Any,Any}()
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
-    const RAW_CUBE_CACHE_BUDGET = Ref(Int(Sys.total_memory() ÷ 4))
     const REDUCTION_CACHE = Dict{Any,Any}()
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
@@ -62,9 +61,8 @@ begin
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
 
-    Entries are evicted least-recently-used first once the resident set exceeds
-    `RAW_CUBE_CACHE_BUDGET`. One entry is always retained, so a cube larger than
-    the budget still benefits from repeated use within a single sweep.
+    The previous entry is evicted before a cache miss is read. Consequently a
+    slider change never leaves several raw snapshots resident in this cache.
     """
     function cached_raw_cube!(key, build)
         hit = lock(CACHE_LOCK) do
@@ -78,19 +76,20 @@ begin
             end
         end
         isnothing(hit) || return hit
+        lock(CACHE_LOCK) do
+            empty!(RAW_CUBE_CACHE)
+            empty!(RAW_CUBE_CACHE_BYTES)
+            empty!(RAW_CUBE_CACHE_ORDER)
+        end
         value = build()
         bytes = Base.summarysize(value)
         lock(CACHE_LOCK) do
+            empty!(RAW_CUBE_CACHE)
+            empty!(RAW_CUBE_CACHE_BYTES)
+            empty!(RAW_CUBE_CACHE_ORDER)
             RAW_CUBE_CACHE[key] = value
             RAW_CUBE_CACHE_BYTES[key] = bytes
             push!(RAW_CUBE_CACHE_ORDER, key)
-            resident = sum(values(RAW_CUBE_CACHE_BYTES))
-            while length(RAW_CUBE_CACHE_ORDER) > 1 && resident > RAW_CUBE_CACHE_BUDGET[]
-                evicted = popfirst!(RAW_CUBE_CACHE_ORDER)
-                resident -= RAW_CUBE_CACHE_BYTES[evicted]
-                delete!(RAW_CUBE_CACHE, evicted)
-                delete!(RAW_CUBE_CACHE_BYTES, evicted)
-            end
         end
         value
     end
@@ -1542,7 +1541,6 @@ begin
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
-    series_runs_text = join(analysis_series_labels, ", ")
     active_snapshot_format = snapshot_format(run_files[selected_run][selected_snapshot])
     Markdown.parse("""
     ### Active selection
@@ -1555,7 +1553,7 @@ begin
     | Physical time | **$(active_time_text)** ``\\mathrm{Myr}`` |
     | Line of sight | **$(los_name)** |
     | HDF5 access | **Sequential; one file at a time** |
-    | Runs used for time series | **$(series_runs_text)** |
+    | Time-series cubes | **Loaded only when a temporal figure is enabled** |
     | Comparative simulations | **$(comparison_runs_text)** |
     | Family comparison variable | **$(comparison_parameter)** |
     | Physical convention | ``\\gamma`` = **$(gamma)**; ``\\mu`` = **$(mean_molecular_weight)** ``m_{\\mathrm H}``; Gaussian CGS; PDF weighting = **$(pdf_weighting)** |
@@ -1689,8 +1687,7 @@ begin
     The disk read is cached, so changing a unit widget only re-runs the
     multiplications below.
     """
-    function load_cube(path)
-        raw = load_raw_cube(path)
+    function scale_raw_cube(raw)
         velocity_scale = Float64(velocity_unit_kms)
         magnetic_scale = Float64(magnetic_unit_G)
         (
@@ -1705,6 +1702,40 @@ begin
             L = Float64(length_unit_pc) .* raw.L,
             t = Float64(time_unit_Myr) * raw.t,
         )
+    end
+
+    load_cube(path) = scale_raw_cube(load_raw_cube(path))
+
+    """
+    How many snapshots a sweep may process at once.
+
+    Each in-flight snapshot holds a raw cube plus its scaled copy, so the worker
+    count is bounded by free memory as well as by the available threads.
+    """
+    function sweep_concurrency(cube_bytes)
+        cube_bytes > 0 || return 1
+        # Sys.free_memory() is not usable here: on macOS it counts only genuinely
+        # free pages and is almost always near zero, which would quietly reduce
+        # the sweep to one worker. Budget a fraction of total memory instead.
+        # A worker holds the raw cube, its scaled copy and the derived fields,
+        # which together come to roughly three times the raw size.
+        budget = Sys.total_memory() ÷ 4
+        affordable = Int(budget ÷ (3 * cube_bytes))
+        clamp(affordable, 1, Threads.nthreads())
+    end
+
+    "Apply `work` to every index, running at most `workers` of them at a time."
+    function parallel_foreach(work, indices, workers)
+        workers <= 1 && return foreach(work, indices)
+        queue = Channel{eltype(indices)}(length(indices))
+        foreach(index -> put!(queue, index), indices)
+        close(queue)
+        @sync for _ in 1:workers
+            Threads.@spawn for index in queue
+                work(index)
+            end
+        end
+        nothing
     end
 
     "Every widget value that changes the physical content of a loaded cube."
@@ -2624,35 +2655,79 @@ begin
             warm_boundary_K, phase_weighting, with_phase)
         bulk = Vector{Any}(undef, length(paths))
         phase = with_phase ? Vector{Any}(undef, length(paths)) : nothing
-        for (index, path) in pairs(paths)
+        keys_by_index = map(paths) do path
             signature = cube_signature(path)
-            bulk_key = (:bulk, signature, gamma)
-            phase_key = (:phase, signature, molecular_weight, cold_boundary_K,
-                warm_boundary_K, phase_weighting)
+            ((:bulk, signature, gamma),
+             (:phase, signature, molecular_weight, cold_boundary_K,
+                warm_boundary_K, phase_weighting))
+        end
+
+        # Serve everything already memoized first, so that only the snapshots
+        # that still have to be read reach the parallel section below.
+        pending = Int[]
+        for index in eachindex(paths)
+            bulk_key, phase_key = keys_by_index[index]
             bulk_hit = reduction_hit(bulk_key)
             phase_hit = with_phase ? reduction_hit(phase_key) : nothing
             if isnothing(bulk_hit) || (with_phase && isnothing(phase_hit))
-                c = load_cube(path)
-                isnothing(bulk_hit) && (bulk_hit = store_reduction!(bulk_key,
-                    bulk_metrics_from_cube(c, gamma)))
-                with_phase && isnothing(phase_hit) &&
-                    (phase_hit = store_reduction!(phase_key,
-                        phase_metrics_from_cube(c, molecular_weight, cold_boundary_K,
-                            warm_boundary_K, phase_weighting)))
+                push!(pending, index)
+            else
+                bulk[index] = bulk_hit
+                with_phase && (phase[index] = phase_hit)
             end
-            bulk[index] = bulk_hit
-            with_phase && (phase[index] = phase_hit)
+        end
+
+        # read_raw_cube bypasses the single-entry cube cache on purpose: a sweep
+        # visits each snapshot once, so caching here would only evict the
+        # interactively selected cube, and would have parallel workers evict
+        # each other.
+        function reduce_snapshot!(index)
+            bulk_key, phase_key = keys_by_index[index]
+            raw = read_raw_cube(paths[index])
+            c = scale_raw_cube(raw)
+            bulk[index] = store_reduction!(bulk_key, bulk_metrics_from_cube(c, gamma))
+            with_phase && (phase[index] = store_reduction!(phase_key,
+                phase_metrics_from_cube(c, molecular_weight, cold_boundary_K,
+                    warm_boundary_K, phase_weighting)))
+            Base.summarysize(raw)
+        end
+
+        if !isempty(pending)
+            # The first snapshot is read serially, both to size the remaining
+            # workers against free memory and to surface a malformed file as a
+            # plain error rather than one wrapped in a task failure.
+            cube_bytes = reduce_snapshot!(first(pending))
+            rest = @view pending[2:end]
+            isempty(rest) ||
+                parallel_foreach(reduce_snapshot!, rest, sweep_concurrency(cube_bytes))
         end
         (bulk = identity.(bulk), phase = with_phase ? identity.(phase) : nothing)
     end
 
-    metric_series_by_run = Dict(
-        label => run_metric_series(run_files[label], Float64(gamma),
-            Float64(mean_molecular_weight), Float64(phase_cold_boundary_K),
-            Float64(phase_warm_boundary_K), String(phase_B_weighting),
-            display_phase_B_time && label in comparison_run_labels)
-        for label in analysis_series_labels
-    )
+    temporal_series_requested = display_global_evolution ||
+        display_gamma_relations || display_normalized_B_relations ||
+        display_growth_fit || display_phase_B_time || display_energy_time ||
+        display_polarization_time
+
+    function metadata_only_series(label)
+        [(
+            t = Float64(time_unit_Myr) * Float64(time),
+            mach = NaN, mach_alfven = NaN, Bmean = NaN, Brms = NaN,
+            energy_ratio = NaN, kin_mag = NaN, therm_mag = NaN,
+            kin_therm = NaN,
+        ) for time in run_times[label]]
+    end
+
+    metric_series_by_run = temporal_series_requested ? Dict(
+            label => run_metric_series(run_files[label], Float64(gamma),
+                Float64(mean_molecular_weight), Float64(phase_cold_boundary_K),
+                Float64(phase_warm_boundary_K), String(phase_B_weighting),
+                display_phase_B_time && label in comparison_run_labels)
+            for label in analysis_series_labels
+        ) : Dict(
+            label => (bulk = metadata_only_series(label), phase = nothing)
+            for label in analysis_series_labels
+        )
 
     all_series = Dict(label => metric_series_by_run[label].bulk
         for label in analysis_series_labels)
@@ -2673,12 +2748,12 @@ The fitted physical model is $B(t)=A\exp[\Gamma_B(t-t_0)]$, where $t_0$ is the f
 
 The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measured field used only as a plotting normalization. The reported $R^2$ uses the usual mean-centred total sum of squares appropriate to this intercept fit. The theoretical comparison curves remain anchored at the first valid measured snapshot. Because $E_{\mathrm B}\propto B^2$, magnetic energy grows at rate $2\Gamma_B$.
 
-**Display the magnetic growth-rate fit:** $(@bind display_growth_fit PlutoUI.CheckBox(default = true))
+**Display the magnetic growth-rate fit:** $(@bind display_growth_fit PlutoUI.CheckBox(default = false))
 
 | Setting | Control |
 |:--|:--|
 | Fitted field | $(@bind growth_fit_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
-| Fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(all_series[selected_run]); default = min(2, length(all_series[selected_run])):min(4, length(all_series[selected_run])), show_value = true)) |
+| Fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(run_files[selected_run]); default = min(2, length(run_files[selected_run])):min(4, length(run_files[selected_run])), show_value = true)) |
 | Theoretical $\Gamma_{B,1}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_1 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.01)) |
 | Theoretical $\Gamma_{B,2}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_2 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.03)) |
 | Theoretical $\Gamma_{B,3}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_3 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.05)) |
@@ -2773,7 +2848,7 @@ The local magnetic-growth rate is evaluated between consecutive snapshots rather
 
 Time, sonic Mach number, and Alfvénic Mach number are assigned their midpoint values over the same interval. Positive $\Gamma_B$ indicates magnetic amplification; negative $\Gamma_B$ indicates decay.
 
-**Display interval growth-rate relations:** $(@bind display_gamma_relations PlutoUI.CheckBox(default = true))
+**Display interval growth-rate relations:** $(@bind display_gamma_relations PlutoUI.CheckBox(default = false))
 
 | Growth-rate setting | Control |
 |:--|:--|
@@ -2861,7 +2936,7 @@ Selected snapshots are superimposed in the same figure using
 
 where $B_0$ is the first available snapshot of each run. Color identifies the run; every snapshot uses the same circular marker to keep temporal comparisons readable. All axes remain linear because the logarithm is applied to the magnetic-field ratio itself.
 
-**Display multi-snapshot normalized magnetic evolution:** $(@bind display_normalized_B_relations PlutoUI.CheckBox(default = true))
+**Display multi-snapshot normalized magnetic evolution:** $(@bind display_normalized_B_relations PlutoUI.CheckBox(default = false))
 
 | Normalized-field relation | Control |
 |:--|:--|
@@ -2994,7 +3069,7 @@ Selected panels compare every discovered run as a function of physical time. Tur
 
 $\mathcal{M}=v_{\mathrm{rms}}/c_{s,\mathrm{rms}}$ measures compressibility, while $\mathcal{M}_{\mathrm A}=v_{\mathrm{rms}}/v_{\mathrm A,\mathrm{rms}}$ compares turbulence with Alfvén-wave propagation. Values above unity are supersonic or super-Alfvénic, respectively. Dotted magnetic-field curves show the theoretical exponentials selected in section 5.
 
-**Display global time evolution:** $(@bind display_global_evolution PlutoUI.CheckBox(default = true))
+**Display global time evolution:** $(@bind display_global_evolution PlutoUI.CheckBox(default = false))
 
 | Time-evolution panel | Display |
 |:--|:--:|
@@ -3129,7 +3204,7 @@ with $w_i=1$ for volume normalization or $w_i=\rho_i$ for density normalization.
 \mathrm{WNM}:\ T\geq T_{\mathrm W}.
 ```
 
-**Display magnetic field by phase:** $(@bind display_phase_B_time PlutoUI.CheckBox(default = true))
+**Display magnetic field by phase:** $(@bind display_phase_B_time PlutoUI.CheckBox(default = false))
 
 | Phase-field setting | Control |
 |:--|:--|
@@ -3583,11 +3658,11 @@ Each point is a ratio of energies summed within one density bin, rather than a m
 
 **Display energy ratios by density:** $(@bind display_energy_ratios PlutoUI.CheckBox(default = true))
 
-**Display energy ratios versus time:** $(@bind display_energy_time PlutoUI.CheckBox(default = true))
+**Display energy ratios versus time:** $(@bind display_energy_time PlutoUI.CheckBox(default = false))
 
 | Setting | Control |
 |:--|:--|
-| Snapshots shown in energy reports | $(@bind energy_snapshot_indices PlutoUI.MultiSelect(collect(1:maximum_snapshot_count); default = unique([min(2, maximum_snapshot_count), cld(maximum_snapshot_count, 2), maximum_snapshot_count]))) |
+| Snapshots shown in energy reports | $(@bind energy_snapshot_indices PlutoUI.MultiSelect(collect(1:maximum_snapshot_count); default = [min(Int(selected_snapshot), maximum_snapshot_count)])) |
 | $E_{\mathrm{kin}}/E_{\mathrm{mag}}$ | $(@bind show_energy_kin_mag PlutoUI.CheckBox(default = true)) |
 | $E_{\mathrm{therm}}/E_{\mathrm{mag}}$ | $(@bind show_energy_therm_mag PlutoUI.CheckBox(default = true)) |
 | $E_{\mathrm{kin}}/E_{\mathrm{therm}}$ | $(@bind show_energy_kin_therm PlutoUI.CheckBox(default = true)) |
@@ -3670,7 +3745,8 @@ begin
             snapshot_index <= length(run_files[label]) || continue
             # Build and retain only the one-dimensional profile. The cube from
             # this iteration becomes collectible before the next file is read.
-            local_cube = load_cube(run_files[label][snapshot_index])
+            local_cube = label == selected_run && snapshot_index == selected_snapshot ?
+                cube : load_cube(run_files[label][snapshot_index])
             local_samples = energy_density_samples(local_cube)
             energy_profiles[(label, snapshot_index)] = energy_ratios_by_density(
                 local_samples, density_edges, gamma)
@@ -3898,19 +3974,21 @@ begin
 
     enstrophy_snapshot_indices = Dict(
         label => min(Int(selected_snapshot), length(run_files[label])) for label in comparison_run_labels)
-    enstrophy_profiles = Dict(
-        label => enstrophy_by_density(
-            load_cube(run_files[label][enstrophy_snapshot_indices[label]]),
-            density_edges, enstrophy_density_weighting,
-        ) for label in comparison_run_labels
-    )
+    enstrophy_profiles = Dict{String, Any}()
+    enstrophy_mach_by_run = Dict{String, Float64}()
+    for label in comparison_run_labels
+        local_cube = comparison_cube(label)
+        enstrophy_profiles[label] = enstrophy_by_density(
+            local_cube, density_edges, enstrophy_density_weighting)
+        comparison_kind == :mach && (enstrophy_mach_by_run[label] =
+            bulk_metrics_from_cube(local_cube, Float64(gamma)).mach)
+    end
     enstrophy_profile_matrix = hcat([
         enstrophy_profiles[label] for label in comparison_run_labels]...)
 
     function enstrophy_parameter_label(label)
         if comparison_kind == :mach
-            index = enstrophy_snapshot_indices[label]
-            mach_value = all_series[label][index].mach
+            mach_value = enstrophy_mach_by_run[label]
             return string("𝓜 = ", round(mach_value; sigdigits = 3))
         end
         legend_run_label(label)
@@ -3918,8 +3996,7 @@ begin
 
     function enstrophy_parameter_ticklabel(label)
         if comparison_kind == :mach
-            index = enstrophy_snapshot_indices[label]
-            mach_value = all_series[label][index].mach
+            mach_value = enstrophy_mach_by_run[label]
             return latexstring("\\mathcal{M}=", round(mach_value; sigdigits = 3))
         end
         latex_run_label(label)
@@ -4205,6 +4282,44 @@ begin
     end
     display_structure_functions ? fig_structure : nothing
 end
+
+# ╔═╡ 14e7606a-3a13-4c8e-b860-e40dc63a6fa2
+md"""
+---
+
+## 19. Polarization fractions versus time
+
+Each panel follows one synthetic-observation polarization fraction through the selected simulations. The reported value is either the area-weighted sky mean,
+
+```math
+\langle p\rangle_A=\frac{1}{N_{\rm pix}}\sum_j p_j,
+```
+
+or the intensity-weighted mean,
+
+```math
+\langle p\rangle_I=\frac{\sum_j P_j}{\sum_j I_j}=\frac{\sum_j p_jI_j}{\sum_j I_j}.
+```
+
+The thick horizontal segments above every panel identify two time intervals for the active run: the exponential dynamo interval used to fit $\Gamma_B$ in section 5 and the user-selected statistically steady interval. Thin vertical guides mark the end of growth and the beginning of the steady regime.
+
+**Display polarization fractions versus time:** $(@bind display_polarization_time PlutoUI.CheckBox(default = false))
+
+| Temporal polarization diagnostic | Display |
+|:--|:--:|
+| Thermal dust | $(@bind show_polarization_time_dust PlutoUI.CheckBox(default = true)) |
+| Dichroic starlight | $(@bind show_polarization_time_starlight PlutoUI.CheckBox(default = true)) |
+| Faraday synchrotron | $(@bind show_polarization_time_faraday PlutoUI.CheckBox(default = true)) |
+| Zeeman circular polarization | $(@bind show_polarization_time_zeeman PlutoUI.CheckBox(default = true)) |
+
+| Temporal setting | Control |
+|:--|:--|
+| Sky averaging | $(@bind polarization_time_weighting PlutoUI.Select(["Intensity-weighted mean" => "intensity", "Area-weighted mean" => "area"]; default = "intensity")) |
+| Snapshot stride | $(@bind polarization_time_stride PlutoUI.Slider(1:maximum_snapshot_count; default = 1, show_value = true)) |
+| Zeeman velocity channels | $(@bind polarization_time_zeeman_channels PlutoUI.Select([31, 51, 81, 101]; default = 51)) |
+| Display growth and steady-state bars | $(@bind show_polarization_regime_bars PlutoUI.CheckBox(default = true)) |
+| Steady-state start snapshot | $(@bind polarization_steady_start PlutoUI.Slider(1:length(run_files[selected_run]); default = min(last(growth_fit_window) + 1, length(run_files[selected_run])), show_value = true)) |
+"""
 
 # ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
 begin
@@ -6363,6 +6478,7 @@ version = "4.1.0+0"
 # ╠═24e60849-1c70-4df3-bd17-57d29949b7a6
 # ╠═4b16d83f-4a1d-49e7-9270-8f573fd46835
 # ╠═d69dd1ce-312a-48e0-a478-b470b299ed1b
+# ╟─14e7606a-3a13-4c8e-b860-e40dc63a6fa2
 # ╠═e1000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000002-6f8c-4d0c-9a10-000000000002
 # ╠═e1000003-6f8c-4d0c-9a10-000000000003

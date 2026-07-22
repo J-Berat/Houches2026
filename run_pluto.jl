@@ -89,10 +89,18 @@ launch_browser = parse_boolean(get(ENV, "LAUNCH_BROWSER",
 println("Opening Pluto for: $notebook")
 println("Lazy startup enabled: select a cell and run it with Shift+Enter.")
 !launch_browser && println("Open http://$pluto_host:$pluto_port in your browser (use an SSH tunnel for a remote server).")
+# Pluto starts its notebook worker as a separate Julia process, which does not
+# inherit this launcher's thread count. Without an explicit --threads the worker
+# runs single threaded, so the multithreaded cells fall back to one core.
+notebook_threads = get(ENV, "JULIA_NUM_THREADS", string(max(Sys.CPU_THREADS - 1, 1)))
+println("Notebook worker threads: $notebook_threads (set JULIA_NUM_THREADS to override)")
+
 Pluto.run(
     notebook_path_suggestion = notebook,
     host = pluto_host,
     port = pluto_port,
     launch_browser = launch_browser,
     run_notebook_on_load = false,
+    compiler_options = Pluto.Configuration.CompilerOptions(
+        threads = notebook_threads),
 )

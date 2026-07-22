@@ -42,14 +42,13 @@ begin
 
     # Persistent caches. This cell has no reactive dependency, so Pluto runs it
     # once per session and the caches survive every widget change. RAW_CUBE_CACHE
-    # holds unit-free arrays exactly as stored on disk and is bounded by a memory
-    # budget; REDUCTION_CACHE holds the scalar summaries of a snapshot, which are
-    # small enough to keep for every snapshot of every run.
+    # holds at most one unit-free cube, exactly as stored on disk;
+    # REDUCTION_CACHE holds scalar summaries, which are small enough to keep for
+    # every snapshot of every run.
     const CACHE_LOCK = ReentrantLock()
     const RAW_CUBE_CACHE = Dict{Any,Any}()
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
-    const RAW_CUBE_CACHE_BUDGET = Ref(Int(Sys.total_memory() ÷ 4))
     const REDUCTION_CACHE = Dict{Any,Any}()
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
@@ -62,9 +61,8 @@ begin
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
 
-    Entries are evicted least-recently-used first once the resident set exceeds
-    `RAW_CUBE_CACHE_BUDGET`. One entry is always retained, so a cube larger than
-    the budget still benefits from repeated use within a single sweep.
+    The previous entry is evicted before a cache miss is read. Consequently a
+    slider change never leaves several raw snapshots resident in this cache.
     """
     function cached_raw_cube!(key, build)
         hit = lock(CACHE_LOCK) do
@@ -78,19 +76,20 @@ begin
             end
         end
         isnothing(hit) || return hit
+        lock(CACHE_LOCK) do
+            empty!(RAW_CUBE_CACHE)
+            empty!(RAW_CUBE_CACHE_BYTES)
+            empty!(RAW_CUBE_CACHE_ORDER)
+        end
         value = build()
         bytes = Base.summarysize(value)
         lock(CACHE_LOCK) do
+            empty!(RAW_CUBE_CACHE)
+            empty!(RAW_CUBE_CACHE_BYTES)
+            empty!(RAW_CUBE_CACHE_ORDER)
             RAW_CUBE_CACHE[key] = value
             RAW_CUBE_CACHE_BYTES[key] = bytes
             push!(RAW_CUBE_CACHE_ORDER, key)
-            resident = sum(values(RAW_CUBE_CACHE_BYTES))
-            while length(RAW_CUBE_CACHE_ORDER) > 1 && resident > RAW_CUBE_CACHE_BUDGET[]
-                evicted = popfirst!(RAW_CUBE_CACHE_ORDER)
-                resident -= RAW_CUBE_CACHE_BYTES[evicted]
-                delete!(RAW_CUBE_CACHE, evicted)
-                delete!(RAW_CUBE_CACHE_BYTES, evicted)
-            end
         end
         value
     end
@@ -1524,7 +1523,6 @@ begin
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
-    series_runs_text = join(analysis_series_labels, ", ")
     active_snapshot_format = snapshot_format(run_files[selected_run][selected_snapshot])
     Markdown.parse("""
     ### Active selection
@@ -1537,7 +1535,7 @@ begin
     | Physical time | **$(active_time_text)** ``\\mathrm{Myr}`` |
     | Line of sight | **$(los_name)** |
     | HDF5 access | **Sequential; one file at a time** |
-    | Runs used for time series | **$(series_runs_text)** |
+    | Time-series cubes | **Loaded only when a temporal figure is enabled** |
     | Comparative simulations | **$(comparison_runs_text)** |
     | Family comparison variable | **$(comparison_parameter)** |
     | Physical convention | ``\\gamma`` = **$(gamma)**; ``\\mu`` = **$(mean_molecular_weight)** ``m_{\\mathrm H}``; Gaussian CGS; PDF weighting = **$(pdf_weighting)** |
@@ -1671,8 +1669,7 @@ begin
     The disk read is cached, so changing a unit widget only re-runs the
     multiplications below.
     """
-    function load_cube(path)
-        raw = load_raw_cube(path)
+    function scale_raw_cube(raw)
         velocity_scale = Float64(velocity_unit_kms)
         magnetic_scale = Float64(magnetic_unit_G)
         (
@@ -1687,6 +1684,40 @@ begin
             L = Float64(length_unit_pc) .* raw.L,
             t = Float64(time_unit_Myr) * raw.t,
         )
+    end
+
+    load_cube(path) = scale_raw_cube(load_raw_cube(path))
+
+    """
+    How many snapshots a sweep may process at once.
+
+    Each in-flight snapshot holds a raw cube plus its scaled copy, so the worker
+    count is bounded by free memory as well as by the available threads.
+    """
+    function sweep_concurrency(cube_bytes)
+        cube_bytes > 0 || return 1
+        # Sys.free_memory() is not usable here: on macOS it counts only genuinely
+        # free pages and is almost always near zero, which would quietly reduce
+        # the sweep to one worker. Budget a fraction of total memory instead.
+        # A worker holds the raw cube, its scaled copy and the derived fields,
+        # which together come to roughly three times the raw size.
+        budget = Sys.total_memory() ÷ 4
+        affordable = Int(budget ÷ (3 * cube_bytes))
+        clamp(affordable, 1, Threads.nthreads())
+    end
+
+    "Apply `work` to every index, running at most `workers` of them at a time."
+    function parallel_foreach(work, indices, workers)
+        workers <= 1 && return foreach(work, indices)
+        queue = Channel{eltype(indices)}(length(indices))
+        foreach(index -> put!(queue, index), indices)
+        close(queue)
+        @sync for _ in 1:workers
+            Threads.@spawn for index in queue
+                work(index)
+            end
+        end
+        nothing
     end
 
     "Every widget value that changes the physical content of a loaded cube."

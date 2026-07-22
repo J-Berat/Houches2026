@@ -193,7 +193,8 @@ Useful extension names include `RHO`, `PRESSURE`, `VX`, `VY`, `VZ`, `BX`, `BY`, 
 
 ## Using a notebook
 
-The notebooks start in lazy mode: expensive calculations do not run immediately.
+The notebooks start in lazy mode. Only the selected 3-D snapshot is loaded;
+expensive time-series calculations do not run immediately.
 
 1. Select a data repository and click **Load path**.
 2. Select the active simulation, snapshot, and line of sight.
@@ -202,6 +203,12 @@ The notebooks start in lazy mode: expensive calculations do not run immediately.
 5. Click a result cell and press `Shift+Enter`.
 
 Pluto automatically evaluates every upstream dependency required by that result. This is usually faster and uses less memory than running the entire notebook.
+
+Temporal figures are disabled initially. Enabling a temporal figure explicitly
+reads the required snapshots sequentially, closes each HDF5 file immediately,
+and retains only scalar summaries. The raw-cube cache contains at most one
+snapshot; moving the snapshot slider evicts the previous raw cube before reading
+the newly selected one.
 
 For comparative diagnostics, select any number of simulations under **Simulations in comparative plots**. One simulation is selected initially to keep startup light. Comparative PDFs, distributions, and histograms use the chosen snapshot index for every selected run; if a run is shorter, its last available snapshot is used. Spatial maps continue to use the active **Run** and **Snapshot** selections.
 
@@ -293,8 +300,9 @@ Read the accepted aliases shown in the mapping table, inspect the available-data
 ### Calculations use too much memory
 
 HDF5 access is serialized: only one file is open at a time, every dataset handle
-is closed immediately after reading, and comparative diagnostics retain derived
-profiles or maps instead of a full 3-D cube for every simulation. Keep lazy
+is closed immediately after reading, the raw cache contains at most one cube,
+and comparative diagnostics retain derived profiles or maps instead of a full
+3-D cube for every simulation. Keep lazy
 execution enabled, run only the needed result cells, and reduce the number of
 selected simulations, maps, or spectral channels when memory is limited.
 

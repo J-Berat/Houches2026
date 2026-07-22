@@ -10,7 +10,7 @@ const NOTEBOOK_SPECS = [
     (
         filename = "dynamo.jl",
         title = "Dynamo — MHD diagnostics",
-        summary = "Spatial, statistical, temporal, and spectral diagnostics for the dynamo simulations.",
+        summary = "Spatial, statistical, temporal, and spectral diagnostics, including comparative B--n relations, HRO, and HOG.",
         start_heading = "# Interactive MHD diagnostics",
         stop_heading = "## 13. Thermal-dust polarization",
         figures = [
@@ -23,6 +23,9 @@ const NOTEBOOK_SPECS = [
             ("growth_rate_relations", "Growth rate versus time and Mach numbers", :fig_gamma_relations),
             ("normalized_magnetic_relations", "Normalized magnetic evolution", :fig_normalized_B_relations),
             ("normalized_magnetic_field", "Normalized magnetic-field distribution", :fig_logB),
+            ("magnetic_density", "Magnetic field versus density", :fig_bn),
+            ("hro", "Histogram of relative orientations", :fig_hro),
+            ("hog", "Histogram of oriented gradients", :fig_hog),
             ("energy_ratios", "Energy ratios by density", :fig_energy),
             ("energy_time", "Energy ratios versus time", :fig_energy_time),
             ("vorticity", "Vorticity map", :fig_vorticity),

@@ -8,7 +8,7 @@ The notebooks read HDF5 or FITS simulation snapshots, expose the main physical a
 
 | File | Purpose |
 |---|---|
-| `dynamo.jl` | General MHD diagnostics: maps, PDFs, phase diagrams, magnetic growth, energy ratios, vorticity, spectra, and structure functions. |
+| `dynamo.jl` | General MHD diagnostics: maps, PDFs, phase diagrams, magnetic growth, energy ratios, vorticity, spectra, structure functions, comparative $B$--$n$ relations, HRO, and HOG. |
 | `dust.jl` | Synthetic thermal-dust Stokes emission, polarization diagnostics, and structure functions for every projected observable. |
 | `moose.jl` | MOOSE synchrotron emission, Faraday rotation, interferometric filtering, RM synthesis, and projected-observable structure functions. |
 | `shine.jl` | SHINE synthetic H I 21-cm emission, phase-separated columns, velocity moments, spectra, RGB composites, and structure functions for all scalar maps. |
@@ -16,6 +16,10 @@ The notebooks read HDF5 or FITS simulation snapshots, expose the main physical a
 | `starlightpol.jl` | Dichroic starlight polarization using cell-by-cell Mueller propagation, with structure functions for all projected Stokes and derived maps. |
 
 The five synthetic-observation notebooks compute axis-averaged, periodic, two-dimensional structure functions for every scalar sky map. Their common controls are in **Shared observational beam**: enable or disable the figures, select the order $p$, and choose the number of sampled separations. Polarization-angle increments use the shortest difference modulo $180^\circ$.
+
+The Dynamo notebook also compares magnetic-field strength with number density, including a binned $B\propto n^\kappa$ fit. Its 3-D HRO measures the orientation of the magnetic field relative to isodensity structures as a function of density. Its projected HOG compares the gradients of column density and density-weighted magnetic-field strength and reports the normalized projected Rayleigh statistic.
+
+The isotropic power-spectrum panels fit $E(k)=A k^\alpha$ over user-selected $k_{\min}$ and $k_{\max}$. Each panel reports $\alpha$ and $R^2$ and can overlay a $k^{-5/3}$ Kolmogorov reference normalized at the geometric center of the fitted interval.
 
 All figures use LaTeX rendering consistently for x- and y-axis labels, numeric tick labels, and colorbar labels and ticks. Scientific-notation ticks are rendered as $a\times10^b$ rather than as plain-text Unicode.
 | `run_pluto.jl` | Interactive launcher that asks which notebook to open. |

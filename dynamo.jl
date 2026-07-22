@@ -760,7 +760,7 @@ end
 md"""
 # Dynamo — MHD diagnostics
 
-Spatial, statistical, temporal, and spectral diagnostics for the dynamo simulations.
+Spatial, statistical, temporal, and spectral diagnostics, including comparative B--n relations, HRO, and HOG.
 
 > **Reactive mode.** Open `dynamo.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
 
@@ -2520,7 +2520,7 @@ Selected snapshots are superimposed in the same figure using
 \ln\!\left(\frac{B_i}{B_0}\right),
 ```
 
-where $B_0$ is the first available snapshot of each run. Color identifies the run and marker shape identifies the snapshot. All axes remain linear because the logarithm is applied to the magnetic-field ratio itself.
+where $B_0$ is the first available snapshot of each run. Color identifies the run; every snapshot uses the same circular marker to keep temporal comparisons readable. All axes remain linear because the logarithm is applied to the magnetic-field ratio itself.
 
 **Display multi-snapshot normalized magnetic evolution:** $(@bind display_normalized_B_relations PlutoUI.CheckBox(default = true))
 
@@ -2547,12 +2547,6 @@ begin
     normalized_B_field_symbol = normalized_B_relation_field == "Mean field ⟨B⟩" ? :Bmean : :Brms
     normalized_B_valid_snapshots = sort(unique(filter(index -> index >= 1,
         Int.(normalized_B_snapshot_indices))))
-    normalized_B_marker_cycle = [:circle, :rect, :utriangle, :diamond, :cross,
-        :xcross, :dtriangle, :pentagon, :hexagon]
-    normalized_B_markers = Dict(
-        snapshot => normalized_B_marker_cycle[mod1(position, length(normalized_B_marker_cycle))]
-        for (position, snapshot) in enumerate(normalized_B_valid_snapshots)
-    )
 
     if isempty(normalized_B_panel_specs) || isempty(normalized_B_valid_snapshots) ||
             isempty(normalized_B_runs)
@@ -2580,21 +2574,14 @@ begin
                 valid = isfinite.(horizontal) .& isfinite.(logarithmic_ratio)
                 lines!(axis, horizontal[valid], logarithmic_ratio[valid];
                     color = run_colors[label], linewidth = 2.2)
-                for (x, y, snapshot) in zip(horizontal[valid], logarithmic_ratio[valid], available[valid])
-                    scatter!(axis, [x], [y]; color = run_colors[label],
-                        marker = normalized_B_markers[snapshot], markersize = 11)
-                end
+                scatter!(axis, horizontal[valid], logarithmic_ratio[valid];
+                    color = run_colors[label], marker = :circle, markersize = 7)
             end
         end
         run_elements = [LineElement(color = run_colors[label], linewidth = 2.4)
             for label in normalized_B_runs]
-        snapshot_elements = [MarkerElement(marker = normalized_B_markers[snapshot],
-            color = :gray25, markersize = 11) for snapshot in normalized_B_valid_snapshots]
         Legend(fig_normalized_B_relations[2, 1:length(normalized_B_panel_specs)],
-            [run_elements, snapshot_elements],
-            [legend_run_label.(normalized_B_runs),
-                ["i = $(snapshot)" for snapshot in normalized_B_valid_snapshots]],
-            ["Run", "Snapshot"];
+            run_elements, legend_run_label.(normalized_B_runs), L"\mathrm{Simulation}";
             orientation = :horizontal, tellheight = true, framevisible = false)
     end
     display_normalized_B_relations ? fig_normalized_B_relations : nothing
@@ -2821,11 +2808,11 @@ with $w_i=1$ for volume normalization or $w_i=\rho_i$ for density normalization.
 begin
     phase_B_specs = NamedTuple[]
     show_phase_B_cold && push!(phase_B_specs,
-        (key = :cold, label = "CNM", linestyle = :solid, marker = :circle))
+        (key = :cold, label = "CNM", linestyle = :solid))
     show_phase_B_lukewarm && push!(phase_B_specs,
-        (key = :lukewarm, label = "LNM", linestyle = :dash, marker = :rect))
+        (key = :lukewarm, label = "LNM", linestyle = :dash))
     show_phase_B_warm && push!(phase_B_specs,
-        (key = :warm, label = "WNM", linestyle = :dot, marker = :utriangle))
+        (key = :warm, label = "WNM", linestyle = :dot))
 
     if !display_phase_B_time
         fig_phase_B_time = Figure(size = (900, 180))
@@ -2855,7 +2842,7 @@ begin
             lines!(phase_B_axis, phase_B_times[valid], values[valid];
                 color = run_colors[label], linestyle = spec.linestyle, linewidth = 2.6)
             scatter!(phase_B_axis, phase_B_times[valid], values[valid];
-                color = run_colors[label], marker = spec.marker, markersize = 7)
+                color = run_colors[label], marker = :circle, markersize = 7)
         end
         Legend(fig_phase_B_time[2, 1],
             [[LineElement(color = run_colors[label], linewidth = 2.5)
@@ -2924,6 +2911,323 @@ begin
         end
     end
     display_normalized_field ? fig_logB : nothing
+end
+
+# ╔═╡ b1000001-6f8c-4d0c-9a10-000000000001
+md"""
+---
+
+## Magnetic field--density analysis
+
+| Diagnostic | Control |
+|:--|:--|
+| Display the comparative $B$--$n$ relation | $(@bind display_bn_relation PlutoUI.CheckBox(default = true)) |
+| Minimum density used by the $B\propto n^\kappa$ fit [$\mathrm{cm}^{-3}$; $0$ uses all bins] | $(@bind bn_fit_min_density PlutoUI.NumberField(default = 0.0)) |
+| Display the 3D HRO | $(@bind display_hro PlutoUI.CheckBox(default = true)) |
+| Number of HRO density intervals | $(@bind hro_density_bin_count PlutoUI.Slider(4:1:20; default = 10, show_value = true)) |
+| Display the projected HOG | $(@bind display_hog PlutoUI.CheckBox(default = true)) |
+| HOG Gaussian smoothing FWHM [pixels] | $(@bind hog_smoothing_fwhm_pix PlutoUI.NumberField(0.0:0.5:20.0; default = 2.0)) |
+| HOG gradient rejection percentile | $(@bind hog_gradient_percentile PlutoUI.Slider(0.0:5.0:90.0; default = 20.0, show_value = true)) |
+| Apply HOG to $\log_{10}$ maps | $(@bind hog_logarithmic_maps PlutoUI.CheckBox(default = true)) |
+
+HRO compares $\mathbf B$ with three-dimensional iso-density structures. HOG compares the gradients of projected $N_{\rm H}$ and density-weighted $|B|$. All selected simulations use the active snapshot index and line of sight.
+"""
+
+# ╔═╡ b1000002-6f8c-4d0c-9a10-000000000002
+begin
+    function magnetic_density_samples(c)
+        local_n = number_density(c.rho)
+        local_B = GAUSS_TO_MICROGAUSS .* magnetic_fields(c).B
+        valid = isfinite.(local_n) .& isfinite.(local_B) .&
+            (local_n .> 0) .& (local_B .> 0)
+        (logn = log10.(Float64.(local_n[valid])),
+            logB = log10.(Float64.(local_B[valid])))
+    end
+
+    function binned_magnetic_density(samples, logn_edges)
+        centers = (logn_edges[1:end-1] .+ logn_edges[2:end]) ./ 2
+        medians = fill(NaN, length(centers))
+        lower = fill(NaN, length(centers))
+        upper = fill(NaN, length(centers))
+        counts = zeros(Int, length(centers))
+        for bin in eachindex(centers)
+            members = (samples.logn .>= logn_edges[bin]) .&
+                (samples.logn .< logn_edges[bin + 1])
+            values = samples.logB[members]
+            counts[bin] = length(values)
+            length(values) >= 4 || continue
+            lower[bin], medians[bin], upper[bin] = quantile(values, (0.16, 0.50, 0.84))
+        end
+        (; centers, medians, lower, upper, counts)
+    end
+
+    function magnetic_density_fit(profile, minimum_density)
+        valid = isfinite.(profile.centers) .& isfinite.(profile.medians) .&
+            (profile.counts .>= 4)
+        minimum_density > 0 &&
+            (valid .&= profile.centers .>= log10(Float64(minimum_density)))
+        x, y = profile.centers[valid], profile.medians[valid]
+        length(x) >= 2 || return (slope = NaN, intercept = NaN)
+        xmean, ymean = mean(x), mean(y)
+        denominator = sum(abs2, x .- xmean)
+        denominator > 0 || return (slope = NaN, intercept = NaN)
+        slope = sum((x .- xmean) .* (y .- ymean)) / denominator
+        (slope = slope, intercept = ymean - slope * xmean)
+    end
+
+    bn_samples_by_run = Dict(label => magnetic_density_samples(comparison_cubes[label])
+        for label in comparison_run_labels)
+    all_bn_logn = vcat([bn_samples_by_run[label].logn for label in comparison_run_labels]...)
+    all_bn_logB = vcat([bn_samples_by_run[label].logB for label in comparison_run_labels]...)
+    bn_nlo, bn_nhi = quantile(all_bn_logn, (0.001, 0.999))
+    bn_Blo, bn_Bhi = quantile(all_bn_logB, (0.001, 0.999))
+    if !(bn_nhi > bn_nlo)
+        bn_nlo, bn_nhi = bn_nlo - 0.5, bn_nhi + 0.5
+    end
+    if !(bn_Bhi > bn_Blo)
+        bn_Blo, bn_Bhi = bn_Blo - 0.5, bn_Bhi + 0.5
+    end
+    bn_logn_edges = collect(range(bn_nlo, bn_nhi; length = Int(nbins) + 1))
+    bn_logB_edges = collect(range(bn_Blo, bn_Bhi; length = Int(nbins) + 1))
+    bn_profiles = Dict(label => binned_magnetic_density(
+            bn_samples_by_run[label], bn_logn_edges)
+        for label in comparison_run_labels)
+    bn_fits = Dict(label => magnetic_density_fit(
+            bn_profiles[label], Float64(bn_fit_min_density))
+        for label in comparison_run_labels)
+
+    active_bn_samples = haskey(bn_samples_by_run, selected_run) ?
+        bn_samples_by_run[selected_run] : magnetic_density_samples(cube)
+    active_bn_histogram = fit(Histogram,
+        (clamp.(active_bn_samples.logn, bn_nlo, prevfloat(bn_nhi)),
+            clamp.(active_bn_samples.logB, bn_Blo, prevfloat(bn_Bhi))),
+        (bn_logn_edges, bn_logB_edges))
+    bn_histogram_total = sum(active_bn_histogram.weights)
+    bn_log_probability = map(active_bn_histogram.weights) do weight
+        weight > 0 && bn_histogram_total > 0 ? log10(weight / bn_histogram_total) : NaN
+    end
+    nothing
+end
+
+# ╔═╡ b1000003-6f8c-4d0c-9a10-000000000003
+begin
+    fig_bn = Figure(size = (1100, 470))
+    bn_panel = fig_bn[1, 1] = GridLayout()
+    bn_joint_axis = latex_axis(bn_panel[1, 1],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"|B|\;[\mu\mathrm{G}]",
+        xscale = log10, yscale = log10,
+        xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+        xminorticksvisible = true, yminorticksvisible = true)
+    bn_heatmap = heatmap!(bn_joint_axis, 10.0 .^ bn_logn_edges,
+        10.0 .^ bn_logB_edges, bn_log_probability; colormap = :magma)
+    latex_colorbar(bn_panel[1, 2], bn_heatmap,
+        label = L"\log_{10}\mathcal{P}_{\mathrm{bin}}")
+    colsize!(bn_panel, 2, 22)
+
+    bn_relation_axis = latex_axis(fig_bn[1, 2],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"|B|\;[\mu\mathrm{G}]",
+        xscale = log10, yscale = log10,
+        xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+        xminorticksvisible = true, yminorticksvisible = true)
+    for label in comparison_run_labels
+        profile = bn_profiles[label]
+        valid = isfinite.(profile.medians)
+        x = 10.0 .^ profile.centers[valid]
+        median_B = 10.0 .^ profile.medians[valid]
+        band!(bn_relation_axis, x, 10.0 .^ profile.lower[valid],
+            10.0 .^ profile.upper[valid]; color = (run_colors[label], 0.15))
+        lines!(bn_relation_axis, x, median_B; color = run_colors[label], linewidth = 2.8)
+        scatter!(bn_relation_axis, x, median_B; color = run_colors[label], markersize = 6)
+        fit_result = bn_fits[label]
+        if isfinite(fit_result.slope) && !isempty(x)
+            fit_x = extrema(x)
+            fit_y = 10.0 .^ (fit_result.intercept .+
+                fit_result.slope .* log10.(collect(fit_x)))
+            lines!(bn_relation_axis, collect(fit_x), fit_y;
+                color = run_colors[label], linestyle = :dash, linewidth = 2,
+                label = latexstring(legend_run_label(label),
+                    raw";\;\kappa=", @sprintf("%.3f", fit_result.slope)))
+        end
+    end
+    axislegend(bn_relation_axis; position = :lt, framevisible = false)
+    stable_pluto_figure(display_bn_relation, fig_bn)
+end
+
+# ╔═╡ b1000004-6f8c-4d0c-9a10-000000000004
+begin
+    function hro_products(c, density_bin_count; angle_bin_count = 18)
+        local_n = number_density(c.rho)
+        log_density = safe_log10.(local_n)
+        spacing = c.L ./ size(c.rho)
+        gx = periodic_derivative(log_density, 1, spacing[1])
+        gy = periodic_derivative(log_density, 2, spacing[2])
+        gz = periodic_derivative(log_density, 3, spacing[3])
+        gradient_norm = sqrt.(gx .^ 2 .+ gy .^ 2 .+ gz .^ 2)
+        field_norm = magnetic_fields(c).B
+        valid = isfinite.(log_density) .& isfinite.(gradient_norm) .&
+            isfinite.(field_norm) .& (gradient_norm .> 0) .& (field_norm .> 0)
+        cosine_gradient = abs.(c.bx .* gx .+ c.by .* gy .+ c.bz .* gz) ./
+            max.(field_norm .* gradient_norm, eps(Float64))
+        # 0°: B follows an isodensity structure; 90°: B crosses it.
+        angles = asind.(clamp.(cosine_gradient[valid], 0.0, 1.0))
+        densities = log_density[valid]
+        probability_edges = collect(range(0.0, 1.0; length = density_bin_count + 1))
+        density_edges = unique(quantile(densities, probability_edges))
+        length(density_edges) >= 2 || (density_edges = [minimum(densities), maximum(densities) + eps()])
+        angle_edges = collect(range(0.0, 90.0; length = angle_bin_count + 1))
+        angle_centers = (angle_edges[1:end-1] .+ angle_edges[2:end]) ./ 2
+        bin_count = length(density_edges) - 1
+        histograms = zeros(Float64, length(angle_centers), bin_count)
+        shape = fill(NaN, bin_count)
+        density_centers = fill(NaN, bin_count)
+        counts = zeros(Int, bin_count)
+        for bin in 1:bin_count
+            members = (densities .>= density_edges[bin]) .&
+                (bin == bin_count ? densities .<= density_edges[bin + 1] :
+                    densities .< density_edges[bin + 1])
+            local_angles = angles[members]
+            counts[bin] = length(local_angles)
+            isempty(local_angles) && continue
+            density_centers[bin] = median(densities[members])
+            histogram = fit(Histogram, local_angles, angle_edges).weights
+            histograms[:, bin] .= histogram ./ max(sum(histogram), 1)
+            central = count(angle -> angle < 22.5, local_angles)
+            edge = count(angle -> angle > 67.5, local_angles)
+            shape[bin] = (central - edge) / max(central + edge, 1)
+        end
+        (; angle_centers, histograms, density_centers, shape, counts)
+    end
+
+    hro_by_run = Dict(label => hro_products(
+            comparison_cubes[label], Int(hro_density_bin_count))
+        for label in comparison_run_labels)
+    active_hro = haskey(hro_by_run, selected_run) ? hro_by_run[selected_run] :
+        hro_products(cube, Int(hro_density_bin_count))
+
+    fig_hro = Figure(size = (1100, 470))
+    hro_hist_axis = latex_axis(fig_hro[1, 1],
+        xlabel = L"\phi_{B,\,\mathrm{structure}}\;[{}^\circ]",
+        ylabel = L"\mathcal{P}(\phi)")
+    representative_bins = unique([1, cld(size(active_hro.histograms, 2), 2),
+        size(active_hro.histograms, 2)])
+    for (style_index, bin) in enumerate(representative_bins)
+        isfinite(active_hro.density_centers[bin]) || continue
+        lines!(hro_hist_axis, active_hro.angle_centers,
+            active_hro.histograms[:, bin]; color = MHD_COLORS[style_index],
+            linewidth = 2.8,
+            label = latexstring(raw"n_{\mathrm{med}}=",
+                @sprintf("%.3g", 10.0^active_hro.density_centers[bin]),
+                raw"\;\mathrm{cm}^{-3}"))
+    end
+    axislegend(hro_hist_axis; position = :ct, framevisible = false)
+
+    hro_shape_axis = latex_axis(fig_hro[1, 2],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"\zeta_{\mathrm{HRO}}",
+        xscale = log10, xticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+    hlines!(hro_shape_axis, [0.0]; color = (:gray45, 0.65), linestyle = :dash)
+    for label in comparison_run_labels
+        product = hro_by_run[label]
+        valid = isfinite.(product.density_centers) .& isfinite.(product.shape)
+        lines!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
+            product.shape[valid]; color = run_colors[label], linewidth = 2.8,
+            label = latexstring(legend_run_label(label)))
+        scatter!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
+            product.shape[valid]; color = run_colors[label], markersize = 6)
+    end
+    axislegend(hro_shape_axis; position = :lb, framevisible = false)
+    stable_pluto_figure(display_hro, fig_hro)
+end
+
+# ╔═╡ b1000005-6f8c-4d0c-9a10-000000000005
+begin
+    function periodic_gaussian_smooth_2d(image, fwhm_pixels)
+        fwhm_pixels <= 0 && return Float64.(image)
+        nx, ny = size(image)
+        sigma = Float64(fwhm_pixels) / (2sqrt(2log(2)))
+        kx = reshape([i <= nx ÷ 2 ? i : i - nx for i in 0:nx-1] ./ nx, nx, 1)
+        ky = reshape([j <= ny ÷ 2 ? j : j - ny for j in 0:ny-1] ./ ny, 1, ny)
+        transfer = @. exp(-2pi^2 * sigma^2 * (kx^2 + ky^2))
+        valid = isfinite.(image)
+        filled = ifelse.(valid, Float64.(image), 0.0)
+        smoothed = real.(ifft(fft(filled) .* transfer))
+        normalization = real.(ifft(fft(Float64.(valid)) .* transfer))
+        map((value, weight) -> weight > sqrt(eps(Float64)) ? value / weight : NaN,
+            smoothed, normalization)
+    end
+
+    function hog_products(c, line_of_sight, plane_dimensions;
+            smoothing_fwhm = 2.0, gradient_percentile = 20.0,
+            logarithmic_maps = true, angle_bin_count = 18)
+        local_n = number_density(c.rho)
+        local_B = GAUSS_TO_MICROGAUSS .* magnetic_fields(c).B
+        column = finite_sum_dims(local_n, line_of_sight)
+        projected_B = weighted_project(local_B, c.rho, line_of_sight)
+        image1 = logarithmic_maps ? safe_log10.(column) : Float64.(column)
+        image2 = logarithmic_maps ? safe_log10.(projected_B) : Float64.(projected_B)
+        image1 = periodic_gaussian_smooth_2d(image1, smoothing_fwhm)
+        image2 = periodic_gaussian_smooth_2d(image2, smoothing_fwhm)
+        d1x = periodic_derivative(image1, 1, 1.0)
+        d1y = periodic_derivative(image1, 2, 1.0)
+        d2x = periodic_derivative(image2, 1, 1.0)
+        d2y = periodic_derivative(image2, 2, 1.0)
+        norm1, norm2 = hypot.(d1x, d1y), hypot.(d2x, d2y)
+        positive1 = filter(x -> isfinite(x) && x > 0, vec(norm1))
+        positive2 = filter(x -> isfinite(x) && x > 0, vec(norm2))
+        threshold1 = isempty(positive1) ? 0.0 : quantile(positive1, gradient_percentile / 100)
+        threshold2 = isempty(positive2) ? 0.0 : quantile(positive2, gradient_percentile / 100)
+        valid = isfinite.(d1x) .& isfinite.(d1y) .& isfinite.(d2x) .&
+            isfinite.(d2y) .& (norm1 .> threshold1) .& (norm2 .> threshold2)
+        dot_product = d1x .* d2x .+ d1y .* d2y
+        cosine = abs.(dot_product[valid]) ./
+            max.(norm1[valid] .* norm2[valid], eps(Float64))
+        angles = acosd.(clamp.(cosine, 0.0, 1.0))
+        angle_edges = collect(range(0.0, 90.0; length = angle_bin_count + 1))
+        angle_centers = (angle_edges[1:end-1] .+ angle_edges[2:end]) ./ 2
+        histogram = isempty(angles) ? zeros(length(angle_centers)) :
+            Float64.(fit(Histogram, angles, angle_edges).weights)
+        sum(histogram) > 0 && (histogram ./= sum(histogram))
+        cos2 = cosd.(2 .* angles)
+        sin2 = sind.(2 .* angles)
+        normalized_prs = isempty(cos2) ? NaN : mean(cos2)
+        prs = isempty(cos2) ? NaN : sum(cos2) / sqrt(length(cos2) / 2)
+        rvl = isempty(cos2) ? NaN : hypot(mean(cos2), mean(sin2))
+        (; angle_centers, histogram, normalized_prs, prs, rvl,
+            ngood = length(angles))
+    end
+
+    hog_by_run = Dict(label => hog_products(comparison_cubes[label], los_dim, sky_dims;
+            smoothing_fwhm = Float64(hog_smoothing_fwhm_pix),
+            gradient_percentile = Float64(hog_gradient_percentile),
+            logarithmic_maps = hog_logarithmic_maps)
+        for label in comparison_run_labels)
+
+    fig_hog = Figure(size = (1100, 470))
+    hog_hist_axis = latex_axis(fig_hog[1, 1],
+        xlabel = L"\phi_{\nabla N_{\mathrm H},\,\nabla |B|}\;[{}^\circ]",
+        ylabel = L"\mathcal{P}(\phi)")
+    for label in comparison_run_labels
+        product = hog_by_run[label]
+        lines!(hog_hist_axis, product.angle_centers, product.histogram;
+            color = run_colors[label], linewidth = 2.8,
+            label = latexstring(legend_run_label(label)))
+    end
+    axislegend(hog_hist_axis; position = :rt, framevisible = false)
+
+    hog_positions = collect(1:length(comparison_run_labels))
+    hog_values = [hog_by_run[label].normalized_prs for label in comparison_run_labels]
+    hog_prs_axis = latex_axis(fig_hog[1, 2],
+        xlabel = L"\mathrm{simulation}", ylabel = L"V/V_{\max}",
+        xticks = hog_positions,
+        xtickformat = values -> [latexstring(legend_run_label(
+            comparison_run_labels[clamp(round(Int, value), 1,
+                length(comparison_run_labels))])) for value in values])
+    hlines!(hog_prs_axis, [0.0]; color = (:gray45, 0.65), linestyle = :dash)
+    barplot!(hog_prs_axis, hog_positions, hog_values;
+        color = [run_colors[label] for label in comparison_run_labels])
+    stable_pluto_figure(display_hog, fig_hog)
 end
 
 # ╔═╡ 298bd579-bb28-48b7-8c55-ea74804b9837
@@ -3195,6 +3499,11 @@ begin
     krho, Prho = isotropic_power_spectrum((number_density_cells,), spectrum_box_length_pc)
     kv, Pv = isotropic_power_spectrum((turb.dvx, turb.dvy, turb.dvz), spectrum_box_length_pc; prefactor = 0.5)
     komega, Pomega = isotropic_power_spectrum((omega.wx, omega.wy, omega.wz), spectrum_box_length_pc)
+    spectrum_maximum_k = maximum(vcat(krho, kv, komega))
+    spectrum_k_choices = spectrum_dk:spectrum_dk:spectrum_maximum_k
+    spectrum_default_k_min = min(spectrum_low_k_limit, spectrum_maximum_k)
+    spectrum_default_k_max = max(spectrum_default_k_min,
+        spectrum_dk * floor(Int, spectrum_maximum_k / (2spectrum_dk)))
 end
 
 # ╔═╡ df880704-b12e-49eb-84f2-67b6f9583a8a
@@ -3351,6 +3660,8 @@ The panels show number-density, turbulent-velocity, and vorticity spectra on bas
 
 The first shells contain few Fourier modes and are correspondingly noisy. The shaded region $k<3\,\Delta k$ marks these box-scale modes; it should be excluded when estimating an inertial-range slope. The threshold is a visual reliability guide, not a claim that an inertial range necessarily begins at $3\,\Delta k$.
 
+The fitted model is $E(k)=A k^\alpha$ over the selected interval. The optional Kolmogorov reference has $\alpha=-5/3$ and is normalized to the fitted spectrum at the geometric center of that interval.
+
 **Display density, velocity, and vorticity power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
 
 | Power-spectrum panel | Display |
@@ -3358,10 +3669,34 @@ The first shells contain few Fourier modes and are correspondingly noisy. The sh
 | Number-density spectrum | $(@bind show_spectrum_density PlutoUI.CheckBox(default = true)) |
 | Velocity spectrum | $(@bind show_spectrum_velocity PlutoUI.CheckBox(default = true)) |
 | Vorticity spectrum | $(@bind show_spectrum_vorticity PlutoUI.CheckBox(default = true)) |
+| Display fitted slopes | $(@bind show_spectrum_slopes PlutoUI.CheckBox(default = true)) |
+| Minimum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_min PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_min)) |
+| Maximum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_max PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_max)) |
+| Display the Kolmogorov $k^{-5/3}$ reference | $(@bind show_kolmogorov_spectrum PlutoUI.CheckBox(default = true)) |
 """
 
 # ╔═╡ 3a731972-3404-478c-a572-00a05ab652b1
 begin
+    function power_law_slope(k, power, minimum_k, maximum_k)
+        lower, upper = minmax(Float64(minimum_k), Float64(maximum_k))
+        valid = isfinite.(k) .& isfinite.(power) .& (k .> 0) .& (power .> 0) .&
+            (k .>= lower) .& (k .<= upper)
+        x, y = log10.(Float64.(k[valid])), log10.(Float64.(power[valid]))
+        length(x) >= 2 || return (slope = NaN, intercept = NaN, r2 = NaN,
+            count = length(x), lower = lower, upper = upper)
+        xmean, ymean = mean(x), mean(y)
+        denominator = sum(abs2, x .- xmean)
+        denominator > 0 || return (slope = NaN, intercept = NaN, r2 = NaN,
+            count = length(x), lower = lower, upper = upper)
+        slope = sum((x .- xmean) .* (y .- ymean)) / denominator
+        intercept = ymean - slope * xmean
+        prediction = intercept .+ slope .* x
+        residual = sum(abs2, y .- prediction)
+        total = sum(abs2, y .- ymean)
+        r2 = total > 0 ? 1 - residual / total : NaN
+        (; slope, intercept, r2, count = length(x), lower, upper)
+    end
+
     spectrum_specs = NamedTuple[]
     show_spectrum_density && push!(spectrum_specs,
         (k = krho, power = Prho, ylabel = L"E_n(k)\;[\mathrm{cm}^{-6}\,\mathrm{pc}]",
@@ -3392,8 +3727,36 @@ begin
                 color = (:gray35, 0.75), linestyle = :dash, linewidth = 1.3)
             valid = isfinite.(spec.k) .& isfinite.(spec.power) .&
                 (spec.k .> 0) .& (spec.power .> 0)
-            lines!(axis, spec.k[valid], spec.power[valid]; color = spec.color, linewidth = 2.5)
+            lines!(axis, spec.k[valid], spec.power[valid]; color = spec.color,
+                linewidth = 2.5, label = L"E(k)")
             scatter!(axis, spec.k[valid], spec.power[valid]; color = spec.color, markersize = 5)
+            fit_result = power_law_slope(spec.k, spec.power,
+                spectrum_fit_k_min, spectrum_fit_k_max)
+            if isfinite(fit_result.slope)
+                fit_k = 10.0 .^ range(log10(fit_result.lower),
+                    log10(fit_result.upper); length = 100)
+                fit_power = 10.0 .^ (fit_result.intercept .+
+                    fit_result.slope .* log10.(fit_k))
+                if show_spectrum_slopes
+                    vspan!(axis, fit_result.lower, fit_result.upper;
+                        color = (MHD_COLORS[2], 0.08))
+                    lines!(axis, fit_k, fit_power; color = MHD_COLORS[2],
+                        linewidth = 2.5, linestyle = :dash,
+                        label = latexstring(raw"\alpha=", @sprintf("%.3f", fit_result.slope),
+                            raw",\;R^2=", @sprintf("%.3f", fit_result.r2)))
+                end
+                if show_kolmogorov_spectrum
+                    pivot_k = sqrt(fit_result.lower * fit_result.upper)
+                    pivot_power = 10.0^(fit_result.intercept +
+                        fit_result.slope * log10(pivot_k))
+                    kolmogorov_power = pivot_power .* (fit_k ./ pivot_k) .^ (-5 / 3)
+                    lines!(axis, fit_k, kolmogorov_power; color = :black,
+                        linewidth = 2.2, linestyle = :dot,
+                        label = L"k^{-5/3}")
+                end
+                (show_spectrum_slopes || show_kolmogorov_spectrum) &&
+                    axislegend(axis; position = :lb, framevisible = false)
+            end
         end
     end
     display_power_spectra ? fig_spectra : nothing
@@ -3513,6 +3876,9 @@ begin
         "growth_rate_relations" => "Growth rate versus time and Mach numbers",
         "normalized_magnetic_relations" => "Normalized magnetic evolution",
         "normalized_magnetic_field" => "Normalized magnetic-field distribution",
+        "magnetic_density" => "Magnetic field versus density",
+        "hro" => "Histogram of relative orientations",
+        "hog" => "Histogram of oriented gradients",
         "energy_ratios" => "Energy ratios by density",
         "energy_time" => "Energy ratios versus time",
         "vorticity" => "Vorticity map",
@@ -3530,6 +3896,9 @@ begin
         "growth_rate_relations" => fig_gamma_relations,
         "normalized_magnetic_relations" => fig_normalized_B_relations,
         "normalized_magnetic_field" => fig_logB,
+        "magnetic_density" => fig_bn,
+        "hro" => fig_hro,
+        "hog" => fig_hog,
         "energy_ratios" => fig_energy,
         "energy_time" => fig_energy_time,
         "vorticity" => fig_vorticity,
@@ -5629,6 +5998,11 @@ version = "4.1.0+0"
 # ╠═d56a8ba3-aa42-4351-a065-87275032a342
 # ╟─1be45ca2-bd2f-4b77-9188-5b338d41483b
 # ╟─89420b8d-c72e-4a04-91dd-043bc9ecef2e
+# ╟─b1000001-6f8c-4d0c-9a10-000000000001
+# ╠═b1000002-6f8c-4d0c-9a10-000000000002
+# ╠═b1000003-6f8c-4d0c-9a10-000000000003
+# ╠═b1000004-6f8c-4d0c-9a10-000000000004
+# ╠═b1000005-6f8c-4d0c-9a10-000000000005
 # ╟─298bd579-bb28-48b7-8c55-ea74804b9837
 # ╟─e4a64ef5-9e6e-4ae2-8daf-42e4fc1724ba
 # ╟─a1bf5e62-ecb8-47d7-8692-c33929c831ac

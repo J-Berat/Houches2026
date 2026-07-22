@@ -136,15 +136,17 @@ julia --project=. run_pluto.jl
 
 You can also change the path interactively in the notebook and click **Load path**.
 
-The selected path may point to any of the following:
+The loader only considers snapshot files located inside a directory named
+`DataCubes`. The selected path may point to any of the following:
 
 - a repository containing several simulation families;
 - one family such as `VaryingMach`;
 - one simulation directory;
-- a `DataCubes` directory;
-- a directory containing snapshot files directly.
+- a `DataCubes` directory.
 
-Directory names and nesting are discovered recursively. A typical layout is:
+Directory names and nesting are discovered recursively, but directories that
+contain snapshots directly without a `DataCubes` level are ignored. A typical
+layout is:
 
 ```text
 simulation-root/
@@ -282,7 +284,7 @@ PLUTO_PORT=16543 julia --project=. run_pluto.jl
 
 ### No snapshots are found
 
-Check the repository path, file extensions, and directory permissions. The path may point directly to a `DataCubes` directory. Set `DYNAMO_DATA_REPOSITORY` explicitly if the default PSMN location is not appropriate.
+Check that the repository contains a non-empty directory named `DataCubes`, that its snapshots use a supported extension, and that you have permission to read it. The path may point directly to a `DataCubes` directory. Set `DYNAMO_DATA_REPOSITORY` explicitly if the default PSMN location is not appropriate.
 
 ### An HDF5 field is missing or ambiguous
 
@@ -290,7 +292,11 @@ Read the accepted aliases shown in the mapping table, inspect the available-data
 
 ### Calculations use too much memory
 
-Keep lazy execution enabled, run only the needed result cells, and reduce the number of selected simulations, maps, or spectral channels when memory is limited.
+HDF5 access is serialized: only one file is open at a time, every dataset handle
+is closed immediately after reading, and comparative diagnostics retain derived
+profiles or maps instead of a full 3-D cube for every simulation. Keep lazy
+execution enabled, run only the needed result cells, and reduce the number of
+selected simulations, maps, or spectral channels when memory is limited.
 
 ## Reproducibility notes
 

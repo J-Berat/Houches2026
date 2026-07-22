@@ -40,6 +40,71 @@ begin
     KM_CM = 1.0e5                    # cm
     GAUSS_TO_MICROGAUSS = 1.0e6
 
+    # Persistent caches. This cell has no reactive dependency, so Pluto runs it
+    # once per session and the caches survive every widget change. RAW_CUBE_CACHE
+    # holds unit-free arrays exactly as stored on disk and is bounded by a memory
+    # budget; REDUCTION_CACHE holds the scalar summaries of a snapshot, which are
+    # small enough to keep for every snapshot of every run.
+    const CACHE_LOCK = ReentrantLock()
+    const RAW_CUBE_CACHE = Dict{Any,Any}()
+    const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
+    const RAW_CUBE_CACHE_ORDER = Any[]
+    const RAW_CUBE_CACHE_BUDGET = Ref(Int(Sys.total_memory() ÷ 4))
+    const REDUCTION_CACHE = Dict{Any,Any}()
+
+    "Return a memoized scalar summary, or `nothing` if it has not been computed."
+    reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
+
+    "Memoize a scalar summary and return it."
+    store_reduction!(key, value) =
+        lock(() -> (REDUCTION_CACHE[key] = value), CACHE_LOCK)
+
+    """
+    Return the cached raw cube for `key`, evaluating `build()` on a miss.
+
+    Entries are evicted least-recently-used first once the resident set exceeds
+    `RAW_CUBE_CACHE_BUDGET`. One entry is always retained, so a cube larger than
+    the budget still benefits from repeated use within a single sweep.
+    """
+    function cached_raw_cube!(key, build)
+        hit = lock(CACHE_LOCK) do
+            if haskey(RAW_CUBE_CACHE, key)
+                position = findfirst(isequal(key), RAW_CUBE_CACHE_ORDER)
+                isnothing(position) || deleteat!(RAW_CUBE_CACHE_ORDER, position)
+                push!(RAW_CUBE_CACHE_ORDER, key)
+                RAW_CUBE_CACHE[key]
+            else
+                nothing
+            end
+        end
+        isnothing(hit) || return hit
+        value = build()
+        bytes = Base.summarysize(value)
+        lock(CACHE_LOCK) do
+            RAW_CUBE_CACHE[key] = value
+            RAW_CUBE_CACHE_BYTES[key] = bytes
+            push!(RAW_CUBE_CACHE_ORDER, key)
+            resident = sum(values(RAW_CUBE_CACHE_BYTES))
+            while length(RAW_CUBE_CACHE_ORDER) > 1 && resident > RAW_CUBE_CACHE_BUDGET[]
+                evicted = popfirst!(RAW_CUBE_CACHE_ORDER)
+                resident -= RAW_CUBE_CACHE_BYTES[evicted]
+                delete!(RAW_CUBE_CACHE, evicted)
+                delete!(RAW_CUBE_CACHE_BYTES, evicted)
+            end
+        end
+        value
+    end
+    const HDF5_READ_LOCK = ReentrantLock()
+
+    "Open at most one HDF5 file at a time and always close it before returning."
+    function with_hdf5_file(operation::Function, path)
+        lock(HDF5_READ_LOCK) do
+            h5open(path, "r") do handle
+                operation(handle)
+            end
+        end
+    end
+
     """
     Render every numeric axis and colorbar tick as a genuine LaTeXString.
     """
@@ -70,9 +135,31 @@ begin
     function latex_axis(parent; xlabel = L"", ylabel = L"",
             xtickformat = latex_ticklabels, ytickformat = latex_ticklabels,
             kwargs...)
+        axis_options = (; kwargs...)
+        x_is_log = get(axis_options, :xscale, identity) === log10
+        y_is_log = get(axis_options, :yscale, identity) === log10
+        readable_log_ticks = (
+            xticksize = x_is_log ? 9 : 6,
+            yticksize = y_is_log ? 9 : 6,
+            xminorticksize = x_is_log ? 5 : 3,
+            yminorticksize = y_is_log ? 5 : 3,
+            xtickwidth = x_is_log ? 1.4 : 1.0,
+            ytickwidth = y_is_log ? 1.4 : 1.0,
+            xminortickwidth = x_is_log ? 1.0 : 0.8,
+            yminortickwidth = y_is_log ? 1.0 : 0.8,
+            xgridvisible = x_is_log,
+            ygridvisible = y_is_log,
+            xgridcolor = (:gray45, 0.18),
+            ygridcolor = (:gray45, 0.18),
+            xminorgridvisible = x_is_log,
+            yminorgridvisible = y_is_log,
+            xminorgridcolor = (:gray55, 0.08),
+            yminorgridcolor = (:gray55, 0.08),
+        )
+        options = merge(readable_log_ticks, axis_options)
         Axis(parent;
             xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
-            xtickformat, ytickformat, kwargs...)
+            xtickformat, ytickformat, options...)
     end
 
     function latex_colorbar(parent, plot; label = L"",
@@ -794,6 +881,10 @@ md"""
 
 ### Data repository
 
+Only simulations stored in a directory named `DataCubes` are discovered. The
+selected path may be the common repository root or one specific `DataCubes`
+directory.
+
 | Data source | Control |
 |:--|:--|
 | Data path | $(@bind data_repository PlutoUI.confirm(PlutoUI.TextField(90; default = DEFAULT_DATA_REPOSITORY, placeholder = "/path/to/data"); label = "Load path")) |
@@ -849,8 +940,15 @@ begin
     function hdf5_file_is_snapshot(path)
         isfile(path) && snapshot_extension(path) in (".h5", ".hdf5") || return false
         try
-            h5open(path, "r") do h
-                any(dataset_path -> ndims(h[dataset_path]) == 3, hdf5_dataset_paths(h))
+            with_hdf5_file(path) do h
+                any(hdf5_dataset_paths(h)) do dataset_path
+                    dataset = h[dataset_path]
+                    try
+                        ndims(dataset) == 3
+                    finally
+                        close(dataset)
+                    end
+                end
             end
         catch
             false
@@ -891,10 +989,35 @@ begin
     function read_hdf5_field(h, field; required = true, source = "HDF5 file",
             overrides = Dict{Symbol,String}())
         path = hdf5_field_path(h, field; required, source, overrides)
-        isnothing(path) ? nothing : read(h[path])
+        isnothing(path) && return nothing
+        dataset = h[path]
+        try
+            read(dataset)
+        finally
+            close(dataset)
+        end
     end
 
     hdf5_scalar_value(value) = value isa Number ? Float64(value) : Float64(only(value))
+
+    # Face-centred fields are averaged in their own precision, so that snapshots
+    # stored as Float32 are not silently widened to Float64.
+    function average_faces(lower, upper)
+        half = convert(float(promote_type(eltype(lower), eltype(upper))), 0.5)
+        half .* (lower .+ upper)
+    end
+
+    """
+    Cheap fingerprint that changes whenever a snapshot is rewritten on disk.
+
+    Including it in the cache keys means the caches invalidate themselves when a
+    simulation is re-run, instead of serving stale arrays.
+    """
+    function snapshot_fingerprint(path)
+        isdir(path) || return (mtime(path), filesize(path))
+        Tuple((basename(entry), mtime(entry), filesize(entry))
+            for entry in sort(readdir(path; join = true)))
+    end
 
     function centered_hdf5_magnetic_component(h, centered, left, right, source;
             overrides = Dict{Symbol,String}())
@@ -908,7 +1031,7 @@ begin
             "$(join(FIELD_ALIASES[left], ", ")) and " *
             "$(join(FIELD_ALIASES[right], ", ")).",
         )
-        0.5 .* (lower .+ upper)
+        average_faces(lower, upper)
     end
 
     function fits_directory_is_snapshot(path)
@@ -938,9 +1061,14 @@ begin
         startswith(path, "~/") ? joinpath(homedir(), path[3:end]) : path
     end
 
+    is_datacubes_directory(path) =
+        isdir(path) && lowercase(basename(normpath(path))) == "datacubes"
+
     function discover_cube_directories(path; depth = 0, max_depth = 32)
         isdir(path) || return String[]
-        !isempty(snapshot_sources(path)) && return [abspath(path)]
+        if is_datacubes_directory(path)
+            return isempty(snapshot_sources(path)) ? String[] : [abspath(path)]
+        end
         depth >= max_depth && return String[]
         found = String[]
         for entry in sort(readdir(path))
@@ -960,8 +1088,8 @@ begin
         requested = abspath(expand_home(strip(repository)))
         isdir(requested) || error("Data folder does not exist: $requested")
         is_dataset_root(requested) || error(
-            "No HDF5 or FITS snapshots were found recursively under: $requested. " *
-            "The folder may be a repository, family, run, DataCubes folder, or direct snapshot folder.",
+            "No non-empty DataCubes directory containing HDF5 or FITS snapshots " *
+            "was found recursively under: $requested.",
         )
         requested
     end
@@ -1041,12 +1169,12 @@ begin
             file = fits_directory_field_file(source, field)
             isnothing(file) ? nothing : FITS(file) do fits
                 hdu = first_fits_image_hdu(fits)
-                isnothing(hdu) ? nothing : Float64.(read(hdu))
+                isnothing(hdu) ? nothing : read(hdu)
             end
         else
             FITS(source) do fits
                 hdu = fits_field_hdu(fits, field; primary_fallback)
-                isnothing(hdu) ? nothing : Float64.(read(hdu))
+                isnothing(hdu) ? nothing : read(hdu)
             end
         end
         required && isnothing(result) && error(
@@ -1075,13 +1203,18 @@ begin
         if is_fits_file(path) || isdir(path)
             return fits_header_scalar(path, names)
         end
-        h5open(path, "r") do h
+        with_hdf5_file(path) do h
             candidates = vcat(names,
                 ["metadata/$name" for name in names],
                 ["parameters/$name" for name in names])
             for candidate in candidates
                 haskey(h, candidate) || continue
-                value = read(h[candidate])
+                dataset = h[candidate]
+                value = try
+                    read(dataset)
+                finally
+                    close(dataset)
+                end
                 value isa Number && return Float64(value)
                 length(value) == 1 && return Float64(first(value))
             end
@@ -1104,10 +1237,15 @@ begin
             dimensions = size(read_fits_field(path, :rho; primary_fallback = true))
             return all(==(first(dimensions)), dimensions) ? first(dimensions) : maximum(dimensions)
         end
-        h5open(path, "r") do h
+        with_hdf5_file(path) do h
             density_path = hdf5_field_path(h, :rho; source = path,
                 overrides)
-            dimensions = size(h[density_path])
+            dataset = h[density_path]
+            dimensions = try
+                size(dataset)
+            finally
+                close(dataset)
+            end
             all(==(first(dimensions)), dimensions) ? first(dimensions) : maximum(dimensions)
         end
     end
@@ -1190,7 +1328,7 @@ begin
         if is_snapshot_file(source) && !is_fits_file(source)]
     HDF5_REFERENCE_FILE = isempty(mapping_sources) ? nothing : first(mapping_sources)
     HDF5_AVAILABLE_DATASETS = isnothing(HDF5_REFERENCE_FILE) ? String[] :
-        h5open(hdf5_dataset_paths, HDF5_REFERENCE_FILE, "r")
+        with_hdf5_file(hdf5_dataset_paths, HDF5_REFERENCE_FILE)
 
     function hdf5_mapping_options(field)
         aliases = Set(normalize_field_name.(FIELD_ALIASES[field]))
@@ -1320,24 +1458,23 @@ begin
         sources
     end
 
+    function snapshot_time_from_filename(path)
+        matched = match(r"([0-9]+(?:\.[0-9]+)?)\D*$", basename(path))
+        isnothing(matched) ? NaN : parse(Float64, matched.captures[1])
+    end
+
     function snapshot_time(path)
         if is_fits_file(path) || isdir(path)
             stored = read_fits_field(path, :t; required = false)
             !isnothing(stored) && length(stored) == 1 && return Float64(first(stored))
             header_time = fits_header_scalar(path, ["TIME", "T", "SIMTIME", "MYRTIME"])
-            if isnothing(header_time)
-                matched = match(r"([0-9]+(?:\.[0-9]+)?)\D*$", basename(path))
-                return isnothing(matched) ? NaN : parse(Float64, matched.captures[1])
-            end
+            isnothing(header_time) && return snapshot_time_from_filename(path)
             return header_time
         end
-        h5open(path, "r") do h
+        with_hdf5_file(path) do h
             stored = read_hdf5_field(h, :t; required = false, source = path,
                 overrides = HDF5_FIELD_OVERRIDES)
-            if isnothing(stored)
-                matched = match(r"([0-9]+(?:\.[0-9]+)?)\D*$", basename(path))
-                return isnothing(matched) ? NaN : parse(Float64, matched.captures[1])
-            end
+            isnothing(stored) && return snapshot_time_from_filename(path)
             hdf5_scalar_value(stored)
         end
     end
@@ -1387,7 +1524,7 @@ begin
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
-    open_cubes_text = join(analysis_series_labels, ", ")
+    series_runs_text = join(analysis_series_labels, ", ")
     active_snapshot_format = snapshot_format(run_files[selected_run][selected_snapshot])
     Markdown.parse("""
     ### Active selection
@@ -1399,8 +1536,8 @@ begin
     | Input format | **$(active_snapshot_format)** |
     | Physical time | **$(active_time_text)** ``\\mathrm{Myr}`` |
     | Line of sight | **$(los_name)** |
-    | Cubes opened | **$(length(analysis_series_labels))** |
-    | Open cubes | **$(open_cubes_text)** |
+    | HDF5 access | **Sequential; one file at a time** |
+    | Runs used for time series | **$(series_runs_text)** |
     | Comparative simulations | **$(comparison_runs_text)** |
     | Family comparison variable | **$(comparison_parameter)** |
     | Physical convention | ``\\gamma`` = **$(gamma)**; ``\\mu`` = **$(mean_molecular_weight)** ``m_{\\mathrm H}``; Gaussian CGS; PDF weighting = **$(pdf_weighting)** |
@@ -1435,7 +1572,7 @@ begin
         upper = read_fits_field(source, right; required = false)
         (isnothing(lower) || isnothing(upper)) && error(
             "FITS magnetic component $(centered) requires either $(centered) or both $(left)/$(right).")
-        0.5 .* (lower .+ upper)
+        average_faces(lower, upper)
     end
 
     function validate_cube_shapes(source, fields)
@@ -1449,12 +1586,18 @@ begin
         nothing
     end
 
-    "Load one HDF5 or FITS cube and center face-stored magnetic-field components."
-    function load_cube(path)
+    """
+    Read one HDF5 or FITS cube in the precision it is stored in.
+
+    Nothing here depends on the physical-unit widgets, so the result is a pure
+    function of the file and of the HDF5 field mapping, and can be cached. As
+    before, the HDF5 file and every dataset handle are closed before any
+    conversion happens.
+    """
+    function read_raw_cube(path)
         if is_fits_file(path) || isdir(path)
-            raw_rho = read_fits_field(path, :rho; primary_fallback = true)
             raw_fields = (
-                rho = raw_rho,
+                rho = read_fits_field(path, :rho; primary_fallback = true),
                 P = read_fits_field(path, :P),
                 vx = read_fits_field(path, :vx),
                 vy = read_fits_field(path, :vy),
@@ -1464,20 +1607,11 @@ begin
                 bz = centered_fits_magnetic_component(path, :bz, :bz_l, :bz_r),
             )
             validate_cube_shapes(path, raw_fields)
-            rho = Float64(density_unit_gcm3) .* raw_fields.rho
-            P = Float64(pressure_unit_ergcm3) .* raw_fields.P
-            velocity_scale = Float64(velocity_unit_kms)
-            vx, vy, vz = velocity_scale .* raw_fields.vx,
-                velocity_scale .* raw_fields.vy, velocity_scale .* raw_fields.vz
-            magnetic_scale = Float64(magnetic_unit_G)
-            bx, by, bz = magnetic_scale .* raw_fields.bx,
-                magnetic_scale .* raw_fields.by, magnetic_scale .* raw_fields.bz
-            L = Float64(length_unit_pc) .* fits_box_length(path, size(raw_rho))
-            raw_time = snapshot_time(path)
-            t = Float64(time_unit_Myr) * raw_time
-            return (; rho, P, vx, vy, vz, bx, by, bz, L, t)
+            return (; raw_fields...,
+                L = fits_box_length(path, size(raw_fields.rho)),
+                t = snapshot_time(path))
         end
-        h5open(path, "r") do h
+        raw_fields, raw_length, raw_time = with_hdf5_file(path) do h
             raw_fields = (
                 rho = read_hdf5_field(h, :rho; source = path,
                     overrides = HDF5_FIELD_OVERRIDES),
@@ -1496,50 +1630,141 @@ begin
                 bz = centered_hdf5_magnetic_component(h, :bz, :bz_l, :bz_r, path;
                     overrides = HDF5_FIELD_OVERRIDES),
             )
-            validate_cube_shapes(path, raw_fields)
-            rho = Float64(density_unit_gcm3) .* raw_fields.rho
-            P = Float64(pressure_unit_ergcm3) .* raw_fields.P
-            velocity_scale = Float64(velocity_unit_kms)
-            vx, vy, vz = velocity_scale .* raw_fields.vx,
-                velocity_scale .* raw_fields.vy, velocity_scale .* raw_fields.vz
-            magnetic_scale = Float64(magnetic_unit_G)
-            bx, by, bz = magnetic_scale .* raw_fields.bx,
-                magnetic_scale .* raw_fields.by, magnetic_scale .* raw_fields.bz
             raw_length = read_hdf5_field(h, :L; source = path,
                 overrides = HDF5_FIELD_OVERRIDES)
-            length_values = raw_length isa Number ? fill(Float64(raw_length), 3) : Float64.(raw_length)
-            length(length_values) == 3 || error(
-                "HDF5 box length in $(path) must be a scalar or contain three values; " *
-                "found size $(size(raw_length)).")
-            L = Float64(length_unit_pc) .* length_values
             raw_time = read_hdf5_field(h, :t; required = false, source = path,
                 overrides = HDF5_FIELD_OVERRIDES)
-            stored_time = isnothing(raw_time) ? snapshot_time(path) : hdf5_scalar_value(raw_time)
-            t = Float64(time_unit_Myr) .* stored_time
-            (; rho, P, vx, vy, vz, bx, by, bz, L, t)
+            (raw_fields, raw_length, raw_time)
         end
+        # The HDF5 file and all dataset handles are closed before conversion or
+        # scientific calculations begin.
+        validate_cube_shapes(path, raw_fields)
+        length_values = raw_length isa Number ? fill(Float64(raw_length), 3) :
+            Float64.(vec(raw_length))
+        length(length_values) == 3 || error(
+            "HDF5 box length in $(path) must be a scalar or contain three values; " *
+            "found size $(size(raw_length)).")
+        (; raw_fields..., L = length_values,
+            t = isnothing(raw_time) ? snapshot_time_from_filename(path) :
+                hdf5_scalar_value(raw_time))
     end
+
+    """
+    Everything that changes the bytes read for `path`, used as a cache key.
+
+    The HDF5 field mapping is part of the key because it selects which datasets
+    the reader pulls out of the file.
+    """
+    raw_cube_key(path) = (String(path), snapshot_fingerprint(path),
+        Tuple(sort!([string(field, "=", dataset)
+            for (field, dataset) in HDF5_FIELD_OVERRIDES])))
+
+    "Return the stored, unit-free arrays of one snapshot, reading them at most once."
+    load_raw_cube(path) = cached_raw_cube!(raw_cube_key(path), () -> read_raw_cube(path))
+
+    "Apply a unit factor to a stored field without widening its element type."
+    scale_field(A, factor) = A .* convert(float(eltype(A)), factor)
+
+    """
+    One snapshot in physical units, centred and scaled.
+
+    The disk read is cached, so changing a unit widget only re-runs the
+    multiplications below.
+    """
+    function load_cube(path)
+        raw = load_raw_cube(path)
+        velocity_scale = Float64(velocity_unit_kms)
+        magnetic_scale = Float64(magnetic_unit_G)
+        (
+            rho = scale_field(raw.rho, density_unit_gcm3),
+            P = scale_field(raw.P, pressure_unit_ergcm3),
+            vx = scale_field(raw.vx, velocity_scale),
+            vy = scale_field(raw.vy, velocity_scale),
+            vz = scale_field(raw.vz, velocity_scale),
+            bx = scale_field(raw.bx, magnetic_scale),
+            by = scale_field(raw.by, magnetic_scale),
+            bz = scale_field(raw.bz, magnetic_scale),
+            L = Float64(length_unit_pc) .* raw.L,
+            t = Float64(time_unit_Myr) * raw.t,
+        )
+    end
+
+    "Every widget value that changes the physical content of a loaded cube."
+    unit_signature() = (Float64(density_unit_gcm3), Float64(pressure_unit_ergcm3),
+        Float64(velocity_unit_kms), Float64(magnetic_unit_G),
+        Float64(length_unit_pc), Float64(time_unit_Myr))
+
+    "Cache key identifying a snapshot together with the units it is loaded in."
+    cube_signature(path) = (raw_cube_key(path), unit_signature())
 
     number_density(rho) = rho ./ (Float64(mean_molecular_weight) * M_H_CGS)
 
-    finite_values(A) = filter(isfinite, vec(Float64.(A)))
-    finite_positive_values(A) = filter(x -> isfinite(x) && x > 0, vec(Float64.(A)))
-    finite_mean(A; default = NaN) = begin
-        values = finite_values(A)
-        isempty(values) ? default : mean(values)
+    # Reductions over a cube run in one pass and accumulate in Float64, so a
+    # Float32 snapshot is never materialized as a Float64 copy. Only the
+    # quantile-based helpers need the selected values collected into a vector,
+    # and they now allocate that vector once instead of twice.
+    function collect_finite(A, keep)
+        values = Vector{Float64}(undef, length(A))
+        selected = 0
+        @inbounds for element in A
+            value = Float64(element)
+            if isfinite(value) && keep(value)
+                selected += 1
+                values[selected] = value
+            end
+        end
+        resize!(values, selected)
     end
+
+    finite_values(A) = collect_finite(A, _ -> true)
+    finite_positive_values(A) = collect_finite(A, >(0))
+
+    function finite_mean(A; default = NaN)
+        total = 0.0
+        counted = 0
+        @inbounds for element in A
+            value = Float64(element)
+            if isfinite(value)
+                total += value
+                counted += 1
+            end
+        end
+        counted == 0 ? default : total / counted
+    end
+
     finite_quantile(A, q; default = NaN) = begin
         values = finite_values(A)
         isempty(values) ? default : quantile(values, q)
     end
-    finite_extrema(A; default = (NaN, NaN)) = begin
-        values = finite_values(A)
-        isempty(values) ? default : extrema(values)
+
+    function finite_extrema(A; default = (NaN, NaN))
+        low, high = Inf, -Inf
+        @inbounds for element in A
+            value = Float64(element)
+            if isfinite(value)
+                value < low && (low = value)
+                value > high && (high = value)
+            end
+        end
+        low > high ? default : (low, high)
     end
-    finite_sum(A) = sum(x -> isfinite(x) ? Float64(x) : 0.0, A)
-    finite_maximum(A; default = NaN) = begin
-        values = finite_values(A)
-        isempty(values) ? default : maximum(values)
+
+    function finite_sum(A)
+        total = 0.0
+        @inbounds for element in A
+            value = Float64(element)
+            isfinite(value) && (total += value)
+        end
+        total
+    end
+
+    function finite_maximum(A; default = NaN)
+        high = -Inf
+        @inbounds for element in A
+            value = Float64(element)
+            isfinite(value) && value > high && (high = value)
+        end
+        isfinite(high) ? high : default
     end
 
     safe_log10(x) = begin
@@ -1588,22 +1813,27 @@ begin
     end
 
     function turbulent_velocity(c)
-        valid = isfinite.(c.rho) .& isfinite.(c.vx) .& isfinite.(c.vy) .&
-            isfinite.(c.vz) .& (c.rho .> 0)
-        weights = ifelse.(valid, c.rho, 0.0)
-        wsum = sum(weights)
+        T = float(eltype(c.rho))
+        rho, vx, vy, vz = c.rho, c.vx, c.vy, c.vz
+        wsum, sx, sy, sz = 0.0, 0.0, 0.0, 0.0
+        @inbounds for index in eachindex(rho)
+            weight = Float64(rho[index])
+            (isfinite(weight) && weight > 0) || continue
+            ux, uy, uz = Float64(vx[index]), Float64(vy[index]), Float64(vz[index])
+            (isfinite(ux) && isfinite(uy) && isfinite(uz)) || continue
+            wsum += weight
+            sx += weight * ux
+            sy += weight * uy
+            sz += weight * uz
+        end
         wsum > 0 || return (
             vbar = (NaN, NaN, NaN),
-            dvx = fill(NaN, size(c.rho)), dvy = fill(NaN, size(c.rho)),
-            dvz = fill(NaN, size(c.rho)),
-            dv2 = fill(NaN, size(c.rho)),
+            dvx = fill(T(NaN), size(rho)), dvy = fill(T(NaN), size(rho)),
+            dvz = fill(T(NaN), size(rho)),
+            dv2 = fill(T(NaN), size(rho)),
         )
-        vbar = (
-            sum(weights .* ifelse.(valid, c.vx, 0.0)) / wsum,
-            sum(weights .* ifelse.(valid, c.vy, 0.0)) / wsum,
-            sum(weights .* ifelse.(valid, c.vz, 0.0)) / wsum,
-        )
-        dvx, dvy, dvz = c.vx .- vbar[1], c.vy .- vbar[2], c.vz .- vbar[3]
+        vbar = (sx / wsum, sy / wsum, sz / wsum)
+        dvx, dvy, dvz = vx .- T(vbar[1]), vy .- T(vbar[2]), vz .- T(vbar[3])
         dv2 = dvx .^ 2 .+ dvy .^ 2 .+ dvz .^ 2
         (; vbar, dvx, dvy, dvz, dv2)
     end
@@ -1652,12 +1882,31 @@ begin
         10.0 .^ exponents
     end
 
+    function latex_decade_number(value)
+        exponent = round(Int, log10(value))
+        if -3 <= exponent <= 6
+            exponent >= 0 && return latexstring(@sprintf("%.0f", value))
+            return latexstring(@sprintf("%.*f", -exponent, value))
+        end
+        latexstring("10^{", exponent, "}")
+    end
+
+    function enclosing_decade_limits(values)
+        valid = Float64.(filter(value -> isfinite(value) && value > 0, vec(values)))
+        isempty(valid) && return nothing
+        lower, upper = extrema(valid)
+        decade_lower = 10.0^floor(Int, log10(lower))
+        decade_upper = 10.0^ceil(Int, log10(upper))
+        decade_lower == decade_upper && (decade_upper *= 10.0)
+        decade_lower, decade_upper
+    end
+
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =
         decade_tick_values(vmin, vmax)
 
     function Makie.get_ticks(::DecadeTicks, ::typeof(log10), formatter, vmin, vmax)
         values = decade_tick_values(vmin, vmax)
-        values, latex_number.(values)
+        values, latex_decade_number.(values)
     end
 
     DECADE_TICKS = DecadeTicks()
@@ -1783,10 +2032,11 @@ begin
     comparison_snapshot_indices = Dict(label =>
         min(Int(selected_snapshot), length(run_files[label]))
         for label in comparison_run_labels)
-    comparison_cubes = Dict(label =>
-        (label == selected_run && comparison_snapshot_indices[label] == selected_snapshot ?
-            cube : load_cube(run_files[label][comparison_snapshot_indices[label]]))
-        for label in comparison_run_labels)
+    function comparison_cube(label)
+        label == selected_run && comparison_snapshot_indices[label] == selected_snapshot &&
+            return cube
+        load_cube(run_files[label][comparison_snapshot_indices[label]])
+    end
 end
 
 # ╔═╡ 94a0a0dc-baf6-4e62-a51e-dc6124d98fd4
@@ -1909,7 +2159,7 @@ begin
     logn = vec(safe_log10.(number_density_cells))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
-    comparative_pdf_samples = Dict(label => cube_pdf_samples(comparison_cubes[label])
+    comparative_pdf_samples = Dict(label => cube_pdf_samples(comparison_cube(label))
         for label in comparison_run_labels)
     density_pdfs = comparative_pdf(comparative_pdf_samples, :density, nbins)
     magnetic_pdfs = comparative_pdf(comparative_pdf_samples, :magnetic, nbins)

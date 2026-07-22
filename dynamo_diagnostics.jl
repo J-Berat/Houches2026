@@ -3907,7 +3907,12 @@ begin
     krho, Prho = isotropic_power_spectrum((number_density_cells,), spectrum_box_length_pc)
     kv, Pv = isotropic_power_spectrum((turb.dvx, turb.dvy, turb.dvz), spectrum_box_length_pc; prefactor = 0.5)
     komega, Pomega = isotropic_power_spectrum((omega.wx, omega.wy, omega.wz), spectrum_box_length_pc)
-    spectrum_maximum_k = maximum(vcat(krho, kv, komega))
+    # The shell power is quadratic in the field, so squaring the Gauss-to-microgauss
+    # factor into the prefactor puts E_B in microgauss^2 pc without scaling the
+    # three components into new cube-sized arrays first.
+    kb, Pb = isotropic_power_spectrum((cube.bx, cube.by, cube.bz), spectrum_box_length_pc;
+        prefactor = 0.5GAUSS_TO_MICROGAUSS^2)
+    spectrum_maximum_k = maximum(vcat(krho, kv, komega, kb))
     spectrum_k_choices = spectrum_dk:spectrum_dk:spectrum_maximum_k
     spectrum_default_k_min = min(spectrum_low_k_limit, spectrum_maximum_k)
     spectrum_default_k_max = max(spectrum_default_k_min,
@@ -4065,23 +4070,36 @@ md"""
 
 ## 10. Isotropic power spectra
 
-The panels show number-density, turbulent-velocity, and vorticity spectra on base-10 logarithmic axes in both $k$ and spectral power. Fourier power is summed in spherical shells and normalized consistently with Parseval's theorem. Dividing shell power by $\Delta k=2\pi/L$ gives spectral densities satisfying $\int E_f(k)\,\mathrm{d}k=\langle|f|^2\rangle$, with the stated velocity prefactor. Velocity and vorticity include all three vector components, and $k$ is expressed in $\mathrm{pc}^{-1}$.
+The panels show number-density, turbulent-velocity, vorticity, and magnetic spectra on base-10 logarithmic axes in both $k$ and spectral power. Fourier power is summed in spherical shells and normalized consistently with Parseval's theorem. Dividing shell power by $\Delta k=2\pi/L$ gives spectral densities satisfying $\int E_f(k)\,\mathrm{d}k=\langle|f|^2\rangle$, with the stated velocity prefactor. Velocity and vorticity include all three vector components, and $k$ is expressed in $\mathrm{pc}^{-1}$.
 
 The first shells contain few Fourier modes and are correspondingly noisy. The shaded region $k<3\,\Delta k$ marks these box-scale modes; it should be excluded when estimating an inertial-range slope. The threshold is a visual reliability guide, not a claim that an inertial range necessarily begins at $3\,\Delta k$.
 
-The fitted model is $E(k)=A k^\alpha$ over the selected interval. The optional Kolmogorov reference has $\alpha=-5/3$ and is normalized to the fitted spectrum at the geometric center of that interval.
+The fitted model is $E(k)=A k^\alpha$ over the selected interval. Each optional reference slope is normalized to the fitted spectrum at the geometric center of that interval.
 
-**Display density, velocity, and vorticity power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
+The magnetic panel shows $E_B(k)=\tfrac12\langle|\mathbf B|^2\rangle_k$ in $\mu\mathrm G^2\,\mathrm{pc}$, so it is an energy spectrum up to the constant $1/4\pi$.
+
+Two different references are offered, because they describe different fields:
+
+- **Kolmogorov**, $\alpha=-5/3$, for the density, velocity, and vorticity panels;
+- **Kazantsev** (1968), $\alpha=+3/2$, for the magnetic panel.
+
+The Kazantsev slope is the prediction of the *kinematic* small-scale dynamo: while the field is still too weak to react back on the flow, magnetic energy piles up at small scales and $E_B(k)\propto k^{3/2}$ between the forcing scale and the resistive scale. Its **positive** exponent is the signature of that regime — magnetic energy peaks at the *smallest* resolved scales, not the largest.
+
+This reference is therefore only meaningful while the dynamo is still kinematic. Once the field saturates, back-reaction flattens and then bends the spectrum, and a $k^{3/2}$ fit stops being informative. Use the exponential-growth window fitted in section 5 to decide whether the selected snapshot is still in the kinematic phase.
+
+**Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
 
 | Power-spectrum panel | Display |
 |:--|:--:|
 | Number-density spectrum | $(@bind show_spectrum_density PlutoUI.CheckBox(default = true)) |
 | Velocity spectrum | $(@bind show_spectrum_velocity PlutoUI.CheckBox(default = true)) |
 | Vorticity spectrum | $(@bind show_spectrum_vorticity PlutoUI.CheckBox(default = true)) |
+| Magnetic spectrum | $(@bind show_spectrum_magnetic PlutoUI.CheckBox(default = true)) |
 | Display fitted slopes | $(@bind show_spectrum_slopes PlutoUI.CheckBox(default = true)) |
 | Minimum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_min PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_min)) |
 | Maximum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_max PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_max)) |
 | Display the Kolmogorov $k^{-5/3}$ reference | $(@bind show_kolmogorov_spectrum PlutoUI.CheckBox(default = true)) |
+| Display the Kazantsev $k^{3/2}$ reference | $(@bind show_kazantsev_spectrum PlutoUI.CheckBox(default = true)) |
 """
 
 # ╔═╡ 3a731972-3404-478c-a572-00a05ab652b1
@@ -4106,18 +4124,30 @@ begin
         (; slope, intercept, r2, count = length(x), lower, upper)
     end
 
+    # Turbulent cascade panels quote Kolmogorov; the magnetic panel quotes
+    # Kazantsev, whose exponent is positive because kinematic small-scale dynamo
+    # action piles magnetic energy up at the smallest scales.
+    kolmogorov_reference = show_kolmogorov_spectrum ?
+        (exponent = -5 / 3, label = L"k^{-5/3}") : nothing
+    kazantsev_reference = show_kazantsev_spectrum ?
+        (exponent = 3 / 2, label = L"k^{3/2}") : nothing
+
     spectrum_specs = NamedTuple[]
     show_spectrum_density && push!(spectrum_specs,
         (k = krho, power = Prho, ylabel = L"E_n(k)\;[\mathrm{cm}^{-6}\,\mathrm{pc}]",
-            color = MHD_COLORS[1]))
+            color = MHD_COLORS[1], reference = kolmogorov_reference))
     show_spectrum_velocity && push!(spectrum_specs,
         (k = kv, power = Pv,
             ylabel = L"E_v(k)\;[(\mathrm{km\,s}^{-1})^2\,\mathrm{pc}]",
-            color = MHD_COLORS[3]))
+            color = MHD_COLORS[3], reference = kolmogorov_reference))
     show_spectrum_vorticity && push!(spectrum_specs,
         (k = komega, power = Pomega,
             ylabel = L"E_\omega(k)\;[\mathrm{Myr}^{-2}\,\mathrm{pc}]",
-            color = MHD_COLORS[5]))
+            color = MHD_COLORS[5], reference = kolmogorov_reference))
+    show_spectrum_magnetic && push!(spectrum_specs,
+        (k = kb, power = Pb,
+            ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
+            color = MHD_COLORS[4], reference = kazantsev_reference))
     if isempty(spectrum_specs)
         fig_spectra = Figure(size = (900, 180))
         Label(fig_spectra[1, 1], L"\mathrm{Select\ at\ least\ one\ power\ spectrum.}", fontsize = 20)
@@ -4154,16 +4184,17 @@ begin
                         label = latexstring(raw"\alpha=", @sprintf("%.3f", fit_result.slope),
                             raw",\;R^2=", @sprintf("%.3f", fit_result.r2)))
                 end
-                if show_kolmogorov_spectrum
+                if !isnothing(spec.reference)
                     pivot_k = sqrt(fit_result.lower * fit_result.upper)
                     pivot_power = 10.0^(fit_result.intercept +
                         fit_result.slope * log10(pivot_k))
-                    kolmogorov_power = pivot_power .* (fit_k ./ pivot_k) .^ (-5 / 3)
-                    lines!(axis, fit_k, kolmogorov_power; color = :black,
+                    reference_power = pivot_power .*
+                        (fit_k ./ pivot_k) .^ spec.reference.exponent
+                    lines!(axis, fit_k, reference_power; color = :black,
                         linewidth = 2.2, linestyle = :dot,
-                        label = L"k^{-5/3}")
+                        label = spec.reference.label)
                 end
-                (show_spectrum_slopes || show_kolmogorov_spectrum) &&
+                (show_spectrum_slopes || !isnothing(spec.reference)) &&
                     axislegend(axis; position = :lb, framevisible = false)
             end
         end

@@ -869,6 +869,7 @@ begin
     DEFAULT_DATA_REPOSITORY = isdir(preferred_data_repository) ?
         preferred_data_repository : bundled_data_repository
     SNAPSHOT_EXTENSIONS = (".h5", ".hdf5", ".fits", ".fit", ".fts")
+    MAX_SNAPSHOTS_PER_RUN = 40
     nothing
 end
 
@@ -893,6 +894,7 @@ directory.
 begin
     snapshot_extension(path) = lowercase(splitext(path)[2])
     is_snapshot_file(path) = isfile(path) && snapshot_extension(path) in SNAPSHOT_EXTENSIONS
+    is_hdf5_file(path) = isfile(path) && snapshot_extension(path) in (".h5", ".hdf5")
     is_fits_file(path) = isfile(path) && snapshot_extension(path) in (".fits", ".fit", ".fts")
     snapshot_format(path) = isdir(path) ? "FITS field directory" :
         is_fits_file(path) ? "FITS multi-extension image" : "HDF5"
@@ -1047,7 +1049,7 @@ begin
         fits_directory_is_snapshot(cube_directory) && return [cube_directory]
         sources = String[]
         for path in readdir(cube_directory; join = true)
-            if hdf5_file_is_snapshot(path) || is_fits_file(path) ||
+            if is_hdf5_file(path) || is_fits_file(path) ||
                     fits_directory_is_snapshot(path)
                 push!(sources, path)
             end
@@ -1451,10 +1453,17 @@ begin
     latex_run_field_label(field, label) =
         latexstring(field, "\\;[", run_label_latex_source(label), "]")
 
-    function snapshot_files(label)
+    function available_snapshot_files(label)
         sources = snapshot_sources(run_cube_directory(ROOT, RUN_DIRS[label]))
         isempty(sources) && error("No HDF5 or FITS snapshots found for $label in $ROOT")
         sources
+    end
+
+    function limit_snapshot_files(sources, maximum_count)
+        length(sources) <= maximum_count && return sources
+        indices = unique(round.(Int,
+            range(1, length(sources); length = maximum_count)))
+        sources[indices]
     end
 
     function snapshot_time_from_filename(path)
@@ -1478,10 +1487,18 @@ begin
         end
     end
 
-    run_files = Dict(label => snapshot_files(label) for label in run_labels)
+    available_run_files = Dict(label => available_snapshot_files(label)
+        for label in run_labels)
+    run_files = Dict(label => limit_snapshot_files(
+            available_run_files[label], MAX_SNAPSHOTS_PER_RUN)
+        for label in run_labels)
     run_times = Dict(label => snapshot_time.(run_files[label]) for label in run_labels)
     maximum_snapshot_count = maximum(length.(values(run_files)))
-    run_summary = join([string(label, " = ", length(run_files[label]), " snapshots") for label in run_labels], ", ")
+    run_summary = join([
+        string(label, " = ", length(run_files[label]), "/",
+            length(available_run_files[label]), " snapshots")
+        for label in run_labels
+    ], ", ")
     nothing
 end
 
@@ -1929,7 +1946,11 @@ begin
         decade_lower = 10.0^floor(Int, log10(lower))
         decade_upper = 10.0^ceil(Int, log10(upper))
         decade_lower == decade_upper && (decade_upper *= 10.0)
-        decade_lower, decade_upper
+        # Keep the bounding major ticks slightly inside the plotted frame.
+        # Makie can then construct the nine logarithmic minor ticks even when
+        # the data span contains only one strictly interior decade.
+        padding = 10.0^0.035
+        decade_lower / padding, decade_upper * padding
     end
 
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =

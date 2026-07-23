@@ -863,6 +863,7 @@ begin
     DEFAULT_DATA_REPOSITORY = isdir(preferred_data_repository) ?
         preferred_data_repository : bundled_data_repository
     SNAPSHOT_EXTENSIONS = (".h5", ".hdf5", ".fits", ".fit", ".fts")
+    MAX_SNAPSHOTS_PER_RUN = 40
     nothing
 end
 
@@ -887,6 +888,7 @@ directory.
 begin
     snapshot_extension(path) = lowercase(splitext(path)[2])
     is_snapshot_file(path) = isfile(path) && snapshot_extension(path) in SNAPSHOT_EXTENSIONS
+    is_hdf5_file(path) = isfile(path) && snapshot_extension(path) in (".h5", ".hdf5")
     is_fits_file(path) = isfile(path) && snapshot_extension(path) in (".fits", ".fit", ".fts")
     snapshot_format(path) = isdir(path) ? "FITS field directory" :
         is_fits_file(path) ? "FITS multi-extension image" : "HDF5"
@@ -1041,7 +1043,7 @@ begin
         fits_directory_is_snapshot(cube_directory) && return [cube_directory]
         sources = String[]
         for path in readdir(cube_directory; join = true)
-            if hdf5_file_is_snapshot(path) || is_fits_file(path) ||
+            if is_hdf5_file(path) || is_fits_file(path) ||
                     fits_directory_is_snapshot(path)
                 push!(sources, path)
             end
@@ -1445,10 +1447,17 @@ begin
     latex_run_field_label(field, label) =
         latexstring(field, "\\;[", run_label_latex_source(label), "]")
 
-    function snapshot_files(label)
+    function available_snapshot_files(label)
         sources = snapshot_sources(run_cube_directory(ROOT, RUN_DIRS[label]))
         isempty(sources) && error("No HDF5 or FITS snapshots found for $label in $ROOT")
         sources
+    end
+
+    function limit_snapshot_files(sources, maximum_count)
+        length(sources) <= maximum_count && return sources
+        indices = unique(round.(Int,
+            range(1, length(sources); length = maximum_count)))
+        sources[indices]
     end
 
     function snapshot_time_from_filename(path)
@@ -1472,10 +1481,18 @@ begin
         end
     end
 
-    run_files = Dict(label => snapshot_files(label) for label in run_labels)
+    available_run_files = Dict(label => available_snapshot_files(label)
+        for label in run_labels)
+    run_files = Dict(label => limit_snapshot_files(
+            available_run_files[label], MAX_SNAPSHOTS_PER_RUN)
+        for label in run_labels)
     run_times = Dict(label => snapshot_time.(run_files[label]) for label in run_labels)
     maximum_snapshot_count = maximum(length.(values(run_files)))
-    run_summary = join([string(label, " = ", length(run_files[label]), " snapshots") for label in run_labels], ", ")
+    run_summary = join([
+        string(label, " = ", length(run_files[label]), "/",
+            length(available_run_files[label]), " snapshots")
+        for label in run_labels
+    ], ", ")
     nothing
 end
 
@@ -1487,6 +1504,7 @@ Markdown.parse("""
 |:--|:--|
 | Comparison parameter | $(comparison_parameter) |
 | Resolved data root | **$(ROOT)** |
+| Snapshot limit | **$(MAX_SNAPSHOTS_PER_RUN)** per simulation, evenly spaced |
 | Discovered runs | $(run_summary) |
 """)
 
@@ -1941,7 +1959,11 @@ begin
         decade_lower = 10.0^floor(Int, log10(lower))
         decade_upper = 10.0^ceil(Int, log10(upper))
         decade_lower == decade_upper && (decade_upper *= 10.0)
-        decade_lower, decade_upper
+        # Keep the bounding major ticks slightly inside the plotted frame.
+        # Makie can then construct the nine logarithmic minor ticks even when
+        # the data span contains only one strictly interior decade.
+        padding = 10.0^0.035
+        decade_lower / padding, decade_upper * padding
     end
 
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =
@@ -2997,6 +3019,7 @@ begin
             growth_has_interval && vspan!(time_axes[:magnetic],
                 growth_times[growth_first_index], growth_times[growth_last_index];
                 color = (:gray50, 0.10))
+            ylims!(time_axes[:magnetic], high = 15.0)
         end
 
         time_legend_layout = GridLayout(fig_time[time_nrows + 1, 1:time_ncols])
@@ -3163,51 +3186,77 @@ begin
         fig_growth = Figure(size = (900, 180))
         Label(fig_growth[1, 1], L"\mathrm{Select\ at\ least\ one\ magnetic-growth\ panel.}", fontsize = 20)
     else
-        fig_growth = Figure(size = (550growth_panel_count, 430))
+        fig_growth = Figure(size = (550growth_panel_count, 520))
         growth_column = 0
         if show_growth_fit_panel
             growth_column += 1
             ag1 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
                 ylabel = L"\ln(B/B_0)")
             lines!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run],
-                linewidth = 2.5, label = "Data")
+                linewidth = 2.5)
             scatter!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run], markersize = 8)
+            fit_legend_elements = Any[
+                LineElement(color = run_colors[selected_run], linewidth = 2.5),
+            ]
+            fit_legend_labels = LaTeXString[L"\mathrm{Data}"]
             if show_growth_fit && isfinite(growth_fit.gamma)
                 fit_t = growth_times[growth_indices]
                 fit_log_ratio = growth_fit.log_amplitude - log(growth_B0) .+
                     growth_fit.gamma .* growth_elapsed_time[growth_indices]
                 lines!(ag1, fit_t, fit_log_ratio; color = :black, linewidth = 3,
-                    linestyle = :dash,
-                    label = string("ln(A/B₀) + ΓB(t − t₀), ",
-                        legend_rate_label(growth_fit.gamma; fitted = true)))
+                    linestyle = :dash)
+                push!(fit_legend_elements,
+                    LineElement(color = :black, linewidth = 3, linestyle = :dash))
+                push!(fit_legend_labels, latexstring(
+                    "\\mathrm{Fit}:\\;\\Gamma_B=",
+                    @sprintf("%.4g", growth_fit.gamma),
+                    "\\;\\mathrm{Myr}^{-1}"))
             end
             growth_has_interval && vspan!(ag1,
                 growth_times[growth_first_index], growth_times[growth_last_index];
                 color = (:gray50, 0.10))
-            axislegend(ag1, position = :lt)
+            Legend(fig_growth[2, growth_column], fit_legend_elements,
+                fit_legend_labels; orientation = :horizontal, nbanks = 1,
+                tellheight = true, framevisible = false, labelsize = 14)
         end
         if show_growth_theory_panel
             growth_column += 1
             ag2 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
                 ylabel = L"\ln(B/B_0)")
             lines!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run],
-                linewidth = 2.5, label = "Data")
+                linewidth = 2.5)
             scatter!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run], markersize = 7)
+            theory_legend_elements = Any[
+                LineElement(color = run_colors[selected_run], linewidth = 2.5),
+            ]
+            theory_legend_labels = LaTeXString[L"\mathrm{Data}"]
             for (Γ, curve, color) in zip(theory_gammas, theory_B_curves, theory_colors)
                 lines!(ag2, growth_times, log.(curve ./ growth_B0); color, linewidth = 2,
-                    linestyle = :dot,
-                    label = legend_rate_label(Γ))
+                    linestyle = :dot)
+                push!(theory_legend_elements,
+                    LineElement(color = color, linewidth = 2, linestyle = :dot))
+                push!(theory_legend_labels, latexstring(
+                    "\\Gamma_B=", @sprintf("%.3g", Γ),
+                    "\\;\\mathrm{Myr}^{-1}"))
             end
             if show_growth_fit && isfinite(growth_fit.gamma)
                 lines!(ag2, growth_times, log.(fitted_ratio_curve); color = :black,
-                    linewidth = 2.5, linestyle = :dashdot,
-                    label = "ln(A/B₀) + ΓB, fit (t − t₀)")
+                    linewidth = 2.5, linestyle = :dashdot)
+                push!(theory_legend_elements,
+                    LineElement(color = :black, linewidth = 2.5, linestyle = :dashdot))
+                push!(theory_legend_labels, latexstring(
+                    "\\mathrm{Best\\ fit}:\\;\\Gamma_B=",
+                    @sprintf("%.4g", growth_fit.gamma),
+                    "\\;\\mathrm{Myr}^{-1}"))
             end
             growth_has_interval && vspan!(ag2,
                 growth_times[growth_first_index], growth_times[growth_last_index];
                 color = (:gray50, 0.10))
-            axislegend(ag2, position = :lt)
+            Legend(fig_growth[2, growth_column], theory_legend_elements,
+                theory_legend_labels; orientation = :horizontal, nbanks = 2,
+                tellheight = true, framevisible = false, labelsize = 13)
         end
+        rowgap!(fig_growth.layout, 8)
     end
     display_growth_fit ? fig_growth : nothing
 end
@@ -3869,7 +3918,6 @@ in $\mathrm{Myr}^{-2}$. Both maps use the active run, snapshot, and line of sigh
 | Vorticity heatmap | $(@bind show_vorticity_map PlutoUI.CheckBox(default = true)) |
 | Enstrophy heatmap | $(@bind show_enstrophy_map PlutoUI.CheckBox(default = true)) |
 | Enstrophy profiles by density bin | $(@bind show_enstrophy_density_profiles PlutoUI.CheckBox(default = true)) |
-| Density–family-parameter heatmap | $(@bind show_enstrophy_parameter_heatmap PlutoUI.CheckBox(default = true)) |
 | Density-bin weighting | $(@bind enstrophy_density_weighting PlutoUI.Select(["volume", "mass"]; default = "volume")) |
 """
 
@@ -3982,84 +4030,42 @@ begin
         comparison_kind == :mach && (enstrophy_mach_by_run[label] =
             bulk_metrics_from_cube(local_cube, Float64(gamma)).mach)
     end
-    enstrophy_profile_matrix = hcat([
-        enstrophy_profiles[label] for label in comparison_run_labels]...)
-
     function enstrophy_parameter_label(label)
         if comparison_kind == :mach
             mach_value = enstrophy_mach_by_run[label]
-            return string("𝓜 = ", round(mach_value; sigdigits = 3))
-        end
-        legend_run_label(label)
-    end
-
-    function enstrophy_parameter_ticklabel(label)
-        if comparison_kind == :mach
-            mach_value = enstrophy_mach_by_run[label]
-            return latexstring("\\mathcal{M}=", round(mach_value; sigdigits = 3))
+            return latexstring("\\mathcal{M}=",
+                @sprintf("%.3g", mach_value))
         end
         latex_run_label(label)
     end
-
-    enstrophy_parameter_axis_label = comparison_kind == :resolution ?
-        L"N^3" : comparison_kind == :ratio ?
-        L"\chi=E_{\mathrm{comp}}/E_{\mathrm{sol}}" : comparison_kind == :mach ?
-        L"\mathcal{M}" : L"\mathrm{simulation}"
-    enstrophy_parameter_ticklabels = as_latex.(
-        enstrophy_parameter_ticklabel.(comparison_run_labels))
 end
 
 # ╔═╡ 873f7ef2-719b-4ae6-b015-1a23c6c27836
 begin
-    enstrophy_density_panels = Symbol[]
-    show_enstrophy_density_profiles && push!(enstrophy_density_panels, :profiles)
-    show_enstrophy_parameter_heatmap && push!(enstrophy_density_panels, :parameter_heatmap)
-    if isempty(enstrophy_density_panels)
+    if !show_enstrophy_density_profiles
         fig_enstrophy_density = Figure(size = (900, 180))
         Label(fig_enstrophy_density[1, 1],
-            L"\mathrm{Select\ at\ least\ one\ density-binned\ enstrophy\ diagnostic.}",
+            L"\mathrm{Density-binned\ enstrophy\ profiles\ are\ disabled.}",
             fontsize = 20)
     else
-        fig_enstrophy_density = Figure(size = (610length(enstrophy_density_panels), 500))
-        for (panel_index, panel_kind) in enumerate(enstrophy_density_panels)
-            if panel_kind == :profiles
-                axis = latex_axis(fig_enstrophy_density[1, panel_index],
-                    xlabel = L"n\;[\mathrm{cm}^{-3}]",
-                    ylabel = L"\langle\mathcal{E}_{\omega}\rangle_n\;[\mathrm{Myr}^{-2}]",
-                    xscale = log10, yscale = log10,
-                    xticks = DECADE_TICKS, yticks = DECADE_TICKS,
-                    xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
-                    xminorticksvisible = true, yminorticksvisible = true)
-                for label in comparison_run_labels
-                    profile = enstrophy_profiles[label]
-                    valid = isfinite.(profile) .& (profile .> 0)
-                    lines!(axis, density_number_centers[valid], profile[valid];
-                        color = run_colors[label], linewidth = 2.5, label = enstrophy_parameter_label(label))
-                    scatter!(axis, density_number_centers[valid], profile[valid];
-                        color = run_colors[label], markersize = 5)
-                end
-                axislegend(axis; position = :lt, framevisible = false)
-            else
-                panel = fig_enstrophy_density[1, panel_index] = GridLayout()
-                parameter_positions = collect(1:length(comparison_run_labels))
-                axis = latex_axis(panel[1, 1], xlabel = enstrophy_parameter_axis_label,
-                    ylabel = L"n\;[\mathrm{cm}^{-3}]", yscale = log10,
-                    yticks = DECADE_TICKS,
-                    yminorticks = IntervalsBetween(9), yminorticksvisible = true,
-                    xticks = parameter_positions,
-                    xtickformat = values -> [
-                        enstrophy_parameter_ticklabels[clamp(round(Int, value), 1,
-                            length(enstrophy_parameter_ticklabels))] for value in values
-                    ])
-                log_enstrophy = safe_log10.(enstrophy_profile_matrix')
-                heat = heatmap!(axis, parameter_positions, density_number_centers,
-                    log_enstrophy; colormap = :magma)
-                latex_colorbar(panel[1, 2], heat;
-                    label = L"\log_{10}\!\left(\langle\mathcal{E}_{\omega}\rangle_n/\mathrm{Myr}^{-2}\right)",
-                    tickformat = latex_ticklabels)
-                colsize!(panel, 2, 22)
-            end
+        fig_enstrophy_density = Figure(size = (680, 500))
+        axis = latex_axis(fig_enstrophy_density[1, 1],
+            xlabel = L"n\;[\mathrm{cm}^{-3}]",
+            ylabel = L"\langle\mathcal{E}_{\omega}\rangle_n\;[\mathrm{Myr}^{-2}]",
+            xscale = log10, yscale = log10,
+            xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+            xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+            xminorticksvisible = true, yminorticksvisible = true)
+        for label in comparison_run_labels
+            profile = enstrophy_profiles[label]
+            valid = isfinite.(profile) .& (profile .> 0)
+            lines!(axis, density_number_centers[valid], profile[valid];
+                color = run_colors[label], linewidth = 2.5,
+                label = enstrophy_parameter_label(label))
+            scatter!(axis, density_number_centers[valid], profile[valid];
+                color = run_colors[label], markersize = 5)
         end
+        axislegend(axis; position = :lt, framevisible = false)
     end
     display_enstrophy_density ? fig_enstrophy_density : nothing
 end

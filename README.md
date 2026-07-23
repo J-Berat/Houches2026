@@ -210,6 +210,11 @@ and retains only scalar summaries. The raw-cube cache contains at most one
 snapshot; moving the snapshot slider evicts the previous raw cube before reading
 the newly selected one.
 
+Each simulation is capped at 40 snapshots. When a `DataCubes` directory contains
+more than 40 files, the notebooks select 40 evenly spaced snapshots including
+the first and last, preserving the full simulated time interval without opening
+the omitted cubes.
+
 For comparative diagnostics, select any number of simulations under **Simulations in comparative plots**. One simulation is selected initially to keep startup light. Comparative PDFs, distributions, and histograms use the chosen snapshot index for every selected run; if a run is shorter, its last available snapshot is used. Spatial maps continue to use the active **Run** and **Snapshot** selections.
 
 ## Exporting a complete notebook to HTML

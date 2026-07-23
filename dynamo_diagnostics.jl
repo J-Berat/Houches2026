@@ -50,6 +50,40 @@ begin
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
     const REDUCTION_CACHE = Dict{Any,Any}()
+    const SNAPSHOT_SOURCE_CACHE = Dict{String,Vector{String}}()
+    const DIRECTORY_DISCOVERY_CACHE = Dict{String,Vector{String}}()
+    const SNAPSHOT_FINGERPRINT_CACHE = Dict{String,Any}()
+    const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
+    const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
+
+    function positive_integer_setting(name, default)
+        value = tryparse(Int, strip(get(ENV, name, string(default))))
+        isnothing(value) && error("$name must be a positive integer.")
+        value > 0 || error("$name must be a positive integer.")
+        value
+    end
+
+    # Pluto stays deliberately conservative. The batch engine raises the entry
+    # limit to the number of selected simulations, while this byte ceiling keeps
+    # large production cubes from exhausting memory.
+    const RAW_CUBE_CACHE_MAX_ENTRIES =
+        positive_integer_setting("DYNAMO_RAW_CUBE_CACHE_ENTRIES", 1)
+    const RAW_CUBE_CACHE_MAX_BYTES = positive_integer_setting(
+        "DYNAMO_RAW_CUBE_CACHE_MIB",
+        max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
+    ) * 1024^2
+
+    "Memoize remote file metadata for the duration of the Pluto session."
+    function cached_snapshot_fingerprint(path)
+        canonical = abspath(path)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_FINGERPRINT_CACHE, canonical) do
+                isdir(canonical) || return (mtime(canonical), filesize(canonical))
+                Tuple((basename(entry), mtime(entry), filesize(entry))
+                    for entry in sort(readdir(canonical; join = true)))
+            end
+        end
+    end
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
     reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
@@ -61,10 +95,19 @@ begin
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
 
-    The previous entry is evicted before a cache miss is read. Consequently a
-    slider change never leaves several raw snapshots resident in this cache.
+    Entries use LRU eviction and are bounded by both a count and a byte budget.
+    Interactive Pluto defaults to one cube. Batch comparisons may retain several
+    cubes when memory allows, preventing the same files from being reopened for
+    each requested comparative figure.
     """
     function cached_raw_cube!(key, build)
+        evict_oldest_unlocked!() = begin
+            oldest = popfirst!(RAW_CUBE_CACHE_ORDER)
+            delete!(RAW_CUBE_CACHE, oldest)
+            delete!(RAW_CUBE_CACHE_BYTES, oldest)
+            nothing
+        end
+
         hit = lock(CACHE_LOCK) do
             if haskey(RAW_CUBE_CACHE, key)
                 position = findfirst(isequal(key), RAW_CUBE_CACHE_ORDER)
@@ -76,17 +119,31 @@ begin
             end
         end
         isnothing(hit) || return hit
+
+        # Use the largest resident cube as a conservative estimate of the next
+        # allocation. Evict before reading to bound peak memory, not only the
+        # final cache size.
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            estimated_bytes = isempty(RAW_CUBE_CACHE_BYTES) ? 0 :
+                maximum(values(RAW_CUBE_CACHE_BYTES))
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    (estimated_bytes > 0 &&
+                        sum(values(RAW_CUBE_CACHE_BYTES)) + estimated_bytes >
+                            RAW_CUBE_CACHE_MAX_BYTES))
+                evict_oldest_unlocked!()
+            end
         end
+
         value = build()
         bytes = Base.summarysize(value)
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    sum(values(RAW_CUBE_CACHE_BYTES)) + bytes >
+                        RAW_CUBE_CACHE_MAX_BYTES)
+                evict_oldest_unlocked!()
+            end
             RAW_CUBE_CACHE[key] = value
             RAW_CUBE_CACHE_BYTES[key] = bytes
             push!(RAW_CUBE_CACHE_ORDER, key)
@@ -99,6 +156,75 @@ begin
     function with_hdf5_file(operation::Function, path)
         lock(HDF5_READ_LOCK) do
             h5open(path, "r") do handle
+                operation(handle)
+            end
+        end
+    end
+
+    """
+    Whether an interactive HDF5 snapshot should first be copied to node-local
+    storage. `auto` stages only `/Xnfs` paths; `true` and `false` provide an
+    explicit override through `DYNAMO_LOCAL_HDF5_CACHE`.
+    """
+    function local_hdf5_cache_enabled(path)
+        isfile(path) &&
+            lowercase(splitext(path)[2]) in (".h5", ".hdf5") || return false
+        setting = lowercase(strip(get(ENV, "DYNAMO_LOCAL_HDF5_CACHE", "auto")))
+        setting in ("0", "false", "no", "off") && return false
+        setting in ("1", "true", "yes", "on") && return true
+        setting == "auto" || error(
+            "DYNAMO_LOCAL_HDF5_CACHE must be auto, true, or false; found $(setting).")
+        startswith(normpath(abspath(path)), "/Xnfs/")
+    end
+
+    """
+    Copy `path` into a private temporary directory, retaining at most one staged
+    HDF5 file. This function is called while `HDF5_READ_LOCK` is held.
+    """
+    function stage_hdf5_snapshot_unlocked(path)
+        fingerprint = cached_snapshot_fingerprint(path)
+        previous = LOCAL_HDF5_STAGE[]
+        if !isnothing(previous) && previous.source == path &&
+                previous.fingerprint == fingerprint && isfile(previous.staged_path)
+            return previous.staged_path
+        end
+
+        if isnothing(LOCAL_HDF5_STAGE_DIRECTORY[])
+            requested_parent =
+                get(ENV, "DYNAMO_LOCAL_CACHE_DIRECTORY", tempdir())
+            parent = requested_parent == "~" ? homedir() :
+                startswith(requested_parent, "~/") ?
+                    joinpath(homedir(), requested_parent[3:end]) :
+                    requested_parent
+            isdir(parent) || mkpath(parent)
+            LOCAL_HDF5_STAGE_DIRECTORY[] =
+                mktempdir(parent; prefix = "dynamo_hdf5_")
+        end
+        if !isnothing(previous) && isfile(previous.staged_path)
+            rm(previous.staged_path; force = true)
+        end
+        LOCAL_HDF5_STAGE[] = nothing
+
+        destination = joinpath(
+            LOCAL_HDF5_STAGE_DIRECTORY[],
+            string(hash((abspath(path), fingerprint)), "_", basename(path)),
+        )
+        cp(path, destination; force = true)
+        LOCAL_HDF5_STAGE[] =
+            (source = path, fingerprint = fingerprint, staged_path = destination)
+        destination
+    end
+
+    """
+    Open an analysis snapshot, optionally from the one-file node-local cache.
+    The lock covers both staging and reading, so another Pluto task cannot evict
+    the local file while it is in use.
+    """
+    function with_analysis_hdf5_file(operation::Function, path; stage_local = false)
+        lock(HDF5_READ_LOCK) do
+            read_path = stage_local && local_hdf5_cache_enabled(path) ?
+                stage_hdf5_snapshot_unlocked(path) : path
+            h5open(read_path, "r") do handle
                 operation(handle)
             end
         end
@@ -998,7 +1124,10 @@ begin
     # stored as Float32 are not silently widened to Float64.
     function average_faces(lower, upper)
         half = convert(float(promote_type(eltype(lower), eltype(upper))), 0.5)
-        half .* (lower .+ upper)
+        # Reuse the lower-face buffer. The fused assignment avoids allocating a
+        # third full 3-D array for every magnetic component.
+        @. lower = half * (lower + upper)
+        lower
     end
 
     """
@@ -1008,9 +1137,7 @@ begin
     simulation is re-run, instead of serving stale arrays.
     """
     function snapshot_fingerprint(path)
-        isdir(path) || return (mtime(path), filesize(path))
-        Tuple((basename(entry), mtime(entry), filesize(entry))
-            for entry in sort(readdir(path; join = true)))
+        cached_snapshot_fingerprint(path)
     end
 
     function centered_hdf5_magnetic_component(h, centered, left, right, source;
@@ -1042,15 +1169,20 @@ begin
 
     function snapshot_sources(cube_directory)
         isdir(cube_directory) || return String[]
-        fits_directory_is_snapshot(cube_directory) && return [cube_directory]
-        sources = String[]
-        for path in readdir(cube_directory; join = true)
-            if is_hdf5_file(path) || is_fits_file(path) ||
-                    fits_directory_is_snapshot(path)
-                push!(sources, path)
+        canonical = abspath(cube_directory)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_SOURCE_CACHE, canonical) do
+                fits_directory_is_snapshot(canonical) && return [canonical]
+                sources = String[]
+                for path in readdir(canonical; join = true)
+                    if is_hdf5_file(path) || is_fits_file(path) ||
+                            fits_directory_is_snapshot(path)
+                        push!(sources, path)
+                    end
+                end
+                sort(sources)
             end
         end
-        sort(sources)
     end
 
     function expand_home(path)
@@ -1060,6 +1192,18 @@ begin
 
     function discover_cube_directories(path; depth = 0, max_depth = 32)
         isdir(path) || return String[]
+        canonical = abspath(path)
+        if depth == 0
+            return lock(CACHE_LOCK) do
+                get!(DIRECTORY_DISCOVERY_CACHE, canonical) do
+                    discover_cube_directories_uncached(canonical; depth, max_depth)
+                end
+            end
+        end
+        discover_cube_directories_uncached(canonical; depth, max_depth)
+    end
+
+    function discover_cube_directories_uncached(path; depth = 0, max_depth = 32)
         direct_snapshots = snapshot_sources(path)
         isempty(direct_snapshots) || return [abspath(path)]
         depth >= max_depth && return String[]
@@ -1068,7 +1212,7 @@ begin
             startswith(entry, ".") && continue
             child = joinpath(path, entry)
             isdir(child) || continue
-            append!(found, discover_cube_directories(child;
+            append!(found, discover_cube_directories_uncached(child;
                 depth = depth + 1, max_depth))
         end
         unique(found)
@@ -1551,8 +1695,11 @@ begin
     analysis_series_labels = requested_open_labels
     comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
-    active_time_value = snapshot_time(
-        run_files[selected_run][selected_snapshot]) * time_unit_Myr
+    # Loading the selected raw cube here supplies the exact stored time and
+    # primes the one-entry cache. The analysis cell below therefore reuses the
+    # same arrays instead of opening this HDF5 file a second time.
+    active_time_value = load_raw_cube(
+        run_files[selected_run][selected_snapshot]).t * time_unit_Myr
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
@@ -1625,7 +1772,7 @@ begin
     before, the HDF5 file and every dataset handle are closed before any
     conversion happens.
     """
-    function read_raw_cube(path)
+    function read_raw_cube(path; stage_local = false)
         if is_fits_file(path) || isdir(path)
             raw_fields = (
                 rho = read_fits_field(path, :rho; primary_fallback = true),
@@ -1642,7 +1789,8 @@ begin
                 L = fits_box_length(path, size(raw_fields.rho)),
                 t = snapshot_time(path))
         end
-        raw_fields, raw_length, raw_time = with_hdf5_file(path) do h
+        raw_fields, raw_length, raw_time =
+                with_analysis_hdf5_file(path; stage_local) do h
             available_paths = hdf5_dataset_paths(h)
             raw_fields = (
                 rho = read_hdf5_field(h, :rho; source = path,
@@ -1692,7 +1840,8 @@ begin
             for (field, dataset) in HDF5_FIELD_OVERRIDES])))
 
     "Return the stored, unit-free arrays of one snapshot, reading them at most once."
-    load_raw_cube(path) = cached_raw_cube!(raw_cube_key(path), () -> read_raw_cube(path))
+    load_raw_cube(path) = cached_raw_cube!(
+        raw_cube_key(path), () -> read_raw_cube(path; stage_local = true))
 
     "Apply a unit factor to a stored field without widening its element type."
     scale_field(A, factor) = A .* convert(float(eltype(A)), factor)

@@ -50,6 +50,40 @@ begin
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
     const REDUCTION_CACHE = Dict{Any,Any}()
+    const SNAPSHOT_SOURCE_CACHE = Dict{String,Vector{String}}()
+    const DIRECTORY_DISCOVERY_CACHE = Dict{String,Vector{String}}()
+    const SNAPSHOT_FINGERPRINT_CACHE = Dict{String,Any}()
+    const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
+    const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
+
+    function positive_integer_setting(name, default)
+        value = tryparse(Int, strip(get(ENV, name, string(default))))
+        isnothing(value) && error("$name must be a positive integer.")
+        value > 0 || error("$name must be a positive integer.")
+        value
+    end
+
+    # Pluto stays deliberately conservative. The batch engine raises the entry
+    # limit to the number of selected simulations, while this byte ceiling keeps
+    # large production cubes from exhausting memory.
+    const RAW_CUBE_CACHE_MAX_ENTRIES =
+        positive_integer_setting("DYNAMO_RAW_CUBE_CACHE_ENTRIES", 1)
+    const RAW_CUBE_CACHE_MAX_BYTES = positive_integer_setting(
+        "DYNAMO_RAW_CUBE_CACHE_MIB",
+        max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
+    ) * 1024^2
+
+    "Memoize remote file metadata for the duration of the Pluto session."
+    function cached_snapshot_fingerprint(path)
+        canonical = abspath(path)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_FINGERPRINT_CACHE, canonical) do
+                isdir(canonical) || return (mtime(canonical), filesize(canonical))
+                Tuple((basename(entry), mtime(entry), filesize(entry))
+                    for entry in sort(readdir(canonical; join = true)))
+            end
+        end
+    end
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
     reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
@@ -61,10 +95,19 @@ begin
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
 
-    The previous entry is evicted before a cache miss is read. Consequently a
-    slider change never leaves several raw snapshots resident in this cache.
+    Entries use LRU eviction and are bounded by both a count and a byte budget.
+    Interactive Pluto defaults to one cube. Batch comparisons may retain several
+    cubes when memory allows, preventing the same files from being reopened for
+    each requested comparative figure.
     """
     function cached_raw_cube!(key, build)
+        evict_oldest_unlocked!() = begin
+            oldest = popfirst!(RAW_CUBE_CACHE_ORDER)
+            delete!(RAW_CUBE_CACHE, oldest)
+            delete!(RAW_CUBE_CACHE_BYTES, oldest)
+            nothing
+        end
+
         hit = lock(CACHE_LOCK) do
             if haskey(RAW_CUBE_CACHE, key)
                 position = findfirst(isequal(key), RAW_CUBE_CACHE_ORDER)
@@ -76,17 +119,31 @@ begin
             end
         end
         isnothing(hit) || return hit
+
+        # Use the largest resident cube as a conservative estimate of the next
+        # allocation. Evict before reading to bound peak memory, not only the
+        # final cache size.
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            estimated_bytes = isempty(RAW_CUBE_CACHE_BYTES) ? 0 :
+                maximum(values(RAW_CUBE_CACHE_BYTES))
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    (estimated_bytes > 0 &&
+                        sum(values(RAW_CUBE_CACHE_BYTES)) + estimated_bytes >
+                            RAW_CUBE_CACHE_MAX_BYTES))
+                evict_oldest_unlocked!()
+            end
         end
+
         value = build()
         bytes = Base.summarysize(value)
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    sum(values(RAW_CUBE_CACHE_BYTES)) + bytes >
+                        RAW_CUBE_CACHE_MAX_BYTES)
+                evict_oldest_unlocked!()
+            end
             RAW_CUBE_CACHE[key] = value
             RAW_CUBE_CACHE_BYTES[key] = bytes
             push!(RAW_CUBE_CACHE_ORDER, key)
@@ -99,6 +156,75 @@ begin
     function with_hdf5_file(operation::Function, path)
         lock(HDF5_READ_LOCK) do
             h5open(path, "r") do handle
+                operation(handle)
+            end
+        end
+    end
+
+    """
+    Whether an interactive HDF5 snapshot should first be copied to node-local
+    storage. `auto` stages only `/Xnfs` paths; `true` and `false` provide an
+    explicit override through `DYNAMO_LOCAL_HDF5_CACHE`.
+    """
+    function local_hdf5_cache_enabled(path)
+        isfile(path) &&
+            lowercase(splitext(path)[2]) in (".h5", ".hdf5") || return false
+        setting = lowercase(strip(get(ENV, "DYNAMO_LOCAL_HDF5_CACHE", "auto")))
+        setting in ("0", "false", "no", "off") && return false
+        setting in ("1", "true", "yes", "on") && return true
+        setting == "auto" || error(
+            "DYNAMO_LOCAL_HDF5_CACHE must be auto, true, or false; found $(setting).")
+        startswith(normpath(abspath(path)), "/Xnfs/")
+    end
+
+    """
+    Copy `path` into a private temporary directory, retaining at most one staged
+    HDF5 file. This function is called while `HDF5_READ_LOCK` is held.
+    """
+    function stage_hdf5_snapshot_unlocked(path)
+        fingerprint = cached_snapshot_fingerprint(path)
+        previous = LOCAL_HDF5_STAGE[]
+        if !isnothing(previous) && previous.source == path &&
+                previous.fingerprint == fingerprint && isfile(previous.staged_path)
+            return previous.staged_path
+        end
+
+        if isnothing(LOCAL_HDF5_STAGE_DIRECTORY[])
+            requested_parent =
+                get(ENV, "DYNAMO_LOCAL_CACHE_DIRECTORY", tempdir())
+            parent = requested_parent == "~" ? homedir() :
+                startswith(requested_parent, "~/") ?
+                    joinpath(homedir(), requested_parent[3:end]) :
+                    requested_parent
+            isdir(parent) || mkpath(parent)
+            LOCAL_HDF5_STAGE_DIRECTORY[] =
+                mktempdir(parent; prefix = "dynamo_hdf5_")
+        end
+        if !isnothing(previous) && isfile(previous.staged_path)
+            rm(previous.staged_path; force = true)
+        end
+        LOCAL_HDF5_STAGE[] = nothing
+
+        destination = joinpath(
+            LOCAL_HDF5_STAGE_DIRECTORY[],
+            string(hash((abspath(path), fingerprint)), "_", basename(path)),
+        )
+        cp(path, destination; force = true)
+        LOCAL_HDF5_STAGE[] =
+            (source = path, fingerprint = fingerprint, staged_path = destination)
+        destination
+    end
+
+    """
+    Open an analysis snapshot, optionally from the one-file node-local cache.
+    The lock covers both staging and reading, so another Pluto task cannot evict
+    the local file while it is in use.
+    """
+    function with_analysis_hdf5_file(operation::Function, path; stage_local = false)
+        lock(HDF5_READ_LOCK) do
+            read_path = stage_local && local_hdf5_cache_enabled(path) ?
+                stage_hdf5_snapshot_unlocked(path) : path
+            h5open(read_path, "r") do handle
                 operation(handle)
             end
         end
@@ -844,13 +970,13 @@ end
 
 # ╔═╡ 3ef88702-bef5-4eca-a151-df97aa7ec2c4
 md"""
-# Dust — thermal polarization
+# Dynamo — MHD diagnostics
 
-Synthetic thermal-dust Stokes emission, polarization maps, spectra, statistics, and polarization fraction versus column density.
+Spatial, statistical, temporal, and spectral diagnostics, including comparative B--n relations, HRO, and HOG.
 
-> **Reactive mode.** Open `dust.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
+> **Reactive mode.** Open `dynamo.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
 
-> **Lazy startup.** Run `run_pluto.jl` with `DYNAMO_NOTEBOOK=dust.jl`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
+> **Lazy startup.** Run `run_pluto.jl`, then select `dynamo.jl`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
 
 All dimensional quantities are converted to the physical units shown on their axes or colorbars. Projected means are density weighted unless stated otherwise, and periodic boundaries are used for spatial operations.
 """
@@ -1004,7 +1130,10 @@ begin
     # stored as Float32 are not silently widened to Float64.
     function average_faces(lower, upper)
         half = convert(float(promote_type(eltype(lower), eltype(upper))), 0.5)
-        half .* (lower .+ upper)
+        # Reuse the lower-face buffer. The fused assignment avoids allocating a
+        # third full 3-D array for every magnetic component.
+        @. lower = half * (lower + upper)
+        lower
     end
 
     """
@@ -1014,9 +1143,7 @@ begin
     simulation is re-run, instead of serving stale arrays.
     """
     function snapshot_fingerprint(path)
-        isdir(path) || return (mtime(path), filesize(path))
-        Tuple((basename(entry), mtime(entry), filesize(entry))
-            for entry in sort(readdir(path; join = true)))
+        cached_snapshot_fingerprint(path)
     end
 
     function centered_hdf5_magnetic_component(h, centered, left, right, source;
@@ -1048,15 +1175,20 @@ begin
 
     function snapshot_sources(cube_directory)
         isdir(cube_directory) || return String[]
-        fits_directory_is_snapshot(cube_directory) && return [cube_directory]
-        sources = String[]
-        for path in readdir(cube_directory; join = true)
-            if is_hdf5_file(path) || is_fits_file(path) ||
-                    fits_directory_is_snapshot(path)
-                push!(sources, path)
+        canonical = abspath(cube_directory)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_SOURCE_CACHE, canonical) do
+                fits_directory_is_snapshot(canonical) && return [canonical]
+                sources = String[]
+                for path in readdir(canonical; join = true)
+                    if is_hdf5_file(path) || is_fits_file(path) ||
+                            fits_directory_is_snapshot(path)
+                        push!(sources, path)
+                    end
+                end
+                sort(sources)
             end
         end
-        sort(sources)
     end
 
     function expand_home(path)
@@ -1066,6 +1198,18 @@ begin
 
     function discover_cube_directories(path; depth = 0, max_depth = 32)
         isdir(path) || return String[]
+        canonical = abspath(path)
+        if depth == 0
+            return lock(CACHE_LOCK) do
+                get!(DIRECTORY_DISCOVERY_CACHE, canonical) do
+                    discover_cube_directories_uncached(canonical; depth, max_depth)
+                end
+            end
+        end
+        discover_cube_directories_uncached(canonical; depth, max_depth)
+    end
+
+    function discover_cube_directories_uncached(path; depth = 0, max_depth = 32)
         direct_snapshots = snapshot_sources(path)
         isempty(direct_snapshots) || return [abspath(path)]
         depth >= max_depth && return String[]
@@ -1074,7 +1218,7 @@ begin
             startswith(entry, ".") && continue
             child = joinpath(path, entry)
             isdir(child) || continue
-            append!(found, discover_cube_directories(child;
+            append!(found, discover_cube_directories_uncached(child;
                 depth = depth + 1, max_depth))
         end
         unique(found)
@@ -1504,6 +1648,25 @@ begin
     nothing
 end
 
+# ╔═╡ 3df9ad9a-b865-41f5-8d7a-34a52d0292dd
+Markdown.parse("""
+### Repository status
+
+| Item | Active value |
+|:--|:--|
+| Comparison parameter | $(comparison_parameter) |
+| Resolved data root | **$(ROOT)** |
+| Snapshot limit | **$(MAX_SNAPSHOTS_PER_RUN)** per simulation, evenly spaced |
+| Discovered runs | $(run_summary) |
+""")
+
+# ╔═╡ 290ecb0a-880a-44bd-9ddc-e6ee12b41a06
+md"""
+### Navigation and physical units
+
+**Run** selects the active cube. **Simulations in comparative plots** starts with that single run and can contain any number of simulations.
+"""
+
 # ╔═╡ e734297f-506e-45e1-8cb7-b2ae671893eb
 md"""
 | Navigation | Control |
@@ -1538,8 +1701,11 @@ begin
     analysis_series_labels = requested_open_labels
     comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
-    active_time_value = snapshot_time(
-        run_files[selected_run][selected_snapshot]) * time_unit_Myr
+    # Loading the selected raw cube here supplies the exact stored time and
+    # primes the one-entry cache. The analysis cell below therefore reuses the
+    # same arrays instead of opening this HDF5 file a second time.
+    active_time_value = load_raw_cube(
+        run_files[selected_run][selected_snapshot]).t * time_unit_Myr
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
@@ -1612,7 +1778,7 @@ begin
     before, the HDF5 file and every dataset handle are closed before any
     conversion happens.
     """
-    function read_raw_cube(path)
+    function read_raw_cube(path; stage_local = false)
         if is_fits_file(path) || isdir(path)
             raw_fields = (
                 rho = read_fits_field(path, :rho; primary_fallback = true),
@@ -1629,7 +1795,8 @@ begin
                 L = fits_box_length(path, size(raw_fields.rho)),
                 t = snapshot_time(path))
         end
-        raw_fields, raw_length, raw_time = with_hdf5_file(path) do h
+        raw_fields, raw_length, raw_time =
+                with_analysis_hdf5_file(path; stage_local) do h
             available_paths = hdf5_dataset_paths(h)
             raw_fields = (
                 rho = read_hdf5_field(h, :rho; source = path,
@@ -1679,7 +1846,8 @@ begin
             for (field, dataset) in HDF5_FIELD_OVERRIDES])))
 
     "Return the stored, unit-free arrays of one snapshot, reading them at most once."
-    load_raw_cube(path) = cached_raw_cube!(raw_cube_key(path), () -> read_raw_cube(path))
+    load_raw_cube(path) = cached_raw_cube!(
+        raw_cube_key(path), () -> read_raw_cube(path; stage_local = true))
 
     "Apply a unit factor to a stored field without widening its element type."
     scale_field(A, factor) = A .* convert(float(eltype(A)), factor)
@@ -2095,6 +2263,57 @@ begin
     end
 end
 
+# ╔═╡ 5fbd0d53-09e8-4b39-bb1d-29c8cc45c6ee
+begin
+    validation_fields = [
+        "Density ρ" => cube.rho,
+        "Pressure P" => cube.P,
+        "Velocity vx" => cube.vx,
+        "Velocity vy" => cube.vy,
+        "Velocity vz" => cube.vz,
+        "Magnetic field Bx" => cube.bx,
+        "Magnetic field By" => cube.by,
+        "Magnetic field Bz" => cube.bz,
+    ]
+    cube_cell_count = length(cube.rho)
+    validation_rows = String[]
+    total_invalid_values = 0
+    for (field_name, values) in validation_fields
+        finite_count = count(isfinite, values)
+        invalid_count = length(values) - finite_count
+        total_invalid_values += invalid_count
+        finite_fraction = 100finite_count / max(length(values), 1)
+        finite_fraction_text = @sprintf("%.3f", finite_fraction)
+        push!(validation_rows,
+            "| $(field_name) | $(finite_fraction_text)% | $(invalid_count) |")
+    end
+    invalid_density_count = count(value -> !isfinite(value) || value <= 0, cube.rho)
+    invalid_pressure_count = count(value -> !isfinite(value) || value <= 0, cube.P)
+    cube_memory_mib = sum(Base.summarysize(last(pair)) for pair in validation_fields) / 2.0^20
+    validation_state = total_invalid_values == 0 && invalid_density_count == 0 &&
+        invalid_pressure_count == 0 ? "All required fields are finite and physically positive." :
+        "Invalid cells are masked by finite-only statistics; inspect the counts below before interpretation."
+    source_text = replace(String(selected_path), "`" => "\\`")
+    Markdown.parse("""
+    ### Active cube validation
+
+    **$(validation_state)**
+
+    | Property | Value |
+    |:--|:--|
+    | Source | **$(source_text)** |
+    | Grid shape | **$(join(size(cube.rho), " × "))** |
+    | Physical box | **$(@sprintf("%.5g × %.5g × %.5g", cube.L...))** ``\\mathrm{pc}^3`` |
+    | Approximate field memory | **$(@sprintf("%.2f", cube_memory_mib)) MiB** |
+    | Non-positive or non-finite density cells | **$(invalid_density_count)** / **$(cube_cell_count)** |
+    | Non-positive or non-finite pressure cells | **$(invalid_pressure_count)** / **$(cube_cell_count)** |
+
+    | Required field | Finite values | Invalid values |
+    |:--|--:|--:|
+    $(join(validation_rows, "\n"))
+    """)
+end
+
 # ╔═╡ 94a0a0dc-baf6-4e62-a51e-dc6124d98fd4
 begin
     Bcomponents = (cube.bx, cube.by, cube.bz)
@@ -2166,569 +2385,2173 @@ md"""
 
 """
 
-# ╔═╡ 62440e86-b560-44ad-bb0a-43ae62e73fc3
-md"""
----
-
-## 12. Shared observational beam
-
-Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
-
-| Gaussian PSF setting | Control |
-|:--|:--|
-| Apply Gaussian beam | $(@bind apply_observational_beam PlutoUI.CheckBox(default = false)) |
-| Beam-width unit | $(@bind observational_beam_unit PlutoUI.Select(["Sky pixels" => "pixel", "Parsecs" => "pc"]; default = "pixel")) |
-| Major-axis FWHM | $(@bind observational_beam_fwhm_major PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
-| Minor-axis FWHM | $(@bind observational_beam_fwhm_minor PlutoUI.NumberField(0.1:0.1:1000.0; default = 3.0)) |
-| Position angle [$^\circ$] | $(@bind observational_beam_pa_deg PlutoUI.Slider(0.0:1.0:180.0; default = 0.0, show_value = true)) |
-| Display observable structure functions | $(@bind display_observational_structure_functions PlutoUI.CheckBox(default = true)) |
-| Observable structure-function order $p$ | $(@bind observational_structure_order PlutoUI.Slider(1:4; default = 2, show_value = true)) |
-| Number of observable separation samples | $(@bind observational_structure_samples PlutoUI.Slider(4:2:20; default = 10, show_value = true)) |
-"""
-
-# ╔═╡ 47b786d6-c7b5-44f4-946a-b8c485ad6380
+# ╔═╡ 76d249f9-d6fd-4513-aa76-7fb386058c37
 begin
-    function observational_beam_width_pixels(c, plane_dims)
-        major = max(Float64(observational_beam_fwhm_major), eps(Float64))
-        minor = max(Float64(observational_beam_fwhm_minor), eps(Float64))
-        if observational_beam_unit == "pc"
-            dx = c.L[plane_dims[1]] / size(c.rho, plane_dims[1])
-            dy = c.L[plane_dims[2]] / size(c.rho, plane_dims[2])
-            reference_pixel = sqrt(dx * dy)
-            major /= reference_pixel
-            minor /= reference_pixel
-        end
-        max(major, minor), min(major, minor)
+    heatmap_specs = NamedTuple[]
+    projected_B_lic = show_projected_B_lic ? lic_texture(Bsky1, Bsky2;
+        niter = Int(lic_iterations), len = Int(lic_length),
+        normalize_vectors = lic_normalize_vectors,
+        amplitude_weight = lic_amplitude_weight,
+        amplitude_floor = Float64(lic_amplitude_floor), seed = Int(lic_seed)) : nothing
+
+    function add_heatmap!(enabled, A, label, colormap, use_log; signed = false, overlay_B = false)
+        enabled || return
+        transformed = use_log ? (signed ? symlog10(A) : safe_log10.(A)) : A
+        latex_label = use_log ?
+            (signed ? latexstring("\\operatorname{symlog}_{10}\\left(", label, "\\right)") :
+                latexstring("\\log_{10}\\left(", label, "\\right)")) :
+            latexstring(label)
+        push!(heatmap_specs, (
+            data = transformed,
+            label = latex_label,
+            colormap = signed ? :balance : colormap,
+            diverging = signed,
+            overlay_B = overlay_B,
+        ))
     end
 
-    function gaussian_beam_transfer(map_size, fwhm_major_pix, fwhm_minor_pix, pa_deg)
-        nx, ny = map_size
-        sigma_major = Float64(fwhm_major_pix) / (2sqrt(2log(2)))
-        sigma_minor = Float64(fwhm_minor_pix) / (2sqrt(2log(2)))
-        angle = deg2rad(Float64(pa_deg))
-        cosine, sine = cos(angle), sin(angle)
-        frequency_x = reshape(Float64.(FFTW.fftfreq(nx, 1.0)), nx, 1)
-        frequency_y = reshape(Float64.(FFTW.fftfreq(ny, 1.0)), 1, ny)
-        frequency_major = cosine .* frequency_x .+ sine .* frequency_y
-        frequency_minor = -sine .* frequency_x .+ cosine .* frequency_y
-        exp.(-2pi^2 .* (sigma_major^2 .* frequency_major .^ 2 .+
-            sigma_minor^2 .* frequency_minor .^ 2))
-    end
+    add_heatmap!(show_column, column_density, "N_{\\mathrm{H}}/(\\mathrm{cm}^{-2})", :magma, log_column;
+        overlay_B = show_projected_B || show_projected_B_lic)
+    add_heatmap!(show_temperature, Tmean, "T/\\mathrm{K}", :thermal, log_temperature)
+    add_heatmap!(show_blos, Blos, "B_{\\mathrm{LOS}}/\\mu\\mathrm{G}", :balance, log_blos; signed = true)
+    add_heatmap!(show_bsky, Bsky, "B_{\\mathrm{sky}}/\\mu\\mathrm{G}", :viridis, log_bsky)
+    add_heatmap!(show_Bmean, Bmean_projected, "\\langle |B|\\rangle/\\mu\\mathrm{G}", :viridis, log_Bmean)
+    add_heatmap!(show_velocity, velocity_projected, "\\langle |\\delta v|\\rangle/(\\mathrm{km\\,s}^{-1})", :plasma, log_velocity)
+    add_heatmap!(show_vorticity, omega_map, "\\langle |\\omega|\\rangle/\\mathrm{Myr}^{-1}", :inferno, log_vorticity)
+    add_heatmap!(show_magnetic_energy, magnetic_energy_map,
+        "\\Sigma_{E,\\mathrm{mag}}/(\\mathrm{erg\\,cm}^{-2})", :magma, log_magnetic_energy)
+    add_heatmap!(show_kinetic_energy, kinetic_energy_map,
+        "\\Sigma_{E,\\mathrm{kin}}/(\\mathrm{erg\\,cm}^{-2})", :viridis, log_kinetic_energy)
+    add_heatmap!(show_thermal_energy, thermal_energy_map,
+        "\\Sigma_{E,\\mathrm{therm}}/(\\mathrm{erg\\,cm}^{-2})", :thermal, log_thermal_energy)
 
-    function apply_gaussian_beam_2d(image, fwhm_major_pix, fwhm_minor_pix, pa_deg)
-        transfer = gaussian_beam_transfer(size(image), fwhm_major_pix,
-            fwhm_minor_pix, pa_deg)
-        valid = isfinite.(image)
-        all(valid) && begin
-            filtered = ifft(fft(image) .* transfer)
-            return eltype(image) <: Real ? real.(filtered) : filtered
-        end
-        filled = ifelse.(valid, image, zero(eltype(image)))
-        filtered = ifft(fft(filled) .* transfer)
-        normalization = real.(ifft(fft(Float64.(valid)) .* transfer))
-        output = eltype(image) <: Real ? real.(filtered) : filtered
-        map((value, weight) -> weight > sqrt(eps(Float64)) ? value / weight :
-            convert(eltype(output), NaN), output, normalization)
-    end
-
-    function apply_observational_beam_2d(image, c, plane_dims)
-        apply_observational_beam || return copy(image)
-        major, minor = observational_beam_width_pixels(c, plane_dims)
-        apply_gaussian_beam_2d(image, major, minor, observational_beam_pa_deg)
-    end
-
-    function apply_observational_beam_cube(cube_xyν, c, plane_dims)
-        apply_observational_beam || return copy(cube_xyν)
-        major, minor = observational_beam_width_pixels(c, plane_dims)
-        output = similar(cube_xyν, promote_type(eltype(cube_xyν), Float64))
-        @views for channel in axes(cube_xyν, 3)
-            output[:, :, channel] .= apply_gaussian_beam_2d(
-                cube_xyν[:, :, channel], major, minor, observational_beam_pa_deg)
-        end
-        output
-    end
-
-    "Axis-averaged periodic scalar structure function of a two-dimensional map."
-    function scalar_structure_function_2d(field, lags, order; period = nothing)
-        ndims(field) == 2 || error("Projected structure functions require a 2-D map.")
-        data = Float64.(field)
-        shifted = similar(data)
-        values = zeros(Float64, length(lags))
-        for (lag_index, lag) in pairs(lags)
-            moment_sum = 0.0
-            moment_count = 0
-            for dimension in 1:2
-                shift = ntuple(d -> d == dimension ? lag : 0, 2)
-                circshift!(shifted, data, shift)
-                for index in eachindex(data)
-                    increment = shifted[index] - data[index]
-                    if !isnothing(period)
-                        increment = mod(increment + period / 2, period) - period / 2
-                    end
-                    moment = abs(increment)^order
-                    if isfinite(moment)
-                        moment_sum += moment
-                        moment_count += 1
-                    end
-                end
-            end
-            values[lag_index] = moment_count > 0 ? moment_sum / moment_count : NaN
-        end
-        values
-    end
-
-    "Plot projected structure functions for a collection of observable maps."
-    function observational_structure_figure(specs, c, plane_dims, order, samples;
-            heading = "Projected observable structure functions")
-        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
-        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
-            length = Int(samples)))))
-        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
-            for dimension in plane_dims)
-        separations_pc = lags .* pixel_scale_pc
-        ncols = min(2, length(specs))
-        nrows = cld(length(specs), ncols)
-        figure = Figure(size = (540ncols, 390nrows + 55))
-        Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
-        for (spec_index, spec) in enumerate(specs)
-            row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
-            axis = latex_axis(figure[row, column],
-                xlabel = L"\ell\;[\mathrm{pc}]",
-                ylabel = latexstring("S_{", order, "}(\\ell)"),
-                title = as_latex(spec.label), xscale = log10, yscale = log10,
-                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
-                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
-                xminorticksvisible = true, yminorticksvisible = true)
-            values = scalar_structure_function_2d(spec.data, lags, order;
-                period = spec.period)
-            valid = isfinite.(values) .& (values .> 0)
-            if any(valid)
-                lines!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, linewidth = 2.5)
-                scatter!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, markersize = 6)
-            else
-                text!(axis, 0.5, 0.5; text = "constant or invalid map",
-                    space = :relative, align = (:center, :center))
-            end
-        end
-        figure
-    end
-
-    function moose_instrument_transfer(map_size, largest_scale_pix, smallest_scale_pix)
-        nx, ny = map_size
-        largest = max(Float64(largest_scale_pix), eps(Float64))
-        smallest = max(Float64(smallest_scale_pix), 2.0)
-        frequency_x = reshape(Float64.(FFTW.fftfreq(nx, 1.0)), nx, 1)
-        frequency_y = reshape(Float64.(FFTW.fftfreq(ny, 1.0)), 1, ny)
-        frequency2 = frequency_x .^ 2 .+ frequency_y .^ 2
-        low_frequency = 1 / largest
-        high_frequency = min(1 / smallest, 0.5)
-        Float64.((frequency2 .>= low_frequency^2) .&
-            (frequency2 .<= high_frequency^2))
-    end
-
-    function apply_moose_interferometer_2d(image, transfer)
-        size(image) == size(transfer) || error("MOOSE transfer-mask shape mismatch.")
-        finite_image = ifelse.(isfinite.(image), image, zero(eltype(image)))
-        filtered = ifft(fft(finite_image) .* transfer)
-        eltype(image) <: Real ? real.(filtered) : filtered
-    end
-
-    function apply_moose_interferometer_cube(cube_xyν, transfer)
-        output = similar(cube_xyν, promote_type(eltype(cube_xyν), Float64))
-        @views for channel in axes(cube_xyν, 3)
-            output[:, :, channel] .= apply_moose_interferometer_2d(
-                cube_xyν[:, :, channel], transfer)
-        end
-        output
-    end
-
-    function add_moose_qu_noise!(Q, U, snr, rng)
-        signal_to_noise = Float64(snr)
-        isfinite(signal_to_noise) && signal_to_noise > 0 ||
-            error("MOOSE Q/U signal-to-noise ratio must be finite and positive.")
-        if ndims(Q) == 2
-            polarized_rms = sqrt(finite_mean(abs2.(Q); default = 0.0) +
-                finite_mean(abs2.(U); default = 0.0))
-            sigma = polarized_rms / signal_to_noise
-            sigma > 0 && (Q .+= sigma .* randn(rng, size(Q));
-                U .+= sigma .* randn(rng, size(U)))
-        else
-            @views for channel in axes(Q, 3)
-                Qchannel, Uchannel = Q[:, :, channel], U[:, :, channel]
-                polarized_rms = sqrt(finite_mean(abs2.(Qchannel); default = 0.0) +
-                    finite_mean(abs2.(Uchannel); default = 0.0))
-                sigma = polarized_rms / signal_to_noise
-                sigma > 0 && (Qchannel .+= sigma .* randn(rng, size(Qchannel));
-                    Uchannel .+= sigma .* randn(rng, size(Uchannel)))
-            end
-        end
-        Q, U
-    end
-end
-
-# ╔═╡ d6a2f4b1-59ac-4e77-a10a-4b74c0d89231
-md"""
----
-
-## 13. Thermal-dust polarization
-
-Optically thin thermal-dust Stokes emission. Statistical plots compare all selected simulations with shared bins.
-
-| Dust figure | Display |
-|:--|:--:|
-| Polarization maps | $(@bind display_dust_maps PlutoUI.CheckBox(default = true)) |
-| Polarization statistics | $(@bind display_dust_statistics PlutoUI.CheckBox(default = true)) |
-| Pixel $I_\nu$, $Q_\nu$, and $U_\nu$ spectra | $(@bind display_dust_pixel_spectrum PlutoUI.CheckBox(default = true)) |
-
-| Dust setting | Control |
-|:--|:--|
-| Observing frequency [$\mathrm{GHz}$] | $(@bind dust_frequency_GHz PlutoUI.NumberField(30.0:1.0:1200.0; default = 353.0)) |
-| Dust temperature [$\mathrm{K}$] | $(@bind dust_temperature_K PlutoUI.NumberField(2.8:0.1:100.0; default = 19.6)) |
-| Cross-section at $353\,\mathrm{GHz}$ [$\mathrm{cm^2\,H^{-1}}$] | $(@bind dust_sigma353_cm2 PlutoUI.NumberField(default = 1.0e-26)) |
-| Emissivity index $\beta_{\mathrm d}$ | $(@bind dust_beta PlutoUI.NumberField(0.0:0.05:4.0; default = 1.6)) |
-| Intrinsic polarization fraction $p_0$ | $(@bind dust_p0 PlutoUI.NumberField(0.0:0.005:0.5; default = 0.20)) |
-| Gas mass per H nucleon [$m_H$] | $(@bind dust_mu_H PlutoUI.NumberField(1.0:0.01:2.0; default = 1.4)) |
-| $I_\nu$ map | $(@bind show_dust_I PlutoUI.CheckBox(default = true)) |
-| $Q_\nu$ map | $(@bind show_dust_Q PlutoUI.CheckBox(default = false)) |
-| $U_\nu$ map | $(@bind show_dust_U PlutoUI.CheckBox(default = false)) |
-| Polarized intensity $P_\nu$ | $(@bind show_dust_P PlutoUI.CheckBox(default = true)) |
-| Polarization fraction $p$ | $(@bind show_dust_fraction PlutoUI.CheckBox(default = true)) |
-| Polarization angle $\psi$ | $(@bind show_dust_angle PlutoUI.CheckBox(default = false)) |
-| Logarithmic $I_\nu$ and $P_\nu$ | $(@bind log_dust_positive PlutoUI.CheckBox(default = true)) |
-| Symmetric-logarithmic $Q_\nu$ and $U_\nu$ | $(@bind log_dust_signed PlutoUI.CheckBox(default = false)) |
-| Polarization pseudo-vectors over $I_\nu$ | $(@bind show_dust_vectors PlutoUI.CheckBox(default = true)) |
-| Pseudo-vector stride | $(@bind dust_vector_stride PlutoUI.Slider(2:1:16; default = 5, show_value = true)) |
-| $p$ versus $N_{\mathrm H}$ relation | $(@bind show_dust_p_column PlutoUI.CheckBox(default = true)) |
-| Polarization-fraction PDF | $(@bind show_dust_p_pdf PlutoUI.CheckBox(default = true)) |
-
-### Stokes spectrum at one sky pixel
-
-The selected pixel is marked by a white cross on every dust map. The spectral panels evaluate the optically thin modified-blackbody model over the requested frequency interval. A vertical line and marker identify the **observing frequency** selected above. With the present single-temperature, single-$\beta_{\mathrm d}$ prescription, $I_\nu$, $Q_\nu$, and $U_\nu$ share the same frequency scaling while retaining their line-of-sight geometric amplitudes and signs.
-
-| Pixel-spectrum setting | Control |
-|:--|:--|
-| First sky-axis pixel | $(@bind dust_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
-| Second sky-axis pixel | $(@bind dust_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| Minimum spectral frequency [$\mathrm{GHz}$] | $(@bind dust_spectrum_min_GHz PlutoUI.NumberField(1.0:1.0:2000.0; default = 30.0)) |
-| Maximum spectral frequency [$\mathrm{GHz}$] | $(@bind dust_spectrum_max_GHz PlutoUI.NumberField(2.0:1.0:3000.0; default = 1200.0)) |
-| Number of frequency samples | $(@bind dust_spectrum_samples PlutoUI.Select([64, 128, 256, 512]; default = 256)) |
-| Logarithmic frequency axis | $(@bind log_dust_frequency_axis PlutoUI.CheckBox(default = true)) |
-| $I_\nu$ spectrum | $(@bind show_dust_I_spectrum PlutoUI.CheckBox(default = true)) |
-| $Q_\nu$ spectrum | $(@bind show_dust_Q_spectrum PlutoUI.CheckBox(default = true)) |
-| $U_\nu$ spectrum | $(@bind show_dust_U_spectrum PlutoUI.CheckBox(default = true)) |
-"""
-
-# ╔═╡ 130ccf03-d7cc-4b71-9210-dbc0e43dfa82
-begin
-    dust_nu_Hz = Float64(dust_frequency_GHz) * 1.0e9
-    dust_T_K = max(Float64(dust_temperature_K), 2.8)
-    dust_planck_MJysr = (2H_PLANCK_CGS * dust_nu_Hz^3 / C_LIGHT_CGS^2) /
-        expm1(H_PLANCK_CGS * dust_nu_Hz / (K_B_CGS * dust_T_K)) * 1.0e17
-    dust_sigma_cm2 = Float64(dust_sigma353_cm2) *
-        (dust_nu_Hz / 353.0e9)^Float64(dust_beta)
-    dust_nH = cube.rho ./ (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
-    dust_Blos = Bcomponents[los_dim]
-    dust_B1 = Bcomponents[sky_dims[1]]
-    dust_B2 = Bcomponents[sky_dims[2]]
-    dust_Bnorm2 = max.(mag.B2, eps(Float64))
-    dust_cos2gamma = clamp.((dust_B1 .^ 2 .+ dust_B2 .^ 2) ./ dust_Bnorm2, 0.0, 1.0)
-    dust_phi = atan.(dust_B2, dust_B1) .+ pi / 2
-    dust_p0_value = Float64(dust_p0)
-    dust_column_weight = dx_los_cm .* dust_nH
-    dust_I_geometry = finite_sum_dims(dust_column_weight .*
-        (1 .- dust_p0_value .* (dust_cos2gamma .- 2 / 3)),
-        los_dim)
-    dust_Q_geometry = finite_sum_dims(dust_column_weight .* dust_p0_value .* dust_cos2gamma .*
-        cos.(2 .* dust_phi), los_dim)
-    dust_U_geometry = finite_sum_dims(dust_column_weight .* dust_p0_value .* dust_cos2gamma .*
-        sin.(2 .* dust_phi), los_dim)
-    dust_I_geometry = apply_observational_beam_2d(dust_I_geometry, cube, sky_dims)
-    dust_Q_geometry = apply_observational_beam_2d(dust_Q_geometry, cube, sky_dims)
-    dust_U_geometry = apply_observational_beam_2d(dust_U_geometry, cube, sky_dims)
-    dust_spectral_factor = dust_planck_MJysr * dust_sigma_cm2
-    dust_I = dust_spectral_factor .* dust_I_geometry
-    dust_Q = dust_spectral_factor .* dust_Q_geometry
-    dust_U = dust_spectral_factor .* dust_U_geometry
-    dust_P = sqrt.(dust_Q .^ 2 .+ dust_U .^ 2)
-    dust_fraction = dust_P ./ max.(dust_I, eps(Float64))
-    dust_angle_deg = rad2deg.(0.5 .* atan.(dust_U, dust_Q))
-
-    dust_map_specs = NamedTuple[]
-    show_dust_I && push!(dust_map_specs, (data = log_dust_positive ? safe_log10.(dust_I) : dust_I,
-        label = log_dust_positive ? L"\log_{10}(I_\nu/[\mathrm{MJy\,sr}^{-1}])" : L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]",
-        colormap = :magma, diverging = false, fixed_range = nothing, vectors = show_dust_vectors))
-    show_dust_Q && push!(dust_map_specs, (data = log_dust_signed ? symlog10(dust_Q) : dust_Q,
-        label = log_dust_signed ? L"\operatorname{symlog}_{10}(Q_\nu/[\mathrm{MJy\,sr}^{-1}])" : L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]",
-        colormap = :balance, diverging = true, fixed_range = nothing, vectors = false))
-    show_dust_U && push!(dust_map_specs, (data = log_dust_signed ? symlog10(dust_U) : dust_U,
-        label = log_dust_signed ? L"\operatorname{symlog}_{10}(U_\nu/[\mathrm{MJy\,sr}^{-1}])" : L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]",
-        colormap = :balance, diverging = true, fixed_range = nothing, vectors = false))
-    show_dust_P && push!(dust_map_specs, (data = log_dust_positive ? safe_log10.(dust_P) : dust_P,
-        label = log_dust_positive ? L"\log_{10}(P_\nu/[\mathrm{MJy\,sr}^{-1}])" : L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]",
-        colormap = :viridis, diverging = false, fixed_range = nothing, vectors = false))
-    show_dust_fraction && push!(dust_map_specs, (data = dust_fraction,
-        label = L"p=P_\nu/I_\nu", colormap = :plasma, diverging = false,
-        fixed_range = (0.0, max(finite_quantile(dust_fraction, 0.995; default = 1.0e-6),
-            1.0e-6)), vectors = false))
-    show_dust_angle && push!(dust_map_specs, (data = dust_angle_deg,
-        label = L"\psi\;[{}^\circ]", colormap = :hsv, diverging = false,
-        fixed_range = (-90.0, 90.0), vectors = false))
-
-    if isempty(dust_map_specs)
-        fig_dust = Figure(size = (900, 180))
-        Label(fig_dust[1, 1], L"\mathrm{Select\ at\ least\ one\ dust\ product.}", fontsize = 20)
+    if isempty(heatmap_specs)
+        fig_maps = Figure(size = (900, 180))
+        Label(fig_maps[1, 1], L"\mathrm{Select\ at\ least\ one\ field\ to\ display\ a\ heatmap.}", fontsize = 20)
     else
-        dust_ncols = length(dust_map_specs) == 1 ? 1 : 2
-        dust_nrows = cld(length(dust_map_specs), dust_ncols)
-        fig_dust = Figure(size = (560dust_ncols, 420dust_nrows))
-        for (index, spec) in enumerate(dust_map_specs)
-            row, col = cld(index, dust_ncols), mod1(index, dust_ncols)
-            panel = fig_dust[row, col] = GridLayout()
-            ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+        ncols = length(heatmap_specs) == 1 ? 1 : 2
+        nrows = cld(length(heatmap_specs), ncols)
+        fig_maps = Figure(size = (560ncols, 420nrows + 60))
+        for (index, spec) in enumerate(heatmap_specs)
+            row, col = cld(index, ncols), mod1(index, ncols)
+            panel = fig_maps[row, col] = GridLayout()
+            ax = latex_axis(panel[1, 1],
+                xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
-            dust_range = isnothing(spec.fixed_range) ?
-                robust_colorrange(spec.data, color_percentile; diverging = spec.diverging) : spec.fixed_range
+            colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
-                colormap = spec.colormap, colorrange = dust_range)
-            scatter!(ax,
-                [sky_coordinates[1][Int(dust_sky_i)]],
-                [sky_coordinates[2][Int(dust_sky_j)]];
-                marker = :cross, markersize = 18, strokewidth = 3,
-                color = :white)
-            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
-            colsize!(panel, 2, 22)
-            if spec.vectors
-                stride = Int(dust_vector_stride)
-                ix = collect(1:stride:size(dust_angle_deg, 1))
-                iy = collect(1:stride:size(dust_angle_deg, 2))
+                colormap = spec.colormap, colorrange)
+            if spec.overlay_B && show_projected_B_lic
+                lic_colors = [RGBAf(0, 0, 0, 0),
+                    RGBAf(1, 1, 1, Float64(lic_opacity))]
+                heatmap!(ax, sky_coordinates[1], sky_coordinates[2], projected_B_lic;
+                    colormap = lic_colors, colorrange = (0.0, 1.0), transparency = true)
+            end
+            latex_colorbar(panel[1, 2], hm, label = as_latex(spec.label), tickformat = latex_ticklabels)
+            colsize!(panel, 2, 20)
+
+            if spec.overlay_B && show_projected_B
+                stride = arrow_stride
+                ix = collect(1:stride:size(Bsky1, 1))
+                iy = collect(1:stride:size(Bsky1, 2))
                 points = [Point2f(sky_coordinates[1][i], sky_coordinates[2][j]) for i in ix for j in iy]
-                directions = [Vec2f(cosd(dust_angle_deg[i, j]), sind(dust_angle_deg[i, j])) for i in ix for j in iy]
-                arrows2d!(ax, points, directions; normalize = true,
-                    lengthscale = 0.65stride * step(sky_coordinates[1]), align = :center,
-                    color = (:white, 0.88), shaftwidth = 1.4, tipwidth = 0, tiplength = 0)
+                dirs = [Vec2f(Bsky1[i, j], Bsky2[i, j]) for i in ix for j in iy]
+                arrow_length_pc = 0.65stride * step(sky_coordinates[1])
+                arrows2d!(ax, points, dirs; normalize = true, lengthscale = arrow_length_pc,
+                    align = :center, color = (:white, 0.85), shaftwidth = 1.5,
+                    tipwidth = 7, tiplength = 5)
             end
         end
     end
-    display_dust_maps ? fig_dust : nothing
+    display_projected_maps ? fig_maps : nothing
 end
 
-# ╔═╡ 5b3f6a91-246e-4cc3-8f68-164f7ff2f07c
+# ╔═╡ 72626861-42ce-4ac0-b980-78f498f8a629
+md"""
+---
+
+## 3. Physical probability density functions
+
+The panels compare every run selected in **Simulations in comparative plots** at the selected snapshot index (clamped to the last available snapshot of shorter runs). They show number density $n$, magnetic-field strength $|B|$, and turbulent speed $|\delta\mathbf v|$ in physical units. Shared $\log_{10}X$ bins are used across runs. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
+
+**Display physical PDFs:** $(@bind display_pdfs PlutoUI.CheckBox(default = true))
+
+| PDF panel | Display |
+|:--|:--:|
+| Number-density PDF | $(@bind show_pdf_density PlutoUI.CheckBox(default = true)) |
+| Magnetic-field PDF | $(@bind show_pdf_magnetic PlutoUI.CheckBox(default = true)) |
+| Turbulent-speed PDF | $(@bind show_pdf_velocity PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
 begin
-    dust_selected_frequency_GHz = Float64(dust_frequency_GHz)
-    dust_frequency_low_GHz = max(min(Float64(dust_spectrum_min_GHz),
-        Float64(dust_spectrum_max_GHz), dust_selected_frequency_GHz), eps(Float64))
-    dust_frequency_high_GHz = max(max(Float64(dust_spectrum_min_GHz),
-        Float64(dust_spectrum_max_GHz), dust_selected_frequency_GHz),
-        dust_frequency_low_GHz * (1 + sqrt(eps(Float64))))
-    dust_frequency_axis_GHz = log_dust_frequency_axis ?
-        10.0 .^ range(log10(dust_frequency_low_GHz), log10(dust_frequency_high_GHz);
-            length = Int(dust_spectrum_samples)) :
-        collect(range(dust_frequency_low_GHz, dust_frequency_high_GHz;
-            length = Int(dust_spectrum_samples)))
-    dust_frequency_axis_Hz = dust_frequency_axis_GHz .* 1.0e9
-    dust_planck_spectrum_MJysr = @. (2H_PLANCK_CGS * dust_frequency_axis_Hz^3 /
-        C_LIGHT_CGS^2) / expm1(H_PLANCK_CGS * dust_frequency_axis_Hz /
-        (K_B_CGS * dust_T_K)) * 1.0e17
-    dust_sigma_spectrum_cm2 = @. Float64(dust_sigma353_cm2) *
-        (dust_frequency_axis_Hz / 353.0e9)^Float64(dust_beta)
-    dust_pixel_spectral_factor = dust_planck_spectrum_MJysr .* dust_sigma_spectrum_cm2
-    dust_pixel_index = (Int(dust_sky_i), Int(dust_sky_j))
-    dust_pixel_I_spectrum = dust_pixel_spectral_factor .* dust_I_geometry[dust_pixel_index...]
-    dust_pixel_Q_spectrum = dust_pixel_spectral_factor .* dust_Q_geometry[dust_pixel_index...]
-    dust_pixel_U_spectrum = dust_pixel_spectral_factor .* dust_U_geometry[dust_pixel_index...]
-
-    dust_pixel_spectrum_specs = NamedTuple[]
-    show_dust_I_spectrum && push!(dust_pixel_spectrum_specs, (
-        values = dust_pixel_I_spectrum,
-        selected_value = dust_I[dust_pixel_index...],
-        ylabel = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]",
-        color = MHD_COLORS[1], signed = false))
-    show_dust_Q_spectrum && push!(dust_pixel_spectrum_specs, (
-        values = dust_pixel_Q_spectrum,
-        selected_value = dust_Q[dust_pixel_index...],
-        ylabel = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]",
-        color = MHD_COLORS[2], signed = true))
-    show_dust_U_spectrum && push!(dust_pixel_spectrum_specs, (
-        values = dust_pixel_U_spectrum,
-        selected_value = dust_U[dust_pixel_index...],
-        ylabel = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]",
-        color = MHD_COLORS[3], signed = true))
-
-    if isempty(dust_pixel_spectrum_specs)
-        fig_dust_pixel_spectrum = Figure(size = (900, 180))
-        Label(fig_dust_pixel_spectrum[1, 1],
-            L"\mathrm{Select\ at\ least\ one\ dust\ Stokes\ spectrum.}", fontsize = 20)
-    else
-        fig_dust_pixel_spectrum = Figure(
-            size = (430length(dust_pixel_spectrum_specs), 390))
-        for (index, spec) in enumerate(dust_pixel_spectrum_specs)
-            axis = latex_axis(fig_dust_pixel_spectrum[1, index],
-                xlabel = L"\nu\;[\mathrm{GHz}]", ylabel = spec.ylabel,
-                xscale = log_dust_frequency_axis ? log10 : identity,
-                xticks = log_dust_frequency_axis ? DECADE_TICKS : Makie.automatic,
-                xminorticks = log_dust_frequency_axis ? IntervalsBetween(9) : IntervalsBetween(5),
-                xminorticksvisible = true)
-            spec.signed && hlines!(axis, [0.0];
-                color = (:gray45, 0.55), linestyle = :dash, linewidth = 1.4)
-            lines!(axis, dust_frequency_axis_GHz, spec.values;
-                color = spec.color, linewidth = 2.7)
-            vlines!(axis, [dust_selected_frequency_GHz];
-                color = :black, linestyle = :dot, linewidth = 1.8)
-            scatter!(axis, [dust_selected_frequency_GHz], [spec.selected_value];
-                color = spec.color, marker = :star5, markersize = 14,
-                strokecolor = :black, strokewidth = 0.8)
-        end
+    function density_pdf(values, weights, edges)
+        valid = isfinite.(values) .& isfinite.(weights) .& (weights .>= 0)
+        values, weights = Float64.(values[valid]), Float64.(weights[valid])
+        isempty(values) && return (Float64[], Float64[])
+        h = fit(Histogram, values, Weights(weights), edges)
+        centers = (edges[1:end-1] .+ edges[2:end]) ./ 2
+        pdf = h.weights ./ max(sum(h.weights .* diff(edges)), eps())
+        centers, pdf
     end
-    display_dust_pixel_spectrum ? fig_dust_pixel_spectrum : nothing
-end
 
-# ╔═╡ 61c3b28c-9d62-4689-a85d-bc827e89641d
-begin
-    function dust_distribution_products(c)
+    function cube_pdf_samples(c)
         local_mag = magnetic_fields(c)
-        local_Bcomponents = (c.bx, c.by, c.bz)
-        local_B1 = local_Bcomponents[sky_dims[1]]
-        local_B2 = local_Bcomponents[sky_dims[2]]
-        local_cos2gamma = clamp.((local_B1 .^ 2 .+ local_B2 .^ 2) ./
-            max.(local_mag.B2, eps(Float64)), 0.0, 1.0)
-        local_phi = atan.(local_B2, local_B1) .+ pi / 2
-        local_dx_cm = c.L[los_dim] / size(c.rho, los_dim) * PC_CM
-        local_nH = c.rho ./ (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
-        local_weight = local_dx_cm .* local_nH
-        local_p0 = Float64(dust_p0)
-        local_I = finite_sum_dims(local_weight .*
-            (1 .- local_p0 .* (local_cos2gamma .- 2 / 3)), los_dim)
-        local_Q = finite_sum_dims(local_weight .* local_p0 .* local_cos2gamma .*
-            cos.(2 .* local_phi), los_dim)
-        local_U = finite_sum_dims(local_weight .* local_p0 .* local_cos2gamma .*
-            sin.(2 .* local_phi), los_dim)
-        local_I = apply_observational_beam_2d(local_I, c, sky_dims)
-        local_Q = apply_observational_beam_2d(local_Q, c, sky_dims)
-        local_U = apply_observational_beam_2d(local_U, c, sky_dims)
-        local_fraction = sqrt.(local_Q .^ 2 .+ local_U .^ 2) ./
-            max.(local_I, eps(Float64))
-        local_column = finite_sum_dims(c.rho, los_dim) .* local_dx_cm ./
-            (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
-        (column = local_column, fraction = local_fraction)
+        local_turb = turbulent_velocity(c)
+        local_weights = pdf_weighting == "mass" ?
+            vec(Float64.(c.rho)) : ones(length(c.rho))
+        local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
+        local_v = sqrt.(local_turb.dv2)
+        local_mean_B = finite_mean(local_mag.B)
+        (
+            density = vec(safe_log10.(number_density(c.rho))),
+            magnetic = vec(safe_log10.(local_B)),
+            velocity = vec(safe_log10.(local_v)),
+            normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
+            weights = local_weights,
+        )
     end
 
-    dust_distributions_by_run = Dict(label =>
-        dust_distribution_products(comparison_cube(label))
-        for label in comparison_run_labels)
-    dust_stat_specs = Symbol[]
-    show_dust_p_column && push!(dust_stat_specs, :column_relation)
-    show_dust_p_pdf && push!(dust_stat_specs, :fraction_pdf)
-    if isempty(dust_stat_specs)
-        fig_dust_statistics = Figure(size = (900, 180))
-        Label(fig_dust_statistics[1, 1], L"\mathrm{Select\ at\ least\ one\ dust\ statistic.}", fontsize = 20)
-    else
-        fig_dust_statistics = Figure(size = (540length(dust_stat_specs), 470))
-        dust_distribution_vectors = Dict(label => begin
-            products = dust_distributions_by_run[label]
-            local_N = vec(Float64.(products.column))
-            local_p = 100 .* vec(Float64.(products.fraction))
-            valid = isfinite.(local_N) .& isfinite.(local_p) .&
-                (local_N .> 0) .& (local_p .>= 0)
-            (N = local_N[valid], p = local_p[valid])
-        end for label in comparison_run_labels)
-        all_dust_p = vcat([dust_distribution_vectors[label].p
+    function comparative_pdf(samples_by_run, field, bins)
+        combined = vcat([finite_values(getfield(samples_by_run[label], field))
             for label in comparison_run_labels]...)
-        dust_pdf_upper = isempty(all_dust_p) ? 1.0e-6 :
-            max(quantile(all_dust_p, 0.999), 1.0e-6)
-        dust_pdf_edges = range(0, dust_pdf_upper; length = 45)
-        for (index, statistic) in enumerate(dust_stat_specs)
-            if statistic == :column_relation
-                ax = latex_axis(fig_dust_statistics[1, index], xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
-                    ylabel = L"100p_{\mathrm d}\;[\%]", xscale = log10,
-                    xticks = DECADE_TICKS,
-                    xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-                for label in comparison_run_labels
-                    dust_N_valid = dust_distribution_vectors[label].N
-                    dust_p_valid = dust_distribution_vectors[label].p
-                    sample_step = max(1, cld(length(dust_N_valid), 6000))
-                    sample = 1:sample_step:length(dust_N_valid)
-                    scatter!(ax, dust_N_valid[sample], dust_p_valid[sample];
-                        color = (run_colors[label], 0.16), markersize = 4)
-                    if !isempty(dust_N_valid)
-                        edges = 10 .^ range(extrema(log10.(dust_N_valid))...; length = 18)
-                        centers, medians = Float64[], Float64[]
-                        for bin in 1:length(edges)-1
-                            members = (dust_N_valid .>= edges[bin]) .&
-                                (dust_N_valid .< edges[bin + 1])
-                            any(members) || continue
-                            push!(centers, sqrt(edges[bin] * edges[bin + 1]))
-                            push!(medians, median(dust_p_valid[members]))
-                        end
-                        lines!(ax, centers, medians; color = run_colors[label],
-                            linewidth = 3, label = legend_run_label(label))
-                        scatter!(ax, centers, medians;
-                            color = run_colors[label], markersize = 7)
-                    end
-                end
-            else
-                ax = latex_axis(fig_dust_statistics[1, index], xlabel = L"100p_{\mathrm d}\;[\%]",
-                    ylabel = L"\mathrm{PDF}(100p_{\mathrm d})")
-                for label in comparison_run_labels
-                    dust_p_valid = dust_distribution_vectors[label].p
-                    isempty(dust_p_valid) && continue
-                    histogram = fit(Histogram,
-                        clamp.(dust_p_valid, 0, prevfloat(dust_pdf_upper)),
-                        dust_pdf_edges)
-                    centers = (dust_pdf_edges[1:end-1] .+ dust_pdf_edges[2:end]) ./ 2
-                    probability = histogram.weights ./
-                        max(sum(histogram.weights .* diff(dust_pdf_edges)), eps(Float64))
-                    stairs!(ax, centers, probability; color = run_colors[label],
-                        linewidth = 2.5, step = :center,
-                        label = legend_run_label(label))
-                end
+        isempty(combined) && return Dict{String, Any}()
+        lo, hi = quantile(combined, (0.001, 0.999))
+        lo == hi && ((lo, hi) = (lo - 0.5, hi + 0.5))
+        edges = range(lo, hi; length = Int(bins) + 1)
+        Dict(label => density_pdf(getfield(samples_by_run[label], field),
+                samples_by_run[label].weights, edges)
+            for label in comparison_run_labels)
+    end
+
+    number_density_cells = number_density(cube.rho)
+    magnetic_strength_uG = GAUSS_TO_MICROGAUSS .* mag.B
+    turbulent_speed_kms = sqrt.(turb.dv2)
+    mean_B = finite_mean(mag.B)
+    sB = vec(safe_log10.(mag.B ./ mean_B))
+    logn = vec(safe_log10.(number_density_cells))
+    logBphysical = vec(safe_log10.(magnetic_strength_uG))
+    logvphysical = vec(safe_log10.(turbulent_speed_kms))
+    comparative_pdf_samples = Dict(label => cube_pdf_samples(comparison_cube(label))
+        for label in comparison_run_labels)
+    density_pdfs = comparative_pdf(comparative_pdf_samples, :density, nbins)
+    magnetic_pdfs = comparative_pdf(comparative_pdf_samples, :magnetic, nbins)
+    velocity_pdfs = comparative_pdf(comparative_pdf_samples, :velocity, nbins)
+    normalized_B_pdfs = comparative_pdf(comparative_pdf_samples, :normalized_B, nbins)
+end
+
+# ╔═╡ 1e0e6c0e-1ae0-40a1-a6f8-9c18fae91961
+begin
+    pdf_specs = NamedTuple[]
+    show_pdf_density && push!(pdf_specs, (pdfs = density_pdfs,
+        xlabel = L"n\;[\mathrm{cm}^{-3}]"))
+    show_pdf_magnetic && push!(pdf_specs, (pdfs = magnetic_pdfs,
+        xlabel = L"|B|\;[\mu\mathrm{G}]"))
+    show_pdf_velocity && push!(pdf_specs, (pdfs = velocity_pdfs,
+        xlabel = L"|\delta v|\;[\mathrm{km\,s}^{-1}]"))
+    if isempty(pdf_specs)
+        fig_pdf = Figure(size = (900, 180))
+        Label(fig_pdf[1, 1], L"\mathrm{Select\ at\ least\ one\ PDF.}", fontsize = 20)
+    else
+        fig_pdf = Figure(size = (420length(pdf_specs), 430))
+        for (j, spec) in enumerate(pdf_specs)
+            ax = latex_axis(fig_pdf[1, j], xlabel = spec.xlabel,
+                ylabel = L"\mathrm{d}\mathcal{P}/\mathrm{d}\log_{10}X", xscale = log10,
+                xticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+            for label in comparison_run_labels
+                logx, probability = spec.pdfs[label]
+                stairs!(ax, 10.0 .^ logx, probability;
+                    color = run_colors[label], linewidth = 2.5, step = :center,
+                    label = legend_run_label(label))
             end
+            ylims!(ax, low = 0)
         end
-        Legend(fig_dust_statistics[2, 1:length(dust_stat_specs)],
+        Legend(fig_pdf[2, 1:length(pdf_specs)],
             [LineElement(color = run_colors[label], linewidth = 2.5)
                 for label in comparison_run_labels],
             legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
             orientation = :horizontal, tellheight = true, framevisible = false)
     end
-    fig_dust_p_column = polarization_column_figure(
-        column_density, dust_fraction,
-        L"100p_{\mathrm d}\;[\%]", MHD_COLORS[2])
-    display_dust_statistics ? fig_dust_statistics : nothing
+    display_pdfs ? fig_pdf : nothing
 end
 
-# ╔═╡ a0010001-6f8c-4d0c-9a10-000000000001
+# ╔═╡ fa155a62-da75-4530-b5e9-215fd4f66412
+md"""
+---
+
+## 4. Thermodynamic phase diagram
+
+This comparative figure shows one joint distribution of number density $n$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. The plotted coordinates are $\log_{10}n$ and $\log_{10}(P/k_{\mathrm B})$; empty probability bins are masked and all panels share one color scale.
+
+The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curve satisfies $n\Lambda(T)=\Gamma$ with $P/k_{\mathrm B}=nT$.
+
+**Display the pressure-density phase diagram:** $(@bind display_phase_diagram PlutoUI.CheckBox(default = true))
+
+| Phase-diagram setting | Control |
+|:--|:--|
+| Bins per axis | $(@bind phase_bins PlutoUI.Slider(20:5:120; default = 60, show_value = true)) |
+| Thermal-equilibrium curve | $(@bind show_phase_equilibrium PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 9da572fe-21f2-43df-9320-b8742fd64773
 begin
-    dust_structure_specs = [
-        (data = dust_I, label = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[1], period = nothing),
-        (data = dust_Q, label = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[2], period = nothing),
-        (data = dust_U, label = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[3], period = nothing),
-        (data = dust_P, label = L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[4], period = nothing),
-        (data = dust_fraction, label = L"p_{\mathrm d}", color = MHD_COLORS[5], period = nothing),
-        (data = dust_angle_deg, label = L"\psi_{\mathrm d}\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
-    ]
-    fig_dust_structure = display_observational_structure_functions ?
-        observational_structure_figure(dust_structure_specs, cube, sky_dims,
-            observational_structure_order, observational_structure_samples;
-            heading = "Dust observable structure functions") : Figure(size = (900, 120))
-    display_observational_structure_functions ? fig_dust_structure : nothing
+    function phase_histogram(logn, logpk, weights, bins)
+        valid = isfinite.(logn) .& isfinite.(logpk) .& isfinite.(weights) .& (weights .>= 0)
+        x, y, w = logn[valid], logpk[valid], weights[valid]
+        isempty(x) && error("No finite positive cells are available for the phase diagram.")
+        xlo, xhi = quantile(x, (0.001, 0.999))
+        ylo, yhi = quantile(y, (0.001, 0.999))
+        xlo == xhi && ((xlo, xhi) = (xlo - 0.5, xhi + 0.5))
+        ylo == yhi && ((ylo, yhi) = (ylo - 0.5, yhi + 0.5))
+        xedges = range(xlo, xhi; length = bins + 1)
+        yedges = range(ylo, yhi; length = bins + 1)
+        histogram = zeros(Float64, bins, bins)
+        for index in eachindex(x)
+            ix = searchsortedlast(xedges, x[index])
+            iy = searchsortedlast(yedges, y[index])
+            1 <= ix <= bins && 1 <= iy <= bins || continue
+            histogram[ix, iy] += w[index]
+        end
+        dx, dy = step(xedges), step(yedges)
+        probability = histogram ./ max(sum(histogram) * dx * dy, eps())
+        log_probability = map(value -> value > 0 ? log10(value) : NaN, probability)
+        xcenters = (xedges[1:end-1] .+ xedges[2:end]) ./ 2
+        ycenters = (yedges[1:end-1] .+ yedges[2:end]) ./ 2
+        (; xcenters, ycenters, log_probability)
+    end
+
+    function koyama_inutsuka_equilibrium(; temperature_min = 10.0,
+            temperature_max = 1.0e5, samples = 2400)
+        temperature_K = 10.0 .^ range(log10(temperature_min), log10(temperature_max);
+            length = samples)
+        cooling_over_heating_cm3 =
+            1.0e7 .* exp.(-1.184e5 ./ (temperature_K .+ 1000.0)) .+
+            1.4e-2 .* sqrt.(temperature_K) .* exp.(-92.0 ./ temperature_K)
+        equilibrium_density_cm3 = 1.0 ./ cooling_over_heating_cm3
+        equilibrium_pressure_over_k = equilibrium_density_cm3 .* temperature_K
+        valid = isfinite.(equilibrium_density_cm3) .&
+            isfinite.(equilibrium_pressure_over_k) .&
+            (equilibrium_density_cm3 .> 0) .& (equilibrium_pressure_over_k .> 0)
+        (
+            logn = safe_log10.(equilibrium_density_cm3[valid]),
+            logpk = safe_log10.(equilibrium_pressure_over_k[valid]),
+        )
+    end
+
+    phase_data_by_run = Dict(label => begin
+        local_cube = comparison_cube(label)
+        local_logn = vec(safe_log10.(number_density(local_cube.rho)))
+        local_logpk = vec(safe_log10.(local_cube.P ./ K_B_CGS))
+        local_weights = pdf_weighting == "mass" ?
+            vec(Float64.(local_cube.rho)) : ones(length(local_cube.rho))
+        phase_histogram(local_logn, local_logpk, local_weights, phase_bins)
+    end for label in comparison_run_labels)
+    phase_equilibrium = koyama_inutsuka_equilibrium()
 end
+
+# ╔═╡ 41b4eb12-889d-43b3-87c2-fc7cccf8679f
+begin
+    phase_panel_count = length(comparison_run_labels)
+    fig_phase = Figure(size = (560phase_panel_count + 80, 520))
+    combined_phase_probability = vcat([
+        finite_values(phase_data_by_run[label].log_probability)
+        for label in comparison_run_labels]...)
+    phase_range = robust_colorrange(combined_phase_probability, 99.0)
+    phase_heatmap = nothing
+    for (panel_index, label) in enumerate(comparison_run_labels)
+        phase_data = phase_data_by_run[label]
+        phase_axis = latex_axis(fig_phase[1, panel_index],
+            xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
+            ylabel = L"\log_{10}\!\left[(P/k_B)/(\mathrm{K\,cm}^{-3})\right]",
+            title = latex_run_label(label))
+        phase_heatmap = heatmap!(phase_axis, phase_data.xcenters, phase_data.ycenters,
+            phase_data.log_probability; colormap = :magma, colorrange = phase_range)
+        if show_phase_equilibrium
+            lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
+                color = :black, linewidth = 4.5)
+            lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
+                color = :white, linewidth = 2.5,
+                label = L"n\Lambda(T)=\Gamma")
+            panel_index == 1 && axislegend(phase_axis; position = :rt, labelsize = 14)
+        end
+        phase_dx = length(phase_data.xcenters) > 1 ?
+            phase_data.xcenters[2] - phase_data.xcenters[1] : 1.0
+        phase_dy = length(phase_data.ycenters) > 1 ?
+            phase_data.ycenters[2] - phase_data.ycenters[1] : 1.0
+        xlims!(phase_axis, first(phase_data.xcenters) - phase_dx / 2,
+            last(phase_data.xcenters) + phase_dx / 2)
+        ylims!(phase_axis, first(phase_data.ycenters) - phase_dy / 2,
+            last(phase_data.ycenters) + phase_dy / 2)
+    end
+    latex_colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
+        label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)
+    colsize!(fig_phase.layout, phase_panel_count + 1, 22)
+    display_phase_diagram ? fig_phase : nothing
+end
+
+# ╔═╡ 904ba663-d536-4b27-a379-4af927b0affb
+begin
+    """
+    Bulk dynamics of one cube, accumulated in a single pass over the grid.
+
+    The broadcast form of this reduction allocated roughly thirty cube-sized
+    temporaries; the loop allocates none.
+    """
+    function bulk_metrics_from_cube(c, gamma)
+        m = magnetic_fields(c)
+        u = turbulent_velocity(c)
+        rho, P, B, B2, dv2 = c.rho, c.P, m.B, m.B2, u.dv2
+        inverse_kms2 = 1 / KM_CM^2
+        thermal_factor = gamma > 1 + sqrt(eps(Float64)) ? 1 / (gamma - 1) : 1.0
+        mass, mass_dv2 = 0.0, 0.0
+        cs_mass, cs_weighted = 0.0, 0.0
+        va_mass, va_weighted = 0.0, 0.0
+        Ekin, Emag, Etherm = 0.0, 0.0, 0.0
+        B_sum, B_count = 0.0, 0
+        B2_sum, B2_count = 0.0, 0
+        @inbounds for index in eachindex(rho)
+            density = Float64(rho[index])
+            pressure = Float64(P[index])
+            magnitude = Float64(B[index])
+            square = Float64(B2[index])
+            turbulence = Float64(dv2[index])
+
+            if isfinite(magnitude)
+                B_sum += magnitude
+                B_count += 1
+            end
+            if isfinite(square)
+                B2_sum += square
+                B2_count += 1
+            end
+
+            magnetic_energy = square / (8pi)
+            isfinite(magnetic_energy) && (Emag += magnetic_energy)
+            kinetic_energy = 0.5 * density * turbulence * KM_CM^2
+            isfinite(kinetic_energy) && (Ekin += kinetic_energy)
+            thermal_energy = thermal_factor * pressure
+            isfinite(thermal_energy) && (Etherm += thermal_energy)
+
+            (isfinite(density) && density > 0 && isfinite(turbulence)) || continue
+            mass += density
+            mass_dv2 += density * turbulence
+            cs2 = gamma * pressure / density * inverse_kms2
+            if isfinite(cs2) && cs2 >= 0
+                cs_mass += density
+                cs_weighted += density * cs2
+            end
+            va2 = square / (4pi * density) * inverse_kms2
+            if isfinite(va2) && va2 >= 0
+                va_mass += density
+                va_weighted += density * va2
+            end
+        end
+        vrms = mass > 0 ? sqrt(mass_dv2 / mass) : NaN
+        cs_rms = cs_mass > 0 ? sqrt(cs_weighted / cs_mass) : NaN
+        va_rms = va_mass > 0 ? sqrt(va_weighted / va_mass) : NaN
+        mean_B = B_count > 0 ? B_sum / B_count : NaN
+        mean_B2 = B2_count > 0 ? B2_sum / B2_count : NaN
+        (
+            t = c.t,
+            mach = vrms / max(cs_rms, eps()),
+            mach_alfven = vrms / max(va_rms, eps()),
+            Bmean = GAUSS_TO_MICROGAUSS * mean_B,
+            Brms = GAUSS_TO_MICROGAUSS * sqrt(mean_B2),
+            energy_ratio = Ekin > 0 ? Emag / Ekin : NaN,
+            kin_mag = Ekin > 0 && Emag > 0 ? Ekin / Emag : NaN,
+            therm_mag = Etherm > 0 && Emag > 0 ? Etherm / Emag : NaN,
+            kin_therm = Ekin > 0 && Etherm > 0 ? Ekin / Etherm : NaN,
+        )
+    end
+
+    """
+    Mean and RMS field of the three thermal phases, in a single pass over the cube.
+
+    Matches the mask-based form this replaces, including its treatment of
+    non-finite temperatures: `NaN` fails all three comparisons and so belongs to
+    no phase, while `-Inf` falls in the cold phase and `+Inf` in the warm one.
+    """
+    function phase_metrics_from_cube(c, molecular_weight, cold_boundary_K,
+            warm_boundary_K, phase_weighting)
+        m = magnetic_fields(c)
+        rho, P, B, B2 = c.rho, c.P, m.B, m.B2
+        cold_boundary = min(cold_boundary_K, warm_boundary_K)
+        warm_boundary = max(cold_boundary_K, warm_boundary_K)
+        temperature_factor = molecular_weight * M_H_CGS / K_B_CGS
+        density_weighted = phase_weighting == "density"
+        counts = zeros(Int, 3)
+        weights = zeros(3)
+        weighted_B = zeros(3)
+        weighted_B2 = zeros(3)
+        @inbounds for index in eachindex(rho)
+            density = Float64(rho[index])
+            magnitude = Float64(B[index])
+            square = Float64(B2[index])
+            (isfinite(density) && isfinite(magnitude) && isfinite(square)) || continue
+            temperature = temperature_factor * Float64(P[index]) / density
+            isnan(temperature) && continue
+            phase = temperature < cold_boundary ? 1 :
+                temperature < warm_boundary ? 2 : 3
+            counts[phase] += 1
+            density_weighted && density <= 0 && continue
+            weight = density_weighted ? density : 1.0
+            weights[phase] += weight
+            weighted_B[phase] += weight * magnitude
+            weighted_B2[phase] += weight * square
+        end
+        statistics = ntuple(3) do phase
+            (counts[phase] == 0 || weights[phase] <= 0) && return (mean = NaN, rms = NaN)
+            (
+                mean = GAUSS_TO_MICROGAUSS * weighted_B[phase] / weights[phase],
+                rms = GAUSS_TO_MICROGAUSS * sqrt(weighted_B2[phase] / weights[phase]),
+            )
+        end
+        (
+            t = c.t,
+            B_cold_mean = statistics[1].mean,
+            B_cold_rms = statistics[1].rms,
+            B_lukewarm_mean = statistics[2].mean,
+            B_lukewarm_rms = statistics[2].rms,
+            B_warm_mean = statistics[3].mean,
+            B_warm_rms = statistics[3].rms,
+        )
+    end
+
+    """
+    Sweep one run once, deriving both series from a single read of each snapshot.
+
+    Each summary is memoized on its own parameters, so changing `gamma` leaves
+    the phase series untouched and changing a phase boundary leaves the bulk
+    series untouched. Only the missing half is recomputed, and the cube behind it
+    is read only when neither half is already cached.
+    """
+    function run_metric_series(paths, gamma, molecular_weight, cold_boundary_K,
+            warm_boundary_K, phase_weighting, with_phase)
+        bulk = Vector{Any}(undef, length(paths))
+        phase = with_phase ? Vector{Any}(undef, length(paths)) : nothing
+        keys_by_index = map(paths) do path
+            signature = cube_signature(path)
+            ((:bulk, signature, gamma),
+             (:phase, signature, molecular_weight, cold_boundary_K,
+                warm_boundary_K, phase_weighting))
+        end
+
+        # Serve everything already memoized first, so that only the snapshots
+        # that still have to be read reach the parallel section below.
+        pending = Int[]
+        for index in eachindex(paths)
+            bulk_key, phase_key = keys_by_index[index]
+            bulk_hit = reduction_hit(bulk_key)
+            phase_hit = with_phase ? reduction_hit(phase_key) : nothing
+            if isnothing(bulk_hit) || (with_phase && isnothing(phase_hit))
+                push!(pending, index)
+            else
+                bulk[index] = bulk_hit
+                with_phase && (phase[index] = phase_hit)
+            end
+        end
+
+        # read_raw_cube bypasses the single-entry cube cache on purpose: a sweep
+        # visits each snapshot once, so caching here would only evict the
+        # interactively selected cube, and would have parallel workers evict
+        # each other.
+        function reduce_snapshot!(index)
+            bulk_key, phase_key = keys_by_index[index]
+            raw = read_raw_cube(paths[index])
+            c = scale_raw_cube(raw)
+            bulk[index] = store_reduction!(bulk_key, bulk_metrics_from_cube(c, gamma))
+            with_phase && (phase[index] = store_reduction!(phase_key,
+                phase_metrics_from_cube(c, molecular_weight, cold_boundary_K,
+                    warm_boundary_K, phase_weighting)))
+            Base.summarysize(raw)
+        end
+
+        if !isempty(pending)
+            # The first snapshot is read serially, both to size the remaining
+            # workers against free memory and to surface a malformed file as a
+            # plain error rather than one wrapped in a task failure.
+            cube_bytes = reduce_snapshot!(first(pending))
+            rest = @view pending[2:end]
+            isempty(rest) ||
+                parallel_foreach(reduce_snapshot!, rest, sweep_concurrency(cube_bytes))
+        end
+        (bulk = identity.(bulk), phase = with_phase ? identity.(phase) : nothing)
+    end
+
+    temporal_series_requested = display_global_evolution ||
+        display_gamma_relations || display_normalized_B_relations ||
+        display_growth_fit || display_phase_B_time || display_energy_time ||
+        display_polarization_time
+
+    function metadata_only_series(label)
+        [(
+            t = Float64(time_unit_Myr) * Float64(time),
+            mach = NaN, mach_alfven = NaN, Bmean = NaN, Brms = NaN,
+            energy_ratio = NaN, kin_mag = NaN, therm_mag = NaN,
+            kin_therm = NaN,
+        ) for time in run_times[label]]
+    end
+
+    metric_series_by_run = temporal_series_requested ? Dict(
+            label => run_metric_series(run_files[label], Float64(gamma),
+                Float64(mean_molecular_weight), Float64(phase_cold_boundary_K),
+                Float64(phase_warm_boundary_K), String(phase_B_weighting),
+                display_phase_B_time && label in comparison_run_labels)
+            for label in analysis_series_labels
+        ) : Dict(
+            label => (bulk = metadata_only_series(label), phase = nothing)
+            for label in analysis_series_labels
+        )
+
+    all_series = Dict(label => metric_series_by_run[label].bulk
+        for label in analysis_series_labels)
+
+    phase_B_series_by_run = display_phase_B_time ? Dict(
+        label => metric_series_by_run[label].phase
+        for label in comparison_run_labels
+    ) : Dict{String, Any}()
+end
+
+# ╔═╡ 36aef377-3de7-435a-af83-3a90421e3159
+md"""
+---
+
+## 5. Magnetic amplification and growth-rate fit
+
+The fitted physical model is $B(t)=A\exp[\Gamma_B(t-t_0)]$, where $t_0$ is the first valid snapshot time and both $A$ and $\Gamma_B$ are inferred from the snapshots in the **Fit window**. Equivalently, the regression is $\ln B=a+\Gamma_B(t-t_0)$ with a free intercept. The shaded interval marks the selected fit range. This avoids treating the first magnetic-field measurement as exact or giving it special leverage in the regression.
+
+The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measured field used only as a plotting normalization. The reported $R^2$ uses the usual mean-centred total sum of squares appropriate to this intercept fit. The theoretical comparison curves remain anchored at the first valid measured snapshot. Because $E_{\mathrm B}\propto B^2$, magnetic energy grows at rate $2\Gamma_B$.
+
+**Display the magnetic growth-rate fit:** $(@bind display_growth_fit PlutoUI.CheckBox(default = false))
+
+| Setting | Control |
+|:--|:--|
+| Fitted field | $(@bind growth_fit_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
+| Fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(run_files[selected_run]); default = min(2, length(run_files[selected_run])):min(4, length(run_files[selected_run])), show_value = true)) |
+| Theoretical $\Gamma_{B,1}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_1 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.01)) |
+| Theoretical $\Gamma_{B,2}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_2 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.03)) |
+| Theoretical $\Gamma_{B,3}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_3 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.05)) |
+| Data and fitted exponential panel | $(@bind show_growth_fit_panel PlutoUI.CheckBox(default = true)) |
+| Theoretical-growth comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
+| Display fitted curve | $(@bind show_growth_fit PlutoUI.CheckBox(default = true)) |
+| Logarithmic $B(t)$ axis in section 6 | $(@bind log_B_time PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 89c33295-34e7-49ec-8d04-52b2aac29cff
+begin
+    growth_series = all_series[selected_run]
+    growth_times = Float64.(getfield.(growth_series, :t))
+    growth_B = growth_fit_field == "Mean field ⟨B⟩" ?
+        Float64.(getfield.(growth_series, :Bmean)) :
+        Float64.(getfield.(growth_series, :Brms))
+    growth_reference_index = findfirst(i -> isfinite(growth_times[i]) &&
+        isfinite(growth_B[i]) && growth_B[i] > 0, eachindex(growth_B))
+    growth_B0 = isnothing(growth_reference_index) ? NaN : growth_B[growth_reference_index]
+    growth_t0 = isnothing(growth_reference_index) ? NaN : growth_times[growth_reference_index]
+    growth_log_B = map(growth_B) do value
+        isfinite(value) && value > 0 ? log(value) : NaN
+    end
+    growth_elapsed_time = growth_times .- growth_t0
+    growth_indices = collect(growth_fit_window)
+    growth_indices = filter(i -> 1 <= i <= length(growth_times) &&
+        isfinite(growth_times[i]) && isfinite(growth_elapsed_time[i]) &&
+        isfinite(growth_log_B[i]), growth_indices)
+
+    function exponential_growth_fit(elapsed_time, log_field, indices)
+        if length(indices) < 2
+            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN, r2 = NaN)
+        end
+        xfit, yfit = elapsed_time[indices], log_field[indices]
+        xmean, ymean = mean(xfit), mean(yfit)
+        centered_x = xfit .- xmean
+        sxx = sum(abs2, centered_x)
+        if sxx <= 0
+            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN, r2 = NaN)
+        end
+        gamma_fit = sum(centered_x .* (yfit .- ymean)) / sxx
+        log_amplitude = ymean - gamma_fit * xmean
+        residuals = yfit .- (log_amplitude .+ gamma_fit .* xfit)
+        ssres = sum(abs2, residuals)
+        sstot = sum(abs2, yfit .- mean(yfit))
+        r2 = sstot > 0 ? 1 - ssres / sstot : NaN
+        gamma_error = length(indices) > 2 ?
+            sqrt((ssres / (length(indices) - 2)) / sxx) : NaN
+        (; log_amplitude, gamma = gamma_fit, gamma_error, r2)
+    end
+
+    growth_fit = exponential_growth_fit(growth_elapsed_time, growth_log_B, growth_indices)
+    theory_gammas = Float64[theory_gamma_1, theory_gamma_2, theory_gamma_3]
+    theory_B_curves = [growth_B0 .* exp.(Γ .* (growth_times .- growth_t0)) for Γ in theory_gammas]
+    fitted_B_curve = exp.(growth_fit.log_amplitude .+ growth_fit.gamma .* growth_elapsed_time)
+    fitted_ratio_curve = fitted_B_curve ./ growth_B0
+    growth_has_interval = !isempty(growth_indices)
+    growth_first_index = growth_has_interval ? first(growth_indices) : missing
+    growth_last_index = growth_has_interval ? last(growth_indices) : missing
+    growth_gamma_text = string(round(growth_fit.gamma; sigdigits = 5))
+    growth_error_text = string(round(growth_fit.gamma_error; sigdigits = 3))
+    growth_r2_text = string(round(growth_fit.r2; sigdigits = 4))
+    growth_amplitude_text = string(round(exp(growth_fit.log_amplitude); sigdigits = 5))
+    growth_energy_gamma_text = string(round(2 * growth_fit.gamma; sigdigits = 5))
+end
+
+# ╔═╡ 8120f7e9-74ed-4a48-b2f4-dbc75ebf0132
+Markdown.parse("""
+### Current fit result
+
+| Quantity | Value |
+|:--|:--|
+| Run and field | **$(selected_run)** — $(growth_fit_field) |
+| Fitted snapshot interval | **$(growth_first_index)–$(growth_last_index)** |
+| Fitted amplitude ``A`` at ``t_0`` | **$(growth_amplitude_text)** ``\\mu\\mathrm{G}`` |
+| Magnetic growth rate ``\\Gamma_B`` | **$(growth_gamma_text)** ``\\mathrm{Myr}^{-1}`` |
+| Standard error ``\\sigma_{\\Gamma_B}`` | **$(growth_error_text)** ``\\mathrm{Myr}^{-1}`` |
+| Coefficient of determination ``R^2`` | **$(growth_r2_text)** |
+| Magnetic-energy growth rate ``2\\Gamma_B`` | **$(growth_energy_gamma_text)** ``\\mathrm{Myr}^{-1}`` |
+""")
+
+# ╔═╡ 71c8ea26-d2ad-4430-9265-0b28d45bba1c
+md"""
+### Interval magnetic-growth rate
+
+The local magnetic-growth rate is evaluated between consecutive snapshots rather than with one fit over the complete selected window:
+
+```math
+\Gamma_{B,i+1/2}
+=\frac{\ln B_{i+1}-\ln B_i}{t_{i+1}-t_i}.
+```
+
+Time, sonic Mach number, and Alfvénic Mach number are assigned their midpoint values over the same interval. Positive $\Gamma_B$ indicates magnetic amplification; negative $\Gamma_B$ indicates decay.
+
+**Display interval growth-rate relations:** $(@bind display_gamma_relations PlutoUI.CheckBox(default = false))
+
+| Growth-rate setting | Control |
+|:--|:--|
+| Magnetic field | $(@bind gamma_relation_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
+| Simulations | Global multi-selection in section 1 |
+| $\Gamma_B(t)$ | $(@bind show_gamma_time PlutoUI.CheckBox(default = true)) |
+| $\Gamma_B(\mathcal{M})$ | $(@bind show_gamma_mach PlutoUI.CheckBox(default = true)) |
+| $\Gamma_B(\mathcal{M}_{\mathrm A})$ | $(@bind show_gamma_alfven_mach PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ f29d5dff-8810-4935-b880-9951bc1239fd
+begin
+    function interval_growth_rate(series, field)
+        times = Float64.(getfield.(series, :t))
+        magnetic_field = Float64.(getfield.(series, field))
+        mach = Float64.(getfield.(series, :mach))
+        mach_alfven = Float64.(getfield.(series, :mach_alfven))
+        length(times) < 2 && return (
+            time = Float64[], gamma = Float64[], mach = Float64[], mach_alfven = Float64[])
+        delta_time = diff(times)
+        gamma_interval = diff(log.(magnetic_field)) ./ delta_time
+        interval_time = (times[1:end-1] .+ times[2:end]) ./ 2
+        interval_mach = (mach[1:end-1] .+ mach[2:end]) ./ 2
+        interval_mach_alfven = (mach_alfven[1:end-1] .+ mach_alfven[2:end]) ./ 2
+        valid = isfinite.(gamma_interval) .& isfinite.(interval_time) .&
+            isfinite.(interval_mach) .& isfinite.(interval_mach_alfven) .&
+            (delta_time .> 0) .& (magnetic_field[1:end-1] .> 0) .&
+            (magnetic_field[2:end] .> 0)
+        (
+            time = interval_time[valid],
+            gamma = gamma_interval[valid],
+            mach = interval_mach[valid],
+            mach_alfven = interval_mach_alfven[valid],
+        )
+    end
+
+    gamma_panel_specs = NamedTuple[]
+    show_gamma_time && push!(gamma_panel_specs,
+        (field = :time, xlabel = L"t\;[\mathrm{Myr}]"))
+    show_gamma_mach && push!(gamma_panel_specs,
+        (field = :mach, xlabel = L"\mathcal{M}"))
+    show_gamma_alfven_mach && push!(gamma_panel_specs,
+        (field = :mach_alfven, xlabel = L"\mathcal{M}_{\mathrm A}"))
+    gamma_runs = comparison_run_labels
+    gamma_field_symbol = gamma_relation_field == "Mean field ⟨B⟩" ? :Bmean : :Brms
+
+    if isempty(gamma_panel_specs)
+        fig_gamma_relations = Figure(size = (900, 180))
+        Label(fig_gamma_relations[1, 1],
+            L"\mathrm{Select\ at\ least\ one\ growth-rate\ relation.}", fontsize = 20)
+    else
+        gamma_ncols = length(gamma_panel_specs) == 1 ? 1 : min(3, length(gamma_panel_specs))
+        fig_gamma_relations = Figure(size = (430gamma_ncols, 450))
+        for (panel_index, spec) in enumerate(gamma_panel_specs)
+            gamma_axis = latex_axis(fig_gamma_relations[1, panel_index],
+                xlabel = spec.xlabel, ylabel = L"\Gamma_B\;[\mathrm{Myr}^{-1}]")
+            hlines!(gamma_axis, [0.0]; color = (:gray35, 0.65),
+                linestyle = :dash, linewidth = 1.5)
+            for label in gamma_runs
+                relation = interval_growth_rate(all_series[label], gamma_field_symbol)
+                horizontal = getfield(relation, spec.field)
+                lines!(gamma_axis, horizontal, relation.gamma;
+                    color = run_colors[label], linewidth = 2.2, label = legend_run_label(label))
+                scatter!(gamma_axis, horizontal, relation.gamma;
+                    color = run_colors[label], markersize = 7)
+            end
+        end
+        Legend(fig_gamma_relations[2, 1:length(gamma_panel_specs)],
+            [LineElement(color = run_colors[label], linewidth = 2.4) for label in gamma_runs],
+            legend_run_label.(gamma_runs); orientation = :horizontal,
+            tellheight = true, framevisible = false)
+    end
+    display_gamma_relations ? fig_gamma_relations : nothing
+end
+
+# ╔═╡ cd7e037c-62f5-4682-92c2-92af7169d692
+md"""
+### Multi-snapshot normalized magnetic evolution
+
+Selected snapshots are superimposed in the same figure using
+
+```math
+\ln\!\left(\frac{B_i}{B_0}\right),
+```
+
+where $B_0$ is the first available snapshot of each run. Color identifies the run; every snapshot uses the same circular marker to keep temporal comparisons readable. All axes remain linear because the logarithm is applied to the magnetic-field ratio itself.
+
+**Display multi-snapshot normalized magnetic evolution:** $(@bind display_normalized_B_relations PlutoUI.CheckBox(default = false))
+
+| Normalized-field relation | Control |
+|:--|:--|
+| Magnetic field | $(@bind normalized_B_relation_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
+| Snapshots displayed | $(@bind normalized_B_snapshot_indices PlutoUI.MultiSelect(collect(1:maximum_snapshot_count); default = unique([1, cld(maximum_snapshot_count, 2), maximum_snapshot_count]))) |
+| Simulations displayed | Global multi-selection in section 1 |
+| $\ln(B/B_0)$ versus $t$ | $(@bind show_normalized_B_time PlutoUI.CheckBox(default = true)) |
+| $\ln(B/B_0)$ versus $\mathcal{M}$ | $(@bind show_normalized_B_mach PlutoUI.CheckBox(default = true)) |
+| $\ln(B/B_0)$ versus $\mathcal{M}_{\mathrm A}$ | $(@bind show_normalized_B_alfven_mach PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 7a4472c3-48c5-44c7-a487-d1021b84ee3a
+begin
+    normalized_B_panel_specs = NamedTuple[]
+    show_normalized_B_time && push!(normalized_B_panel_specs,
+        (field = :t, xlabel = L"t\;[\mathrm{Myr}]"))
+    show_normalized_B_mach && push!(normalized_B_panel_specs,
+        (field = :mach, xlabel = L"\mathcal{M}"))
+    show_normalized_B_alfven_mach && push!(normalized_B_panel_specs,
+        (field = :mach_alfven, xlabel = L"\mathcal{M}_{\mathrm A}"))
+    normalized_B_runs = comparison_run_labels
+    normalized_B_field_symbol = normalized_B_relation_field == "Mean field ⟨B⟩" ? :Bmean : :Brms
+    normalized_B_valid_snapshots = sort(unique(filter(index -> index >= 1,
+        Int.(normalized_B_snapshot_indices))))
+
+    if isempty(normalized_B_panel_specs) || isempty(normalized_B_valid_snapshots) ||
+            isempty(normalized_B_runs)
+        fig_normalized_B_relations = Figure(size = (900, 180))
+        Label(fig_normalized_B_relations[1, 1],
+            L"\mathrm{Select\ at\ least\ one\ relation\ and\ one\ snapshot.}", fontsize = 20)
+    else
+        normalized_B_ncols = length(normalized_B_panel_specs)
+        fig_normalized_B_relations = Figure(size = (430normalized_B_ncols, 500))
+        for (panel_index, spec) in enumerate(normalized_B_panel_specs)
+            axis = latex_axis(fig_normalized_B_relations[1, panel_index],
+                xlabel = spec.xlabel, ylabel = L"\ln(B/B_0)")
+            hlines!(axis, [0.0]; color = (:gray35, 0.65), linestyle = :dash, linewidth = 1.4)
+            for label in normalized_B_runs
+                series = all_series[label]
+                magnetic_field = Float64.(getfield.(series, normalized_B_field_symbol))
+                B0 = first(magnetic_field)
+                available = filter(index -> index <= length(series) &&
+                    isfinite(magnetic_field[index]) && magnetic_field[index] > 0 &&
+                    isfinite(B0) && B0 > 0, normalized_B_valid_snapshots)
+                isempty(available) && continue
+                horizontal_all = Float64.(getfield.(series, spec.field))
+                horizontal = horizontal_all[available]
+                logarithmic_ratio = log.(magnetic_field[available] ./ B0)
+                valid = isfinite.(horizontal) .& isfinite.(logarithmic_ratio)
+                lines!(axis, horizontal[valid], logarithmic_ratio[valid];
+                    color = run_colors[label], linewidth = 2.2)
+                scatter!(axis, horizontal[valid], logarithmic_ratio[valid];
+                    color = run_colors[label], marker = :circle, markersize = 7)
+            end
+        end
+        run_elements = [LineElement(color = run_colors[label], linewidth = 2.4)
+            for label in normalized_B_runs]
+        Legend(fig_normalized_B_relations[2, 1:length(normalized_B_panel_specs)],
+            run_elements, legend_run_label.(normalized_B_runs), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true, framevisible = false)
+    end
+    display_normalized_B_relations ? fig_normalized_B_relations : nothing
+end
+
+# ╔═╡ a7def784-6c52-4f98-9d76-ece082b45229
+begin
+    normalized_B = growth_B ./ growth_B0
+    ln_normalized_B = log.(max.(normalized_B, floatmin(Float64)))
+    growth_panel_count = count(identity, (show_growth_fit_panel, show_growth_theory_panel))
+    if growth_panel_count == 0
+        fig_growth = Figure(size = (900, 180))
+        Label(fig_growth[1, 1], L"\mathrm{Select\ at\ least\ one\ magnetic-growth\ panel.}", fontsize = 20)
+    else
+        fig_growth = Figure(size = (550growth_panel_count, 520))
+        growth_column = 0
+        if show_growth_fit_panel
+            growth_column += 1
+            ag1 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
+                ylabel = L"\ln(B/B_0)")
+            lines!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run],
+                linewidth = 2.5)
+            scatter!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run], markersize = 8)
+            fit_legend_elements = Any[
+                LineElement(color = run_colors[selected_run], linewidth = 2.5),
+            ]
+            fit_legend_labels = LaTeXString[L"\mathrm{Data}"]
+            if show_growth_fit && isfinite(growth_fit.gamma)
+                fit_t = growth_times[growth_indices]
+                fit_log_ratio = growth_fit.log_amplitude - log(growth_B0) .+
+                    growth_fit.gamma .* growth_elapsed_time[growth_indices]
+                lines!(ag1, fit_t, fit_log_ratio; color = :black, linewidth = 3,
+                    linestyle = :dash)
+                push!(fit_legend_elements,
+                    LineElement(color = :black, linewidth = 3, linestyle = :dash))
+                push!(fit_legend_labels, latexstring(
+                    "\\mathrm{Fit}:\\;\\Gamma_B=",
+                    @sprintf("%.4g", growth_fit.gamma),
+                    "\\;\\mathrm{Myr}^{-1}"))
+            end
+            growth_has_interval && vspan!(ag1,
+                growth_times[growth_first_index], growth_times[growth_last_index];
+                color = (:gray50, 0.10))
+            Legend(fig_growth[2, growth_column], fit_legend_elements,
+                fit_legend_labels; orientation = :horizontal, nbanks = 1,
+                tellheight = true, framevisible = false, labelsize = 14)
+        end
+        if show_growth_theory_panel
+            growth_column += 1
+            ag2 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
+                ylabel = L"\ln(B/B_0)")
+            lines!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run],
+                linewidth = 2.5)
+            scatter!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run], markersize = 7)
+            theory_legend_elements = Any[
+                LineElement(color = run_colors[selected_run], linewidth = 2.5),
+            ]
+            theory_legend_labels = LaTeXString[L"\mathrm{Data}"]
+            for (Γ, curve, color) in zip(theory_gammas, theory_B_curves, theory_colors)
+                lines!(ag2, growth_times, log.(curve ./ growth_B0); color, linewidth = 2,
+                    linestyle = :dot)
+                push!(theory_legend_elements,
+                    LineElement(color = color, linewidth = 2, linestyle = :dot))
+                push!(theory_legend_labels, latexstring(
+                    "\\Gamma_B=", @sprintf("%.3g", Γ),
+                    "\\;\\mathrm{Myr}^{-1}"))
+            end
+            if show_growth_fit && isfinite(growth_fit.gamma)
+                lines!(ag2, growth_times, log.(fitted_ratio_curve); color = :black,
+                    linewidth = 2.5, linestyle = :dashdot)
+                push!(theory_legend_elements,
+                    LineElement(color = :black, linewidth = 2.5, linestyle = :dashdot))
+                push!(theory_legend_labels, latexstring(
+                    "\\mathrm{Best\\ fit}:\\;\\Gamma_B=",
+                    @sprintf("%.4g", growth_fit.gamma),
+                    "\\;\\mathrm{Myr}^{-1}"))
+            end
+            growth_has_interval && vspan!(ag2,
+                growth_times[growth_first_index], growth_times[growth_last_index];
+                color = (:gray50, 0.10))
+            Legend(fig_growth[2, growth_column], theory_legend_elements,
+                theory_legend_labels; orientation = :horizontal, nbanks = 2,
+                tellheight = true, framevisible = false, labelsize = 13)
+        end
+        rowgap!(fig_growth.layout, 8)
+    end
+    display_growth_fit ? fig_growth : nothing
+end
+
+# ╔═╡ dcc8f8f3-daaf-4d4b-92a3-4919ed5e36de
+md"""
+---
+
+## 6. Global time evolution
+
+Selected panels compare every discovered run as a function of physical time. Turbulent velocity is measured after subtracting the mass-weighted bulk motion.
+
+$\mathcal{M}=v_{\mathrm{rms}}/c_{s,\mathrm{rms}}$ measures compressibility, while $\mathcal{M}_{\mathrm A}=v_{\mathrm{rms}}/v_{\mathrm A,\mathrm{rms}}$ compares turbulence with Alfvén-wave propagation. Values above unity are supersonic or super-Alfvénic, respectively. Dotted magnetic-field curves show the theoretical exponentials selected in section 5.
+
+**Display global time evolution:** $(@bind display_global_evolution PlutoUI.CheckBox(default = false))
+
+| Time-evolution panel | Display |
+|:--|:--:|
+| Sonic Mach number | $(@bind show_time_mach PlutoUI.CheckBox(default = true)) |
+| Alfvénic Mach number | $(@bind show_time_alfven PlutoUI.CheckBox(default = true)) |
+| Magnetic field | $(@bind show_time_magnetic PlutoUI.CheckBox(default = true)) |
+| Magnetic-to-kinetic energy ratio | $(@bind show_time_energy_ratio PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 3bed2efb-f849-4ddc-9f49-ed5e3d683370
+begin
+    theory_colors = MHD_COLORS[4:6]
+    time_panel_keys = Symbol[]
+    show_time_mach && push!(time_panel_keys, :mach)
+    show_time_alfven && push!(time_panel_keys, :alfven)
+    show_time_magnetic && push!(time_panel_keys, :magnetic)
+    show_time_energy_ratio && push!(time_panel_keys, :energy)
+    if isempty(time_panel_keys)
+        fig_time = Figure(size = (900, 180))
+        Label(fig_time[1, 1], L"\mathrm{Select\ at\ least\ one\ time-evolution\ panel.}", fontsize = 20)
+    else
+        time_ncols = length(time_panel_keys) == 1 ? 1 : 2
+        time_nrows = cld(length(time_panel_keys), time_ncols)
+        fig_time = Figure(size = (560time_ncols, 380time_nrows + 110))
+        time_axes = Dict{Symbol, Any}()
+        for (index, key) in enumerate(time_panel_keys)
+            row, col = cld(index, time_ncols), mod1(index, time_ncols)
+            time_axes[key] = key == :mach ?
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}") :
+                key == :alfven ?
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]", ylabel = L"\mathcal{M}_{\mathrm{A}}") :
+                key == :magnetic ?
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
+                    ylabel = L"B\;[\mu\mathrm{G}]", yscale = log_B_time ? log10 : identity,
+                    yticks = log_B_time ? DECADE_TICKS : Makie.automatic,
+                    yminorticks = log_B_time ? IntervalsBetween(9) : IntervalsBetween(5),
+                    yminorticksvisible = true) :
+                latex_axis(fig_time[row, col], xlabel = L"t\;[\mathrm{Myr}]",
+                    ylabel = L"E_B/E_{\mathrm{kin}}", yscale = log10,
+                    yticks = DECADE_TICKS,
+                    yminorticks = IntervalsBetween(9), yminorticksvisible = true)
+        end
+        for label in comparison_run_labels
+            s = all_series[label]
+            ts = getfield.(s, :t)
+            if haskey(time_axes, :mach)
+                lines!(time_axes[:mach], ts, getfield.(s, :mach);
+                    color = run_colors[label], linewidth = 2)
+                scatter!(time_axes[:mach], ts, getfield.(s, :mach);
+                    color = run_colors[label], markersize = 7)
+            end
+            haskey(time_axes, :alfven) &&
+                lines!(time_axes[:alfven], ts, getfield.(s, :mach_alfven);
+                    color = run_colors[label], linewidth = 2)
+            if haskey(time_axes, :magnetic)
+                lines!(time_axes[:magnetic], ts, getfield.(s, :Bmean);
+                    color = run_colors[label], linewidth = 2)
+                lines!(time_axes[:magnetic], ts, getfield.(s, :Brms);
+                    color = run_colors[label], linestyle = :dash)
+            end
+            haskey(time_axes, :energy) &&
+                lines!(time_axes[:energy], ts, getfield.(s, :energy_ratio);
+                    color = run_colors[label], linewidth = 2)
+        end
+        if haskey(time_axes, :magnetic)
+            for (Γ, curve, color) in zip(theory_gammas, theory_B_curves, theory_colors)
+                lines!(time_axes[:magnetic], growth_times, curve;
+                    color, linewidth = 2, linestyle = :dot)
+            end
+            if show_growth_fit && isfinite(growth_fit.gamma)
+                lines!(time_axes[:magnetic], growth_times, fitted_B_curve;
+                    color = :black, linewidth = 2.5, linestyle = :dashdot)
+            end
+            growth_has_interval && vspan!(time_axes[:magnetic],
+                growth_times[growth_first_index], growth_times[growth_last_index];
+                color = (:gray50, 0.10))
+            ylims!(time_axes[:magnetic], high = 15.0)
+        end
+
+        time_legend_layout = GridLayout(fig_time[time_nrows + 1, 1:time_ncols])
+        time_legend_column = 1
+        Legend(time_legend_layout[1, time_legend_column],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), "Simulation";
+            orientation = :horizontal, tellheight = true, framevisible = false,
+            labelsize = 11)
+        if haskey(time_axes, :magnetic)
+            time_legend_column += 1
+            Legend(time_legend_layout[1, time_legend_column], [
+                LineElement(color = :gray25, linewidth = 2.5, linestyle = :solid),
+                LineElement(color = :gray25, linewidth = 2.5, linestyle = :dash),
+            ], ["⟨B⟩", "Bᵣₘₛ"], "Magnetic statistic";
+                orientation = :horizontal, tellheight = true, framevisible = false,
+                labelsize = 11)
+
+            model_elements = Any[
+                LineElement(color = color, linewidth = 2.2, linestyle = :dot)
+                for color in theory_colors
+            ]
+            model_labels = Any[legend_rate_label(Γ) for Γ in theory_gammas]
+            if show_growth_fit && isfinite(growth_fit.gamma)
+                push!(model_elements,
+                    LineElement(color = :black, linewidth = 2.5, linestyle = :dashdot))
+                push!(model_labels, legend_rate_label(growth_fit.gamma; fitted = true))
+            end
+            time_legend_column += 1
+            Legend(time_legend_layout[1, time_legend_column],
+                model_elements, model_labels, "Selected-run model";
+                orientation = :horizontal, tellheight = true, framevisible = false,
+                labelsize = 11)
+        end
+    end
+    stable_pluto_figure(display_global_evolution, fig_time)
+end
+
+# ╔═╡ 62bb58f1-37c3-4adb-a7fc-939f71a56635
+md"""
+### Magnetic field by thermal phase
+
+This diagnostic follows the magnetic-field strength after dividing every snapshot into three temperature phases. The phase boundaries are adjustable. **Volume average** assigns the same weight to every cell, while **Density-weighted average** uses $w_i=\rho_i$. The displayed phase mean and RMS are
+
+```math
+\langle |B|\rangle_{w,\phi}=\frac{\sum_{i\in\phi}w_i|B_i|}{\sum_{i\in\phi}w_i},\qquad
+B_{\mathrm{rms},w,\phi}=\left(\frac{\sum_{i\in\phi}w_iB_i^2}{\sum_{i\in\phi}w_i}\right)^{1/2},
+```
+
+with $w_i=1$ for volume normalization or $w_i=\rho_i$ for density normalization. Values are shown in $\mu\mathrm G$; no additional normalization by a global $B_0$ is applied in this phase diagnostic.
+
+```math
+\mathrm{CNM}:\ T<T_{\mathrm C},\qquad
+\mathrm{LNM}:\ T_{\mathrm C}\leq T<T_{\mathrm W},\qquad
+\mathrm{WNM}:\ T\geq T_{\mathrm W}.
+```
+
+**Display magnetic field by phase:** $(@bind display_phase_B_time PlutoUI.CheckBox(default = false))
+
+| Phase-field setting | Control |
+|:--|:--|
+| Cold/Lukewarm boundary $T_{\mathrm C}$ [$\mathrm{K}$] | $(@bind phase_cold_boundary_K PlutoUI.NumberField(10.0:10.0:5000.0; default = 200.0)) |
+| Lukewarm/Warm boundary $T_{\mathrm W}$ [$\mathrm{K}$] | $(@bind phase_warm_boundary_K PlutoUI.NumberField(100.0:50.0:50000.0; default = 2000.0)) |
+| Magnetic statistic | $(@bind phase_B_statistic PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
+| Phase normalization | $(@bind phase_B_weighting PlutoUI.Select(["Volume average" => "volume", "Density-weighted average" => "density"]; default = "volume")) |
+| Logarithmic $B$ axis | $(@bind log_phase_B_time PlutoUI.CheckBox(default = true)) |
+| CNM curve | $(@bind show_phase_B_cold PlutoUI.CheckBox(default = true)) |
+| LNM curve | $(@bind show_phase_B_lukewarm PlutoUI.CheckBox(default = true)) |
+| WNM curve | $(@bind show_phase_B_warm PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ d56a8ba3-aa42-4351-a065-87275032a342
+begin
+    phase_B_specs = NamedTuple[]
+    show_phase_B_cold && push!(phase_B_specs,
+        (key = :cold, label = "CNM", linestyle = :solid))
+    show_phase_B_lukewarm && push!(phase_B_specs,
+        (key = :lukewarm, label = "LNM", linestyle = :dash))
+    show_phase_B_warm && push!(phase_B_specs,
+        (key = :warm, label = "WNM", linestyle = :dot))
+
+    if !display_phase_B_time
+        fig_phase_B_time = Figure(size = (900, 180))
+    elseif isempty(phase_B_specs)
+        fig_phase_B_time = Figure(size = (900, 180))
+        Label(fig_phase_B_time[1, 1],
+            L"\mathrm{Select\ at\ least\ one\ thermal\ phase.}", fontsize = 20)
+    else
+        fig_phase_B_time = Figure(size = (760, 480))
+        phase_B_ylabel = phase_B_statistic == "Mean field ⟨B⟩" ?
+            L"\langle |B|\rangle_{\mathrm{phase}}\;[\mu\mathrm{G}]" :
+            L"B_{\mathrm{rms,phase}}\;[\mu\mathrm{G}]"
+        phase_B_axis = latex_axis(fig_phase_B_time[1, 1],
+            xlabel = L"t\;[\mathrm{Myr}]", ylabel = phase_B_ylabel,
+            yscale = log_phase_B_time ? log10 : identity,
+            yticks = log_phase_B_time ? DECADE_TICKS : Makie.automatic,
+            yminorticks = log_phase_B_time ? IntervalsBetween(9) : IntervalsBetween(5),
+            yminorticksvisible = true)
+        statistic_suffix = phase_B_statistic == "Mean field ⟨B⟩" ? "mean" : "rms"
+        for label in comparison_run_labels, spec in phase_B_specs
+            phase_B_series = phase_B_series_by_run[label]
+            phase_B_times = Float64.(getfield.(phase_B_series, :t))
+            field = Symbol("B_", spec.key, "_", statistic_suffix)
+            values = Float64.(getfield.(phase_B_series, field))
+            valid = isfinite.(phase_B_times) .& isfinite.(values) .&
+                (log_phase_B_time ? values .> 0 : trues(length(values)))
+            lines!(phase_B_axis, phase_B_times[valid], values[valid];
+                color = run_colors[label], linestyle = spec.linestyle, linewidth = 2.6)
+            scatter!(phase_B_axis, phase_B_times[valid], values[valid];
+                color = run_colors[label], marker = :circle, markersize = 7)
+        end
+        Legend(fig_phase_B_time[2, 1],
+            [[LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+             [LineElement(color = :gray25, linestyle = spec.linestyle, linewidth = 2.5)
+                for spec in phase_B_specs]],
+            [legend_run_label.(comparison_run_labels), [spec.label for spec in phase_B_specs]],
+            ["Simulation", "Phase"];
+            orientation = :horizontal, tellheight = true, framevisible = false)
+    end
+    display_phase_B_time ? fig_phase_B_time : nothing
+end
+
+# ╔═╡ 1be45ca2-bd2f-4b77-9188-5b338d41483b
+md"""
+---
+
+## 7. Normalized magnetic-field distribution
+
+The map shows the active run's line-of-sight mean of $\log_{10}(B/\langle B\rangle)$. The PDF compares every selected simulation using shared bins and every cell of the corresponding cube. A value of zero corresponds to each cube's mean field strength; positive and negative values identify locally stronger and weaker fields.
+
+**Display the normalized magnetic-field distribution:** $(@bind display_normalized_field PlutoUI.CheckBox(default = true))
+
+| Normalized-field panel | Display |
+|:--|:--:|
+| $\log_{10}(B/\langle B\rangle)$ map | $(@bind show_logB_map PlutoUI.CheckBox(default = true)) |
+| $\log_{10}(B/\langle B\rangle)$ PDF | $(@bind show_logB_histogram PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 89420b8d-c72e-4a04-91dd-043bc9ecef2e
+begin
+    logB = safe_log10.(mag.B ./ finite_mean(mag.B))
+    logB_map = finite_mean_dims(logB, los_dim)
+    logB_panel_count = count(identity, (show_logB_map, show_logB_histogram))
+    if logB_panel_count == 0
+        fig_logB = Figure(size = (900, 180))
+        Label(fig_logB[1, 1], L"\mathrm{Select\ a\ normalized-field\ panel.}", fontsize = 20)
+    else
+        fig_logB = Figure(size = (530logB_panel_count, 390))
+        logB_column = 0
+        if show_logB_map
+            logB_column += 1
+            map_panel = fig_logB[1, logB_column] = GridLayout()
+            axmap = latex_axis(map_panel[1, 1],
+                xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+                ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
+            limB = max(maximum(abs, filter(isfinite, vec(logB_map)); init = 0.0),
+                sqrt(eps(Float64)))
+            hb = heatmap!(axmap, sky_coordinates[1], sky_coordinates[2], logB_map;
+                colormap = :balance, colorrange = (-limB, limB))
+            latex_colorbar(map_panel[1, 2], hb,
+                label = L"\log_{10}(B/\langle B\rangle)", tickformat = latex_ticklabels)
+            colsize!(map_panel, 2, 22)
+        end
+        if show_logB_histogram
+            logB_column += 1
+            axhist = latex_axis(fig_logB[1, logB_column],
+                xlabel = L"\log_{10}(B/\langle B\rangle)", ylabel = L"\mathcal{P}")
+            for label in comparison_run_labels
+                logB_ratio_x, logB_ratio_p = normalized_B_pdfs[label]
+                lines!(axhist, logB_ratio_x, logB_ratio_p;
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
+            end
+            axislegend(axhist; position = :rt, framevisible = false)
+        end
+    end
+    display_normalized_field ? fig_logB : nothing
+end
+
+# ╔═╡ b1000001-6f8c-4d0c-9a10-000000000001
+md"""
+---
+
+## Magnetic field--density analysis
+
+| Diagnostic | Control |
+|:--|:--|
+| Display the comparative $B$--$n$ relation | $(@bind display_bn_relation PlutoUI.CheckBox(default = true)) |
+| Minimum density used by the $B\propto n^\kappa$ fit [$\mathrm{cm}^{-3}$; $0$ uses all bins] | $(@bind bn_fit_min_density PlutoUI.NumberField(default = 0.0)) |
+| Display the 3D HRO | $(@bind display_hro PlutoUI.CheckBox(default = true)) |
+| Number of HRO density intervals | $(@bind hro_density_bin_count PlutoUI.Slider(4:1:20; default = 10, show_value = true)) |
+| Display the projected HOG | $(@bind display_hog PlutoUI.CheckBox(default = true)) |
+| HOG Gaussian smoothing FWHM [pixels] | $(@bind hog_smoothing_fwhm_pix PlutoUI.NumberField(0.0:0.5:20.0; default = 2.0)) |
+| HOG gradient rejection percentile | $(@bind hog_gradient_percentile PlutoUI.Slider(0.0:5.0:90.0; default = 20.0, show_value = true)) |
+| Apply HOG to $\log_{10}$ maps | $(@bind hog_logarithmic_maps PlutoUI.CheckBox(default = true)) |
+
+HRO compares $\mathbf B$ with three-dimensional iso-density structures. HOG compares the gradients of projected $N_{\rm H}$ and density-weighted $|B|$. All selected simulations use the active snapshot index and line of sight.
+"""
+
+# ╔═╡ b1000002-6f8c-4d0c-9a10-000000000002
+begin
+    function magnetic_density_samples(c)
+        local_n = number_density(c.rho)
+        local_B = GAUSS_TO_MICROGAUSS .* magnetic_fields(c).B
+        valid = isfinite.(local_n) .& isfinite.(local_B) .&
+            (local_n .> 0) .& (local_B .> 0)
+        (logn = log10.(Float64.(local_n[valid])),
+            logB = log10.(Float64.(local_B[valid])))
+    end
+
+    function binned_magnetic_density(samples, logn_edges)
+        centers = (logn_edges[1:end-1] .+ logn_edges[2:end]) ./ 2
+        medians = fill(NaN, length(centers))
+        lower = fill(NaN, length(centers))
+        upper = fill(NaN, length(centers))
+        counts = zeros(Int, length(centers))
+        for bin in eachindex(centers)
+            members = (samples.logn .>= logn_edges[bin]) .&
+                (samples.logn .< logn_edges[bin + 1])
+            values = samples.logB[members]
+            counts[bin] = length(values)
+            length(values) >= 4 || continue
+            lower[bin], medians[bin], upper[bin] = quantile(values, (0.16, 0.50, 0.84))
+        end
+        (; centers, medians, lower, upper, counts)
+    end
+
+    function magnetic_density_fit(profile, minimum_density)
+        valid = isfinite.(profile.centers) .& isfinite.(profile.medians) .&
+            (profile.counts .>= 4)
+        minimum_density > 0 &&
+            (valid .&= profile.centers .>= log10(Float64(minimum_density)))
+        x, y = profile.centers[valid], profile.medians[valid]
+        length(x) >= 2 || return (slope = NaN, intercept = NaN)
+        xmean, ymean = mean(x), mean(y)
+        denominator = sum(abs2, x .- xmean)
+        denominator > 0 || return (slope = NaN, intercept = NaN)
+        slope = sum((x .- xmean) .* (y .- ymean)) / denominator
+        (slope = slope, intercept = ymean - slope * xmean)
+    end
+
+    bn_samples_by_run = Dict(label => magnetic_density_samples(comparison_cube(label))
+        for label in comparison_run_labels)
+    all_bn_logn = vcat([bn_samples_by_run[label].logn for label in comparison_run_labels]...)
+    all_bn_logB = vcat([bn_samples_by_run[label].logB for label in comparison_run_labels]...)
+    bn_nlo, bn_nhi = quantile(all_bn_logn, (0.001, 0.999))
+    bn_Blo, bn_Bhi = quantile(all_bn_logB, (0.001, 0.999))
+    if !(bn_nhi > bn_nlo)
+        bn_nlo, bn_nhi = bn_nlo - 0.5, bn_nhi + 0.5
+    end
+    if !(bn_Bhi > bn_Blo)
+        bn_Blo, bn_Bhi = bn_Blo - 0.5, bn_Bhi + 0.5
+    end
+    bn_logn_edges = collect(range(bn_nlo, bn_nhi; length = Int(nbins) + 1))
+    bn_logB_edges = collect(range(bn_Blo, bn_Bhi; length = Int(nbins) + 1))
+    bn_profiles = Dict(label => binned_magnetic_density(
+            bn_samples_by_run[label], bn_logn_edges)
+        for label in comparison_run_labels)
+    bn_fits = Dict(label => magnetic_density_fit(
+            bn_profiles[label], Float64(bn_fit_min_density))
+        for label in comparison_run_labels)
+
+    active_bn_samples = haskey(bn_samples_by_run, selected_run) ?
+        bn_samples_by_run[selected_run] : magnetic_density_samples(cube)
+    active_bn_histogram = fit(Histogram,
+        (clamp.(active_bn_samples.logn, bn_nlo, prevfloat(bn_nhi)),
+            clamp.(active_bn_samples.logB, bn_Blo, prevfloat(bn_Bhi))),
+        (bn_logn_edges, bn_logB_edges))
+    bn_histogram_total = sum(active_bn_histogram.weights)
+    bn_log_probability = map(active_bn_histogram.weights) do weight
+        weight > 0 && bn_histogram_total > 0 ? log10(weight / bn_histogram_total) : NaN
+    end
+    nothing
+end
+
+# ╔═╡ b1000003-6f8c-4d0c-9a10-000000000003
+begin
+    fig_bn = Figure(size = (1100, 470))
+    bn_panel = fig_bn[1, 1] = GridLayout()
+    bn_joint_axis = latex_axis(bn_panel[1, 1],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"|B|\;[\mu\mathrm{G}]",
+        xscale = log10, yscale = log10,
+        xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+        xminorticksvisible = true, yminorticksvisible = true)
+    bn_heatmap = heatmap!(bn_joint_axis, 10.0 .^ bn_logn_edges,
+        10.0 .^ bn_logB_edges, bn_log_probability; colormap = :magma)
+    latex_colorbar(bn_panel[1, 2], bn_heatmap,
+        label = L"\log_{10}\mathcal{P}_{\mathrm{bin}}")
+    colsize!(bn_panel, 2, 22)
+
+    bn_relation_axis = latex_axis(fig_bn[1, 2],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"|B|\;[\mu\mathrm{G}]",
+        xscale = log10, yscale = log10,
+        xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+        xminorticksvisible = true, yminorticksvisible = true)
+    for label in comparison_run_labels
+        profile = bn_profiles[label]
+        valid = isfinite.(profile.medians)
+        x = 10.0 .^ profile.centers[valid]
+        median_B = 10.0 .^ profile.medians[valid]
+        band!(bn_relation_axis, x, 10.0 .^ profile.lower[valid],
+            10.0 .^ profile.upper[valid]; color = (run_colors[label], 0.15))
+        lines!(bn_relation_axis, x, median_B; color = run_colors[label], linewidth = 2.8)
+        scatter!(bn_relation_axis, x, median_B; color = run_colors[label], markersize = 6)
+        fit_result = bn_fits[label]
+        if isfinite(fit_result.slope) && !isempty(x)
+            fit_x = extrema(x)
+            fit_y = 10.0 .^ (fit_result.intercept .+
+                fit_result.slope .* log10.(collect(fit_x)))
+            lines!(bn_relation_axis, collect(fit_x), fit_y;
+                color = run_colors[label], linestyle = :dash, linewidth = 2,
+                label = latexstring(legend_run_label(label),
+                    raw";\;\kappa=", @sprintf("%.3f", fit_result.slope)))
+        end
+    end
+    axislegend(bn_relation_axis; position = :lt, framevisible = false)
+    stable_pluto_figure(display_bn_relation, fig_bn)
+end
+
+# ╔═╡ b1000004-6f8c-4d0c-9a10-000000000004
+begin
+    function hro_products(c, density_bin_count; angle_bin_count = 18)
+        local_n = number_density(c.rho)
+        log_density = safe_log10.(local_n)
+        spacing = c.L ./ size(c.rho)
+        gx = periodic_derivative(log_density, 1, spacing[1])
+        gy = periodic_derivative(log_density, 2, spacing[2])
+        gz = periodic_derivative(log_density, 3, spacing[3])
+        gradient_norm = sqrt.(gx .^ 2 .+ gy .^ 2 .+ gz .^ 2)
+        field_norm = magnetic_fields(c).B
+        valid = isfinite.(log_density) .& isfinite.(gradient_norm) .&
+            isfinite.(field_norm) .& (gradient_norm .> 0) .& (field_norm .> 0)
+        cosine_gradient = abs.(c.bx .* gx .+ c.by .* gy .+ c.bz .* gz) ./
+            max.(field_norm .* gradient_norm, eps(Float64))
+        # 0°: B follows an isodensity structure; 90°: B crosses it.
+        angles = asind.(clamp.(cosine_gradient[valid], 0.0, 1.0))
+        densities = log_density[valid]
+        probability_edges = collect(range(0.0, 1.0; length = density_bin_count + 1))
+        density_edges = unique(quantile(densities, probability_edges))
+        length(density_edges) >= 2 || (density_edges = [minimum(densities), maximum(densities) + eps()])
+        angle_edges = collect(range(0.0, 90.0; length = angle_bin_count + 1))
+        angle_centers = (angle_edges[1:end-1] .+ angle_edges[2:end]) ./ 2
+        bin_count = length(density_edges) - 1
+        histograms = zeros(Float64, length(angle_centers), bin_count)
+        shape = fill(NaN, bin_count)
+        density_centers = fill(NaN, bin_count)
+        counts = zeros(Int, bin_count)
+        for bin in 1:bin_count
+            members = (densities .>= density_edges[bin]) .&
+                (bin == bin_count ? densities .<= density_edges[bin + 1] :
+                    densities .< density_edges[bin + 1])
+            local_angles = angles[members]
+            counts[bin] = length(local_angles)
+            isempty(local_angles) && continue
+            density_centers[bin] = median(densities[members])
+            histogram = fit(Histogram, local_angles, angle_edges).weights
+            histograms[:, bin] .= histogram ./ max(sum(histogram), 1)
+            central = count(angle -> angle < 22.5, local_angles)
+            edge = count(angle -> angle > 67.5, local_angles)
+            shape[bin] = (central - edge) / max(central + edge, 1)
+        end
+        (; angle_centers, histograms, density_centers, shape, counts)
+    end
+
+    hro_by_run = Dict(label => hro_products(
+            comparison_cube(label), Int(hro_density_bin_count))
+        for label in comparison_run_labels)
+    active_hro = haskey(hro_by_run, selected_run) ? hro_by_run[selected_run] :
+        hro_products(cube, Int(hro_density_bin_count))
+
+    fig_hro = Figure(size = (1100, 470))
+    hro_hist_axis = latex_axis(fig_hro[1, 1],
+        xlabel = L"\phi_{B,\,\mathrm{structure}}\;[{}^\circ]",
+        ylabel = L"\mathcal{P}(\phi)")
+    representative_bins = unique([1, cld(size(active_hro.histograms, 2), 2),
+        size(active_hro.histograms, 2)])
+    for (style_index, bin) in enumerate(representative_bins)
+        isfinite(active_hro.density_centers[bin]) || continue
+        lines!(hro_hist_axis, active_hro.angle_centers,
+            active_hro.histograms[:, bin]; color = MHD_COLORS[style_index],
+            linewidth = 2.8,
+            label = latexstring(raw"n_{\mathrm{med}}=",
+                @sprintf("%.3g", 10.0^active_hro.density_centers[bin]),
+                raw"\;\mathrm{cm}^{-3}"))
+    end
+    axislegend(hro_hist_axis; position = :ct, framevisible = false)
+
+    hro_shape_axis = latex_axis(fig_hro[1, 2],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"\zeta_{\mathrm{HRO}}",
+        xscale = log10, xticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+    hlines!(hro_shape_axis, [0.0]; color = (:gray45, 0.65), linestyle = :dash)
+    for label in comparison_run_labels
+        product = hro_by_run[label]
+        valid = isfinite.(product.density_centers) .& isfinite.(product.shape)
+        lines!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
+            product.shape[valid]; color = run_colors[label], linewidth = 2.8,
+            label = latexstring(legend_run_label(label)))
+        scatter!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
+            product.shape[valid]; color = run_colors[label], markersize = 6)
+    end
+    axislegend(hro_shape_axis; position = :lb, framevisible = false)
+    stable_pluto_figure(display_hro, fig_hro)
+end
+
+# ╔═╡ b1000005-6f8c-4d0c-9a10-000000000005
+begin
+    function periodic_gaussian_smooth_2d(image, fwhm_pixels)
+        fwhm_pixels <= 0 && return Float64.(image)
+        nx, ny = size(image)
+        sigma = Float64(fwhm_pixels) / (2sqrt(2log(2)))
+        kx = reshape([i <= nx ÷ 2 ? i : i - nx for i in 0:nx-1] ./ nx, nx, 1)
+        ky = reshape([j <= ny ÷ 2 ? j : j - ny for j in 0:ny-1] ./ ny, 1, ny)
+        transfer = @. exp(-2pi^2 * sigma^2 * (kx^2 + ky^2))
+        valid = isfinite.(image)
+        filled = ifelse.(valid, Float64.(image), 0.0)
+        smoothed = real.(ifft(fft(filled) .* transfer))
+        normalization = real.(ifft(fft(Float64.(valid)) .* transfer))
+        map((value, weight) -> weight > sqrt(eps(Float64)) ? value / weight : NaN,
+            smoothed, normalization)
+    end
+
+    function hog_products(c, line_of_sight, plane_dimensions;
+            smoothing_fwhm = 2.0, gradient_percentile = 20.0,
+            logarithmic_maps = true, angle_bin_count = 18)
+        local_n = number_density(c.rho)
+        local_B = GAUSS_TO_MICROGAUSS .* magnetic_fields(c).B
+        column = finite_sum_dims(local_n, line_of_sight)
+        projected_B = weighted_project(local_B, c.rho, line_of_sight)
+        image1 = logarithmic_maps ? safe_log10.(column) : Float64.(column)
+        image2 = logarithmic_maps ? safe_log10.(projected_B) : Float64.(projected_B)
+        image1 = periodic_gaussian_smooth_2d(image1, smoothing_fwhm)
+        image2 = periodic_gaussian_smooth_2d(image2, smoothing_fwhm)
+        d1x = periodic_derivative(image1, 1, 1.0)
+        d1y = periodic_derivative(image1, 2, 1.0)
+        d2x = periodic_derivative(image2, 1, 1.0)
+        d2y = periodic_derivative(image2, 2, 1.0)
+        norm1, norm2 = hypot.(d1x, d1y), hypot.(d2x, d2y)
+        positive1 = filter(x -> isfinite(x) && x > 0, vec(norm1))
+        positive2 = filter(x -> isfinite(x) && x > 0, vec(norm2))
+        threshold1 = isempty(positive1) ? 0.0 : quantile(positive1, gradient_percentile / 100)
+        threshold2 = isempty(positive2) ? 0.0 : quantile(positive2, gradient_percentile / 100)
+        valid = isfinite.(d1x) .& isfinite.(d1y) .& isfinite.(d2x) .&
+            isfinite.(d2y) .& (norm1 .> threshold1) .& (norm2 .> threshold2)
+        dot_product = d1x .* d2x .+ d1y .* d2y
+        cosine = abs.(dot_product[valid]) ./
+            max.(norm1[valid] .* norm2[valid], eps(Float64))
+        angles = acosd.(clamp.(cosine, 0.0, 1.0))
+        angle_edges = collect(range(0.0, 90.0; length = angle_bin_count + 1))
+        angle_centers = (angle_edges[1:end-1] .+ angle_edges[2:end]) ./ 2
+        histogram = isempty(angles) ? zeros(length(angle_centers)) :
+            Float64.(fit(Histogram, angles, angle_edges).weights)
+        sum(histogram) > 0 && (histogram ./= sum(histogram))
+        cos2 = cosd.(2 .* angles)
+        sin2 = sind.(2 .* angles)
+        normalized_prs = isempty(cos2) ? NaN : mean(cos2)
+        prs = isempty(cos2) ? NaN : sum(cos2) / sqrt(length(cos2) / 2)
+        rvl = isempty(cos2) ? NaN : hypot(mean(cos2), mean(sin2))
+        (; angle_centers, histogram, normalized_prs, prs, rvl,
+            ngood = length(angles))
+    end
+
+    hog_by_run = Dict(label => hog_products(comparison_cube(label), los_dim, sky_dims;
+            smoothing_fwhm = Float64(hog_smoothing_fwhm_pix),
+            gradient_percentile = Float64(hog_gradient_percentile),
+            logarithmic_maps = hog_logarithmic_maps)
+        for label in comparison_run_labels)
+
+    fig_hog = Figure(size = (1100, 470))
+    hog_hist_axis = latex_axis(fig_hog[1, 1],
+        xlabel = L"\phi_{\nabla N_{\mathrm H},\,\nabla |B|}\;[{}^\circ]",
+        ylabel = L"\mathcal{P}(\phi)")
+    for label in comparison_run_labels
+        product = hog_by_run[label]
+        lines!(hog_hist_axis, product.angle_centers, product.histogram;
+            color = run_colors[label], linewidth = 2.8,
+            label = latexstring(legend_run_label(label)))
+    end
+    axislegend(hog_hist_axis; position = :rt, framevisible = false)
+
+    hog_positions = collect(1:length(comparison_run_labels))
+    hog_values = [hog_by_run[label].normalized_prs for label in comparison_run_labels]
+    hog_prs_axis = latex_axis(fig_hog[1, 2],
+        xlabel = L"\mathrm{simulation}", ylabel = L"V/V_{\max}",
+        xticks = hog_positions,
+        xtickformat = values -> [latexstring(legend_run_label(
+            comparison_run_labels[clamp(round(Int, value), 1,
+                length(comparison_run_labels))])) for value in values])
+    hlines!(hog_prs_axis, [0.0]; color = (:gray45, 0.65), linestyle = :dash)
+    barplot!(hog_prs_axis, hog_positions, hog_values;
+        color = [run_colors[label] for label in comparison_run_labels])
+    stable_pluto_figure(display_hog, fig_hog)
+end
+
+# ╔═╡ 298bd579-bb28-48b7-8c55-ea74804b9837
+md"""
+---
+
+## 8. Energy partition by density and time
+
+### Density-binned energy ratios
+
+The figure compares three energy ratios as functions of physical number density. Color identifies the simulation run and line style identifies the snapshot. The horizontal reference at unity marks equal energies; values above unity indicate that the numerator dominates.
+
+Each point is a ratio of energies summed within one density bin, rather than a mean of cell-by-cell ratios. The CGS energy densities are $E_{\mathrm{kin}}=\rho|\delta\mathbf v|^2/2$, $E_{\mathrm{mag}}=B^2/(8\pi)$, and $E_{\mathrm{therm}}=P/(\gamma-1)$ in $\mathrm{erg\,cm}^{-3}$. For $\gamma=1$, the notebook adopts the isothermal convention $E_{\mathrm{therm}}=P$. Cubes selected for the comparative profiles are read and reduced to these per-cell quantities in a separate Pluto cell; changing $\gamma$ or the density bins therefore rebins the cached arrays without rereading the RAMSES files.
+
+**Display energy ratios by density:** $(@bind display_energy_ratios PlutoUI.CheckBox(default = true))
+
+**Display energy ratios versus time:** $(@bind display_energy_time PlutoUI.CheckBox(default = false))
+
+| Setting | Control |
+|:--|:--|
+| Snapshots shown in energy reports | $(@bind energy_snapshot_indices PlutoUI.MultiSelect(collect(1:maximum_snapshot_count); default = [min(Int(selected_snapshot), maximum_snapshot_count)])) |
+| $E_{\mathrm{kin}}/E_{\mathrm{mag}}$ | $(@bind show_energy_kin_mag PlutoUI.CheckBox(default = true)) |
+| $E_{\mathrm{therm}}/E_{\mathrm{mag}}$ | $(@bind show_energy_therm_mag PlutoUI.CheckBox(default = true)) |
+| $E_{\mathrm{kin}}/E_{\mathrm{therm}}$ | $(@bind show_energy_kin_therm PlutoUI.CheckBox(default = true)) |
+
+### Time evolution of the energy ratios
+
+The same ratio checkboxes select the time-evolution panels. Each curve uses energies integrated over the complete simulation volume. Color identifies the run, and the horizontal reference at unity marks equipartition.
+"""
+
+# ╔═╡ e4a64ef5-9e6e-4ae2-8daf-42e4fc1724ba
+begin
+    function energy_density_samples(c)
+        m = magnetic_fields(c)
+        u = turbulent_velocity(c)
+        (
+            log_density = vec(safe_log10.(number_density(c.rho))),
+            emag = vec(m.B2 ./ (8pi)),
+            ekin = vec(0.5 .* c.rho .* u.dv2 .* KM_CM^2),
+            pressure = vec(Float64.(c.P)),
+        )
+    end
+
+    function energy_ratios_by_density(samples, edges, gamma)
+        s = samples.log_density
+        Emag = samples.emag
+        Ekin = samples.ekin
+        pressure = samples.pressure
+        thermal_factor = gamma > 1 + sqrt(eps(Float64)) ? 1 / (gamma - 1) : 1.0
+        idx = clamp.(searchsortedlast.(Ref(edges), s), 1, length(edges) - 1)
+        emag = zeros(length(edges) - 1)
+        ekin = zeros(length(edges) - 1)
+        etherm = zeros(length(edges) - 1)
+        for i in eachindex(idx)
+            b = idx[i]
+            Etherm = thermal_factor * pressure[i]
+            if isfinite(s[i]) && isfinite(Emag[i]) && isfinite(Ekin[i]) &&
+                    isfinite(Etherm) && edges[b] <= s[i] <= edges[b + 1]
+                emag[b] += Emag[i]
+                ekin[b] += Ekin[i]
+                etherm[b] += Etherm
+            end
+        end
+        positive_ratio(numerator, denominator) = [
+            numerator[i] > 0 && denominator[i] > 0 ? numerator[i] / denominator[i] : NaN
+            for i in eachindex(numerator)
+        ]
+        (
+            kin_mag = positive_ratio(ekin, emag),
+            therm_mag = positive_ratio(etherm, emag),
+            kin_therm = positive_ratio(ekin, etherm),
+            mag_kin = positive_ratio(emag, ekin),
+        )
+    end
+
+end
+
+# ╔═╡ a1bf5e62-ecb8-47d7-8692-c33929c831ac
+selected_energy_samples = energy_density_samples(cube)
+
+# ╔═╡ 5983ddd0-3ea9-4304-a1e2-390065309aef
+begin
+    density_values = finite_values(logn)
+    isempty(density_values) && error("No finite positive density is available.")
+    density_lo, density_hi = quantile(density_values, (0.001, 0.999))
+    density_lo == density_hi && ((density_lo, density_hi) =
+        (density_lo - 0.5, density_hi + 0.5))
+    density_edges = range(density_lo, density_hi; length = nbins + 1)
+    density_centers = (density_edges[1:end-1] .+ density_edges[2:end]) ./ 2
+    density_number_centers = 10.0 .^ density_centers
+    selected_energy_ratios = energy_ratios_by_density(
+        selected_energy_samples, density_edges, gamma)
+end
+
+# ╔═╡ b7c04a6f-b24d-48ca-97d2-5a77d297aa8d
+begin
+    valid_energy_snapshots = sort(unique(filter(i -> i >= 1, Int.(energy_snapshot_indices))))
+    energy_profiles = Dict{Tuple{String, Int}, Any}()
+    for label in comparison_run_labels
+        for snapshot_index in valid_energy_snapshots
+            snapshot_index <= length(run_files[label]) || continue
+            # Build and retain only the one-dimensional profile. The cube from
+            # this iteration becomes collectible before the next file is read.
+            local_cube = label == selected_run && snapshot_index == selected_snapshot ?
+                cube : load_cube(run_files[label][snapshot_index])
+            local_samples = energy_density_samples(local_cube)
+            energy_profiles[(label, snapshot_index)] = energy_ratios_by_density(
+                local_samples, density_edges, gamma)
+        end
+    end
+end
+
+# ╔═╡ 2c4762f5-4780-4bfa-a320-e4102d9f5d6c
+nothing
+
+# ╔═╡ 72b2e359-c054-4efc-a834-a2f5fa99e3fc
+begin
+    energy_panel_keys = Symbol[]
+    show_energy_kin_mag && push!(energy_panel_keys, :kin_mag)
+    show_energy_therm_mag && push!(energy_panel_keys, :therm_mag)
+    show_energy_kin_therm && push!(energy_panel_keys, :kin_therm)
+    energy_line_styles = [:solid, :dash, :dot, :dashdot]
+    snapshot_styles = Dict(
+        snapshot_index => energy_line_styles[mod1(style_index, length(energy_line_styles))]
+        for (style_index, snapshot_index) in enumerate(valid_energy_snapshots)
+    )
+    if isempty(energy_panel_keys)
+        fig_energy = Figure(size = (900, 180))
+        Label(fig_energy[1, 1], L"\mathrm{Select\ at\ least\ one\ energy\ ratio.}", fontsize = 20)
+    else
+        fig_energy = Figure(size = (500length(energy_panel_keys), 520))
+        energy_axes = Dict{Symbol, Any}()
+        for (index, key) in enumerate(energy_panel_keys)
+            ylabel = key == :kin_mag ? L"E_{\mathrm{kin}}/E_{\mathrm{mag}}" :
+                key == :therm_mag ? L"E_{\mathrm{therm}}/E_{\mathrm{mag}}" :
+                L"E_{\mathrm{kin}}/E_{\mathrm{therm}}"
+            energy_axes[key] = latex_axis(fig_energy[1, index],
+                xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = ylabel,
+                xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
+            hlines!(energy_axes[key], [1.0]; color = (:gray45, 0.55),
+                linestyle = :dash, linewidth = 1.5)
+        end
+        for label in comparison_run_labels, snapshot_index in valid_energy_snapshots
+            haskey(energy_profiles, (label, snapshot_index)) || continue
+            profile = energy_profiles[(label, snapshot_index)]
+            style = snapshot_styles[snapshot_index]
+            for key in energy_panel_keys
+                lines!(energy_axes[key], density_number_centers, getfield(profile, key);
+                    color = run_colors[label], linestyle = style, linewidth = 2.5)
+            end
+        end
+        run_legend_elements = [LineElement(color = run_colors[label], linewidth = 2.5) for label in comparison_run_labels]
+        snapshot_legend_elements = [
+            LineElement(color = :black, linestyle = snapshot_styles[index], linewidth = 2.5)
+            for index in valid_energy_snapshots
+        ]
+        energy_run_labels = legend_run_label.(comparison_run_labels)
+        energy_snapshot_labels = ["Snapshot $(index)" for index in valid_energy_snapshots]
+        Legend(fig_energy[2, 1:length(energy_panel_keys)],
+            [run_legend_elements, snapshot_legend_elements],
+            [energy_run_labels, energy_snapshot_labels],
+            ["Run", "Snapshot"];
+            orientation = :horizontal, tellheight = true, framevisible = false)
+    end
+    display_energy_ratios ? fig_energy : nothing
+end
+
+# ╔═╡ 4e8ac6d4-4ee4-4e41-a63a-1c93213da33f
+begin
+    energy_time_specs = NamedTuple[]
+    show_energy_kin_mag && push!(energy_time_specs,
+        (field = :kin_mag, ylabel = L"E_{\mathrm{kin}}/E_{\mathrm{mag}}"))
+    show_energy_therm_mag && push!(energy_time_specs,
+        (field = :therm_mag, ylabel = L"E_{\mathrm{therm}}/E_{\mathrm{mag}}"))
+    show_energy_kin_therm && push!(energy_time_specs,
+        (field = :kin_therm, ylabel = L"E_{\mathrm{kin}}/E_{\mathrm{therm}}"))
+
+    if isempty(energy_time_specs)
+        fig_energy_time = Figure(size = (900, 180))
+        Label(fig_energy_time[1, 1],
+            L"\mathrm{Select\ at\ least\ one\ time\ dependent\ energy\ ratio.}", fontsize = 20)
+    else
+        fig_energy_time = Figure(size = (500length(energy_time_specs), 470))
+        for (index, spec) in enumerate(energy_time_specs)
+            ax = latex_axis(fig_energy_time[1, index],
+                xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel, yscale = log10,
+                yticks = DECADE_TICKS,
+                yminorticks = IntervalsBetween(9), yminorticksvisible = true)
+            hlines!(ax, [1.0]; color = (:gray45, 0.55), linestyle = :dash, linewidth = 1.5)
+            for label in comparison_run_labels
+                series = all_series[label]
+                times = Float64.(getfield.(series, :t))
+                ratio = Float64.(getfield.(series, spec.field))
+                lines!(ax, times, ratio; color = run_colors[label], linewidth = 2.6)
+                scatter!(ax, times, ratio; color = run_colors[label], markersize = 6)
+            end
+        end
+        energy_time_legend_elements = [
+            LineElement(color = run_colors[label], linewidth = 2.6) for label in comparison_run_labels
+        ]
+        energy_time_legend_labels = legend_run_label.(comparison_run_labels)
+        Legend(fig_energy_time[2, 1:length(energy_time_specs)],
+            energy_time_legend_elements, energy_time_legend_labels;
+            orientation = :horizontal, tellheight = true, framevisible = false)
+    end
+    display_energy_time ? fig_energy_time : nothing
+end
+
+# ╔═╡ d87379b7-3527-45a8-bc60-bec191c499af
+md"""
+---
+
+## 9. Vorticity and enstrophy
+
+The first map shows the line-of-sight mean of the vorticity magnitude, $\langle|\boldsymbol\omega|\rangle_{\mathrm{LOS}}$. The second shows the line-of-sight mean enstrophy,
+
+```math
+\mathcal{E}_{\omega}=\frac{1}{2}|\boldsymbol\omega|^2,
+```
+
+in $\mathrm{Myr}^{-2}$. Both maps use the active run, snapshot, and line of sight.
+
+**Display vorticity and enstrophy maps:** $(@bind display_vorticity_figure PlutoUI.CheckBox(default = true))  
+**Display density-binned enstrophy diagnostics:** $(@bind display_enstrophy_density PlutoUI.CheckBox(default = true))
+
+| Vorticity and enstrophy diagnostic | Display |
+|:--|:--:|
+| Vorticity heatmap | $(@bind show_vorticity_map PlutoUI.CheckBox(default = true)) |
+| Enstrophy heatmap | $(@bind show_enstrophy_map PlutoUI.CheckBox(default = true)) |
+| Enstrophy profiles by density bin | $(@bind show_enstrophy_density_profiles PlutoUI.CheckBox(default = true)) |
+| Density-bin weighting | $(@bind enstrophy_density_weighting PlutoUI.Select(["volume", "mass"]; default = "volume")) |
+"""
+
+# ╔═╡ 3190e127-1d53-49f1-bfab-b9645910c2c6
+begin
+    function isotropic_power_spectrum(components, box_length_pc; prefactor = 1.0)
+        Fpower = zeros(Float64, size(first(components)))
+        for component in components
+            replacement = finite_mean(component; default = 0.0)
+            finite_component = ifelse.(isfinite.(component), Float64.(component), replacement)
+            Fpower .+= abs2.(fft(finite_component))
+        end
+        n = size(Fpower)
+        ntot = length(Fpower)
+        kmax = floor(Int, sqrt(sum((ni ÷ 2)^2 for ni in n)))
+        shell_power = zeros(kmax + 1)
+        shell_count = zeros(Int, kmax + 1)
+        fft_mode(i, ni) = (i - 1 <= ni ÷ 2) ? i - 1 : i - 1 - ni
+        for I in CartesianIndices(Fpower)
+            kmag = sqrt(sum(fft_mode(I[d], n[d])^2 for d in 1:3))
+            shell = round(Int, kmag) + 1
+            shell <= length(shell_power) || continue
+            shell_power[shell] += prefactor * Fpower[I] / ntot^2
+            shell_count[shell] += 1
+        end
+        modes = collect(0:kmax)
+        valid = (modes .> 0) .& (shell_count .> 0) .& (shell_power .> 0)
+        dk = 2pi / box_length_pc
+        modes[valid] .* dk, shell_power[valid] ./ dk
+    end
+
+    spectrum_box_length_pc = cbrt(prod(cube.L))
+    spectrum_dk = 2pi / spectrum_box_length_pc
+    spectrum_low_k_limit = 3spectrum_dk
+    krho, Prho = isotropic_power_spectrum((number_density_cells,), spectrum_box_length_pc)
+    kv, Pv = isotropic_power_spectrum((turb.dvx, turb.dvy, turb.dvz), spectrum_box_length_pc; prefactor = 0.5)
+    komega, Pomega = isotropic_power_spectrum((omega.wx, omega.wy, omega.wz), spectrum_box_length_pc)
+    # The shell power is quadratic in the field, so squaring the Gauss-to-microgauss
+    # factor into the prefactor puts E_B in microgauss^2 pc without scaling the
+    # three components into new cube-sized arrays first.
+    kb, Pb = isotropic_power_spectrum((cube.bx, cube.by, cube.bz), spectrum_box_length_pc;
+        prefactor = 0.5GAUSS_TO_MICROGAUSS^2)
+    spectrum_maximum_k = maximum(vcat(krho, kv, komega, kb))
+    spectrum_k_choices = spectrum_dk:spectrum_dk:spectrum_maximum_k
+    spectrum_default_k_min = min(spectrum_low_k_limit, spectrum_maximum_k)
+    spectrum_default_k_max = max(spectrum_default_k_min,
+        spectrum_dk * floor(Int, spectrum_maximum_k / (2spectrum_dk)))
+end
+
+# ╔═╡ df880704-b12e-49eb-84f2-67b6f9583a8a
+begin
+    vorticity_map_specs = NamedTuple[]
+    show_vorticity_map && push!(vorticity_map_specs,
+        (data = safe_log10.(omega_map), colormap = :inferno,
+            label = L"\log_{10}\!\left(\langle|\omega|\rangle/\mathrm{Myr}^{-1}\right)"))
+    show_enstrophy_map && push!(vorticity_map_specs,
+        (data = safe_log10.(enstrophy_map), colormap = :magma,
+            label = L"\log_{10}\!\left(\langle\mathcal{E}_{\omega}\rangle/\mathrm{Myr}^{-2}\right)"))
+    if isempty(vorticity_map_specs)
+        fig_vorticity = Figure(size = (900, 180))
+        Label(fig_vorticity[1, 1],
+            L"\mathrm{Select\ at\ least\ one\ vorticity\ or\ enstrophy\ map.}", fontsize = 20)
+    else
+        fig_vorticity = Figure(size = (620length(vorticity_map_specs), 520))
+        for (index, spec) in enumerate(vorticity_map_specs)
+            panel = fig_vorticity[1, index] = GridLayout()
+            axis = latex_axis(panel[1, 1],
+                xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+                ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
+            heat = heatmap!(axis, sky_coordinates[1], sky_coordinates[2], spec.data;
+                colormap = spec.colormap)
+            latex_colorbar(panel[1, 2], heat; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            colsize!(panel, 2, 22)
+        end
+    end
+    display_vorticity_figure ? fig_vorticity : nothing
+end
+
+# ╔═╡ b02ceda6-0a0d-4543-91f8-a6669231ec72
+begin
+    function enstrophy_by_density(c, edges, weighting)
+        local_omega = vorticity(c)
+        local_enstrophy = 0.5 .* local_omega.magnitude .^ 2
+        log_density = vec(safe_log10.(number_density(c.rho)))
+        enstrophy_values = vec(local_enstrophy)
+        weights = weighting == "mass" ? vec(Float64.(c.rho)) : ones(length(c.rho))
+        bin_index = clamp.(searchsortedlast.(Ref(edges), log_density), 1, length(edges) - 1)
+        weighted_sum = zeros(Float64, length(edges) - 1)
+        weight_sum = zeros(Float64, length(edges) - 1)
+        for cell in eachindex(bin_index)
+            bin = bin_index[cell]
+            if edges[bin] <= log_density[cell] <= edges[bin + 1] &&
+                    isfinite(enstrophy_values[cell]) && isfinite(weights[cell])
+                weighted_sum[bin] += weights[cell] * enstrophy_values[cell]
+                weight_sum[bin] += weights[cell]
+            end
+        end
+        [weight_sum[index] > 0 ? weighted_sum[index] / weight_sum[index] : NaN
+            for index in eachindex(weight_sum)]
+    end
+
+    enstrophy_snapshot_indices = Dict(
+        label => min(Int(selected_snapshot), length(run_files[label])) for label in comparison_run_labels)
+    enstrophy_profiles = Dict{String, Any}()
+    enstrophy_mach_by_run = Dict{String, Float64}()
+    for label in comparison_run_labels
+        local_cube = comparison_cube(label)
+        enstrophy_profiles[label] = enstrophy_by_density(
+            local_cube, density_edges, enstrophy_density_weighting)
+        comparison_kind == :mach && (enstrophy_mach_by_run[label] =
+            bulk_metrics_from_cube(local_cube, Float64(gamma)).mach)
+    end
+    function enstrophy_parameter_label(label)
+        if comparison_kind == :mach
+            mach_value = enstrophy_mach_by_run[label]
+            return latexstring("\\mathcal{M}=",
+                @sprintf("%.3g", mach_value))
+        end
+        latex_run_label(label)
+    end
+end
+
+# ╔═╡ 873f7ef2-719b-4ae6-b015-1a23c6c27836
+begin
+    if !show_enstrophy_density_profiles
+        fig_enstrophy_density = Figure(size = (900, 180))
+        Label(fig_enstrophy_density[1, 1],
+            L"\mathrm{Density-binned\ enstrophy\ profiles\ are\ disabled.}",
+            fontsize = 20)
+    else
+        fig_enstrophy_density = Figure(size = (680, 500))
+        axis = latex_axis(fig_enstrophy_density[1, 1],
+            xlabel = L"n\;[\mathrm{cm}^{-3}]",
+            ylabel = L"\langle\mathcal{E}_{\omega}\rangle_n\;[\mathrm{Myr}^{-2}]",
+            xscale = log10, yscale = log10,
+            xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+            xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+            xminorticksvisible = true, yminorticksvisible = true)
+        for label in comparison_run_labels
+            profile = enstrophy_profiles[label]
+            valid = isfinite.(profile) .& (profile .> 0)
+            lines!(axis, density_number_centers[valid], profile[valid];
+                color = run_colors[label], linewidth = 2.5,
+                label = enstrophy_parameter_label(label))
+            scatter!(axis, density_number_centers[valid], profile[valid];
+                color = run_colors[label], markersize = 5)
+        end
+        axislegend(axis; position = :lt, framevisible = false)
+    end
+    display_enstrophy_density ? fig_enstrophy_density : nothing
+end
+
+# ╔═╡ a8558c31-7dcf-433e-9950-a59e9acf158b
+md"""
+---
+
+## 10. Isotropic power spectra
+
+The panels show number-density, turbulent-velocity, vorticity, and magnetic spectra on base-10 logarithmic axes in both $k$ and spectral power. Fourier power is summed in spherical shells and normalized consistently with Parseval's theorem. Dividing shell power by $\Delta k=2\pi/L$ gives spectral densities satisfying $\int E_f(k)\,\mathrm{d}k=\langle|f|^2\rangle$, with the stated velocity prefactor. Velocity and vorticity include all three vector components, and $k$ is expressed in $\mathrm{pc}^{-1}$.
+
+The first shells contain few Fourier modes and are correspondingly noisy. The shaded region $k<3\,\Delta k$ marks these box-scale modes; it should be excluded when estimating an inertial-range slope. The threshold is a visual reliability guide, not a claim that an inertial range necessarily begins at $3\,\Delta k$.
+
+The fitted model is $E(k)=A k^\alpha$ over the selected interval. Each optional reference slope is normalized to the fitted spectrum at the geometric center of that interval.
+
+The magnetic panel shows $E_B(k)=\tfrac12\langle|\mathbf B|^2\rangle_k$ in $\mu\mathrm G^2\,\mathrm{pc}$, so it is an energy spectrum up to the constant $1/4\pi$.
+
+Two different references are offered, because they describe different fields:
+
+- **Kolmogorov**, $\alpha=-5/3$, for the density, velocity, and vorticity panels;
+- **Kazantsev** (1968), $\alpha=+3/2$, for the magnetic panel.
+
+The Kazantsev slope is the prediction of the *kinematic* small-scale dynamo: while the field is still too weak to react back on the flow, magnetic energy piles up at small scales and $E_B(k)\propto k^{3/2}$ between the forcing scale and the resistive scale. Its **positive** exponent is the signature of that regime — magnetic energy peaks at the *smallest* resolved scales, not the largest.
+
+This reference is therefore only meaningful while the dynamo is still kinematic. Once the field saturates, back-reaction flattens and then bends the spectrum, and a $k^{3/2}$ fit stops being informative. Use the exponential-growth window fitted in section 5 to decide whether the selected snapshot is still in the kinematic phase.
+
+**Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
+
+| Power-spectrum panel | Display |
+|:--|:--:|
+| Number-density spectrum | $(@bind show_spectrum_density PlutoUI.CheckBox(default = true)) |
+| Velocity spectrum | $(@bind show_spectrum_velocity PlutoUI.CheckBox(default = true)) |
+| Vorticity spectrum | $(@bind show_spectrum_vorticity PlutoUI.CheckBox(default = true)) |
+| Magnetic spectrum | $(@bind show_spectrum_magnetic PlutoUI.CheckBox(default = true)) |
+| Display fitted slopes | $(@bind show_spectrum_slopes PlutoUI.CheckBox(default = true)) |
+| Minimum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_min PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_min)) |
+| Maximum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_max PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_max)) |
+| Display the Kolmogorov $k^{-5/3}$ reference | $(@bind show_kolmogorov_spectrum PlutoUI.CheckBox(default = true)) |
+| Display the Kazantsev $k^{3/2}$ reference | $(@bind show_kazantsev_spectrum PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 3a731972-3404-478c-a572-00a05ab652b1
+begin
+    function power_law_slope(k, power, minimum_k, maximum_k)
+        lower, upper = minmax(Float64(minimum_k), Float64(maximum_k))
+        valid = isfinite.(k) .& isfinite.(power) .& (k .> 0) .& (power .> 0) .&
+            (k .>= lower) .& (k .<= upper)
+        x, y = log10.(Float64.(k[valid])), log10.(Float64.(power[valid]))
+        length(x) >= 2 || return (slope = NaN, intercept = NaN, r2 = NaN,
+            count = length(x), lower = lower, upper = upper)
+        xmean, ymean = mean(x), mean(y)
+        denominator = sum(abs2, x .- xmean)
+        denominator > 0 || return (slope = NaN, intercept = NaN, r2 = NaN,
+            count = length(x), lower = lower, upper = upper)
+        slope = sum((x .- xmean) .* (y .- ymean)) / denominator
+        intercept = ymean - slope * xmean
+        prediction = intercept .+ slope .* x
+        residual = sum(abs2, y .- prediction)
+        total = sum(abs2, y .- ymean)
+        r2 = total > 0 ? 1 - residual / total : NaN
+        (; slope, intercept, r2, count = length(x), lower, upper)
+    end
+
+    # Turbulent cascade panels quote Kolmogorov; the magnetic panel quotes
+    # Kazantsev, whose exponent is positive because kinematic small-scale dynamo
+    # action piles magnetic energy up at the smallest scales.
+    kolmogorov_reference = show_kolmogorov_spectrum ?
+        (exponent = -5 / 3, label = L"k^{-5/3}") : nothing
+    kazantsev_reference = show_kazantsev_spectrum ?
+        (exponent = 3 / 2, label = L"k^{3/2}") : nothing
+
+    spectrum_specs = NamedTuple[]
+    show_spectrum_density && push!(spectrum_specs,
+        (k = krho, power = Prho, ylabel = L"E_n(k)\;[\mathrm{cm}^{-6}\,\mathrm{pc}]",
+            color = MHD_COLORS[1], reference = kolmogorov_reference))
+    show_spectrum_velocity && push!(spectrum_specs,
+        (k = kv, power = Pv,
+            ylabel = L"E_v(k)\;[(\mathrm{km\,s}^{-1})^2\,\mathrm{pc}]",
+            color = MHD_COLORS[3], reference = kolmogorov_reference))
+    show_spectrum_vorticity && push!(spectrum_specs,
+        (k = komega, power = Pomega,
+            ylabel = L"E_\omega(k)\;[\mathrm{Myr}^{-2}\,\mathrm{pc}]",
+            color = MHD_COLORS[5], reference = kolmogorov_reference))
+    show_spectrum_magnetic && push!(spectrum_specs,
+        (k = kb, power = Pb,
+            ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
+            color = MHD_COLORS[4], reference = kazantsev_reference))
+    if isempty(spectrum_specs)
+        fig_spectra = Figure(size = (900, 180))
+        Label(fig_spectra[1, 1], L"\mathrm{Select\ at\ least\ one\ power\ spectrum.}", fontsize = 20)
+    else
+        fig_spectra = Figure(size = (400length(spectrum_specs), 390))
+        for (index, spec) in enumerate(spectrum_specs)
+            axis = latex_axis(fig_spectra[1, index], xlabel = L"k\;[\mathrm{pc}^{-1}]",
+                ylabel = spec.ylabel, xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true,
+                xminorticksize = 4, yminorticksize = 4)
+            vspan!(axis, spectrum_dk, spectrum_low_k_limit;
+                color = (:gray55, 0.18))
+            vlines!(axis, [spectrum_low_k_limit];
+                color = (:gray35, 0.75), linestyle = :dash, linewidth = 1.3)
+            valid = isfinite.(spec.k) .& isfinite.(spec.power) .&
+                (spec.k .> 0) .& (spec.power .> 0)
+            lines!(axis, spec.k[valid], spec.power[valid]; color = spec.color,
+                linewidth = 2.5, label = L"E(k)")
+            scatter!(axis, spec.k[valid], spec.power[valid]; color = spec.color, markersize = 5)
+            fit_result = power_law_slope(spec.k, spec.power,
+                spectrum_fit_k_min, spectrum_fit_k_max)
+            if isfinite(fit_result.slope)
+                fit_k = 10.0 .^ range(log10(fit_result.lower),
+                    log10(fit_result.upper); length = 100)
+                fit_power = 10.0 .^ (fit_result.intercept .+
+                    fit_result.slope .* log10.(fit_k))
+                if show_spectrum_slopes
+                    vspan!(axis, fit_result.lower, fit_result.upper;
+                        color = (MHD_COLORS[2], 0.08))
+                    lines!(axis, fit_k, fit_power; color = MHD_COLORS[2],
+                        linewidth = 2.5, linestyle = :dash,
+                        label = latexstring(raw"\alpha=", @sprintf("%.3f", fit_result.slope),
+                            raw",\;R^2=", @sprintf("%.3f", fit_result.r2)))
+                end
+                if !isnothing(spec.reference)
+                    pivot_k = sqrt(fit_result.lower * fit_result.upper)
+                    pivot_power = 10.0^(fit_result.intercept +
+                        fit_result.slope * log10(pivot_k))
+                    reference_power = pivot_power .*
+                        (fit_k ./ pivot_k) .^ spec.reference.exponent
+                    lines!(axis, fit_k, reference_power; color = :black,
+                        linewidth = 2.2, linestyle = :dot,
+                        label = spec.reference.label)
+                end
+                (show_spectrum_slopes || !isnothing(spec.reference)) &&
+                    axislegend(axis; position = :lb, framevisible = false)
+            end
+        end
+    end
+    display_power_spectra ? fig_spectra : nothing
+end
+
+# ╔═╡ 24e60849-1c70-4df3-bd17-57d29949b7a6
+md"""
+---
+
+## 11. Real-space structure functions
+
+The panels measure velocity, vorticity, and magnetic-field increments as functions of spatial separation. For a vector field $\mathbf f$, $S_p^f(\ell)=\left\langle\left|\mathbf f(\mathbf x+\boldsymbol\ell)-\mathbf f(\mathbf x)\right|^p\right\rangle$.
+
+The average includes every cell and shifts along the three periodic grid axes, then averages those three results. This is an axis-sampled estimator of the full vector-increment magnitude: it mixes longitudinal and transverse contributions and is **not** an angularly isotropic average. Longitudinal or transverse intermittency exponents should therefore be measured with dedicated projected increments rather than inferred from these panels. Separation is measured in parsecs; vertical units are the corresponding physical field units raised to order $p$. **Order $p$** selects the increment moment, while **Number of separation samples** controls the balance between radial resolution and computation time.
+
+The FFT spectra and structure-function arrays live in calculation cells separate from their plotting cells, so display checkboxes and other cosmetic plot controls do not rerun the heavy transforms. Changing the active cube, the structure-function order, or the separation sampling does require a new calculation. On grids of $256^3$ cells or larger this can still take appreciable time and memory.
+
+**Display velocity, vorticity, and magnetic structure functions:** $(@bind display_structure_functions PlutoUI.CheckBox(default = true))
+
+| Setting | Control |
+|:--|:--|
+| Order $p$ | $(@bind structure_order PlutoUI.Slider(1:4; default = 2, show_value = true)) |
+| Number of separation samples | $(@bind structure_samples PlutoUI.Slider(6:2:24; default = 12, show_value = true)) |
+| Velocity structure function | $(@bind show_structure_velocity PlutoUI.CheckBox(default = true)) |
+| Vorticity structure function | $(@bind show_structure_vorticity PlutoUI.CheckBox(default = true)) |
+| Magnetic structure function | $(@bind show_structure_magnetic PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 4b16d83f-4a1d-49e7-9270-8f573fd46835
+begin
+    function vector_structure_function(components, lags, order)
+        values = zeros(Float64, length(lags))
+        shifted = zeros(Float64, size(first(components)))
+        increment2 = similar(shifted)
+        for (lag_index, lag) in pairs(lags)
+            directional_sum = 0.0
+            for dimension in 1:3
+                shift = ntuple(d -> d == dimension ? lag : 0, 3)
+                fill!(increment2, 0.0)
+                for component in components
+                    circshift!(shifted, component, shift)
+                    @. increment2 += abs2(shifted - component)
+                end
+                finite_sum = 0.0
+                finite_count = 0
+                for squared_increment in increment2
+                    moment = squared_increment^(order / 2)
+                    if isfinite(moment)
+                        finite_sum += moment
+                        finite_count += 1
+                    end
+                end
+                directional_sum += finite_count > 0 ? finite_sum / finite_count : 0.0
+            end
+            values[lag_index] = directional_sum / 3
+        end
+        values
+    end
+
+    maximum_lag = max(1, minimum(size(cube.rho)) ÷ 2)
+    structure_lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag)); length = structure_samples))))
+    structure_separations_pc = structure_lags .* minimum(cube.L ./ size(cube.rho))
+    Sv = vector_structure_function((turb.dvx, turb.dvy, turb.dvz), structure_lags, structure_order)
+    Somega = vector_structure_function((omega.wx, omega.wy, omega.wz), structure_lags, structure_order)
+    SB = vector_structure_function(
+        (GAUSS_TO_MICROGAUSS .* cube.bx, GAUSS_TO_MICROGAUSS .* cube.by, GAUSS_TO_MICROGAUSS .* cube.bz),
+        structure_lags, structure_order)
+end
+
+# ╔═╡ d69dd1ce-312a-48e0-a478-b470b299ed1b
+begin
+    structure_specs = NamedTuple[]
+    show_structure_velocity && push!(structure_specs,
+        (values = Sv,
+            ylabel = latexstring("S_{", structure_order,
+                "}^{v}(\\ell)\\;[(\\mathrm{km\\,s}^{-1})^{", structure_order, "}]"),
+            color = MHD_COLORS[3]))
+    show_structure_vorticity && push!(structure_specs,
+        (values = Somega,
+            ylabel = latexstring("S_{", structure_order,
+                "}^{\\omega}(\\ell)\\;[\\mathrm{Myr}^{-", structure_order, "}]"),
+            color = MHD_COLORS[5]))
+    show_structure_magnetic && push!(structure_specs,
+        (values = SB,
+            ylabel = latexstring("S_{", structure_order,
+                "}^{B}(\\ell)\\;[(\\mu\\mathrm{G})^{", structure_order, "}]"),
+            color = MHD_COLORS[4]))
+    if isempty(structure_specs)
+        fig_structure = Figure(size = (900, 180))
+        Label(fig_structure[1, 1], L"\mathrm{Select\ at\ least\ one\ structure\ function.}", fontsize = 20)
+    else
+        fig_structure = Figure(size = (400length(structure_specs), 390))
+        for (index, spec) in enumerate(structure_specs)
+            axis = latex_axis(fig_structure[1, index], xlabel = L"\ell\;[\mathrm{pc}]",
+                ylabel = spec.ylabel, xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
+            lines!(axis, structure_separations_pc, spec.values;
+                color = spec.color, linewidth = 2.5)
+            scatter!(axis, structure_separations_pc, spec.values;
+                color = spec.color, markersize = 6)
+            x_limits = enclosing_decade_limits(structure_separations_pc)
+            y_limits = enclosing_decade_limits(spec.values)
+            isnothing(x_limits) || xlims!(axis, x_limits...)
+            isnothing(y_limits) || ylims!(axis, y_limits...)
+        end
+    end
+    display_structure_functions ? fig_structure : nothing
+end
+
+# ╔═╡ 14e7606a-3a13-4c8e-b860-e40dc63a6fa2
+md"""
+---
+
+## 19. Polarization fractions versus time
+
+Each panel follows one synthetic-observation polarization fraction through the selected simulations. The reported value is either the area-weighted sky mean,
+
+```math
+\langle p\rangle_A=\frac{1}{N_{\rm pix}}\sum_j p_j,
+```
+
+or the intensity-weighted mean,
+
+```math
+\langle p\rangle_I=\frac{\sum_j P_j}{\sum_j I_j}=\frac{\sum_j p_jI_j}{\sum_j I_j}.
+```
+
+The thick horizontal segments above every panel identify two time intervals for the active run: the exponential dynamo interval used to fit $\Gamma_B$ in section 5 and the user-selected statistically steady interval. Thin vertical guides mark the end of growth and the beginning of the steady regime.
+
+**Display polarization fractions versus time:** $(@bind display_polarization_time PlutoUI.CheckBox(default = false))
+
+| Temporal polarization diagnostic | Display |
+|:--|:--:|
+| Thermal dust | $(@bind show_polarization_time_dust PlutoUI.CheckBox(default = true)) |
+| Dichroic starlight | $(@bind show_polarization_time_starlight PlutoUI.CheckBox(default = true)) |
+| Faraday synchrotron | $(@bind show_polarization_time_faraday PlutoUI.CheckBox(default = true)) |
+| Zeeman circular polarization | $(@bind show_polarization_time_zeeman PlutoUI.CheckBox(default = true)) |
+
+| Temporal setting | Control |
+|:--|:--|
+| Sky averaging | $(@bind polarization_time_weighting PlutoUI.Select(["Intensity-weighted mean" => "intensity", "Area-weighted mean" => "area"]; default = "intensity")) |
+| Snapshot stride | $(@bind polarization_time_stride PlutoUI.Slider(1:maximum_snapshot_count; default = 1, show_value = true)) |
+| Zeeman velocity channels | $(@bind polarization_time_zeeman_channels PlutoUI.Select([31, 51, 81, 101]; default = 51)) |
+| Display growth and steady-state bars | $(@bind show_polarization_regime_bars PlutoUI.CheckBox(default = true)) |
+| Steady-state start snapshot | $(@bind polarization_steady_start PlutoUI.Slider(1:length(run_files[selected_run]); default = min(last(growth_fit_window) + 1, length(run_files[selected_run])), show_value = true)) |
+"""
 
 # ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
 begin
     export_figure_options = [
-        "dust_polarization" => "Dust-polarization maps",
-        "dust_structure" => "Dust observable structure functions",
-        "dust_pixel_spectrum" => "Dust Stokes spectrum",
-        "dust_statistics" => "Dust comparative statistics",
-        "dust_p_column" => "Dust polarization versus column density",
+        "heatmaps" => "Projected heatmaps",
+        "pdfs" => "Probability density functions",
+        "phase_diagram" => "Pressure-density phase diagram",
+        "time_evolution" => "Global time evolution",
+        "phase_magnetic_time" => "Magnetic field by thermal phase",
+        "magnetic_fit" => "Magnetic exponential fit",
+        "growth_rate_relations" => "Growth rate versus time and Mach numbers",
+        "normalized_magnetic_relations" => "Normalized magnetic evolution",
+        "normalized_magnetic_field" => "Normalized magnetic-field distribution",
+        "magnetic_density" => "Magnetic field versus density",
+        "hro" => "Histogram of relative orientations",
+        "hog" => "Histogram of oriented gradients",
+        "energy_ratios" => "Energy ratios by density",
+        "energy_time" => "Energy ratios versus time",
+        "vorticity" => "Vorticity map",
+        "enstrophy_density" => "Enstrophy by density",
+        "power_spectra" => "Power spectra",
+        "structure_functions" => "Structure functions",
     ]
     export_figure_registry = Dict(
-        "dust_polarization" => fig_dust,
-        "dust_structure" => fig_dust_structure,
-        "dust_pixel_spectrum" => fig_dust_pixel_spectrum,
-        "dust_statistics" => fig_dust_statistics,
-        "dust_p_column" => fig_dust_p_column,
+        "heatmaps" => fig_maps,
+        "pdfs" => fig_pdf,
+        "phase_diagram" => fig_phase,
+        "time_evolution" => fig_time,
+        "phase_magnetic_time" => fig_phase_B_time,
+        "magnetic_fit" => fig_growth,
+        "growth_rate_relations" => fig_gamma_relations,
+        "normalized_magnetic_relations" => fig_normalized_B_relations,
+        "normalized_magnetic_field" => fig_logB,
+        "magnetic_density" => fig_bn,
+        "hro" => fig_hro,
+        "hog" => fig_hog,
+        "energy_ratios" => fig_energy,
+        "energy_time" => fig_energy_time,
+        "vorticity" => fig_vorticity,
+        "enstrophy_density" => fig_enstrophy_density,
+        "power_spectra" => fig_spectra,
+        "structure_functions" => fig_structure,
     )
     nothing
 end
@@ -2741,7 +4564,7 @@ md"""
 
 | Export setting | Control |
 |:--|:--|
-| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "dust_polarization")) |
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "heatmaps")) |
 | Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
 """
 
@@ -2753,7 +4576,7 @@ begin
     show(export_buffer, export_mime, export_figure_registry[export_figure_key])
     export_bytes = take!(export_buffer)
     export_run_slug = replace(lowercase(selected_run), r"[^a-z0-9]+" => "_")
-    export_filename = "dust_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
+    export_filename = "dynamo_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
     PlutoUI.DownloadButton(export_bytes, export_filename)
 end
 
@@ -4790,20 +6613,62 @@ version = "4.1.0+0"
 # ╟─98360288-85ca-4551-bdde-c12c7a329302
 # ╟─6a9cfec2-2c80-4d72-94c0-cdb47aa4f046
 # ╟─18e0d2d1-56ca-46cc-a13e-77f142612b5a
+# ╟─3df9ad9a-b865-41f5-8d7a-34a52d0292dd
+# ╟─290ecb0a-880a-44bd-9ddc-e6ee12b41a06
 # ╟─e734297f-506e-45e1-8cb7-b2ae671893eb
 # ╠═7174c31f-f186-48f9-b66e-29cf9a1c1fe3
 # ╟─353cc6fb-c801-448a-a2c5-23dfd1541704
 # ╟─a8ef96ab-0ddd-4eb2-a216-b7d96c2a9a08
 # ╟─32110739-b60e-4592-856a-dd74f7a37401
+# ╟─5fbd0d53-09e8-4b39-bb1d-29c8cc45c6ee
 # ╟─94a0a0dc-baf6-4e62-a51e-dc6124d98fd4
 # ╟─c12d1f54-40b8-4865-9562-8dcb519f924a
-# ╟─62440e86-b560-44ad-bb0a-43ae62e73fc3
-# ╠═47b786d6-c7b5-44f4-946a-b8c485ad6380
-# ╟─d6a2f4b1-59ac-4e77-a10a-4b74c0d89231
-# ╟─130ccf03-d7cc-4b71-9210-dbc0e43dfa82
-# ╟─5b3f6a91-246e-4cc3-8f68-164f7ff2f07c
-# ╟─61c3b28c-9d62-4689-a85d-bc827e89641d
-# ╠═a0010001-6f8c-4d0c-9a10-000000000001
+# ╠═76d249f9-d6fd-4513-aa76-7fb386058c37
+# ╟─72626861-42ce-4ac0-b980-78f498f8a629
+# ╟─496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
+# ╟─1e0e6c0e-1ae0-40a1-a6f8-9c18fae91961
+# ╟─fa155a62-da75-4530-b5e9-215fd4f66412
+# ╟─9da572fe-21f2-43df-9320-b8742fd64773
+# ╠═41b4eb12-889d-43b3-87c2-fc7cccf8679f
+# ╟─904ba663-d536-4b27-a379-4af927b0affb
+# ╠═36aef377-3de7-435a-af83-3a90421e3159
+# ╟─89c33295-34e7-49ec-8d04-52b2aac29cff
+# ╟─8120f7e9-74ed-4a48-b2f4-dbc75ebf0132
+# ╟─71c8ea26-d2ad-4430-9265-0b28d45bba1c
+# ╠═f29d5dff-8810-4935-b880-9951bc1239fd
+# ╟─cd7e037c-62f5-4682-92c2-92af7169d692
+# ╠═7a4472c3-48c5-44c7-a487-d1021b84ee3a
+# ╟─a7def784-6c52-4f98-9d76-ece082b45229
+# ╟─dcc8f8f3-daaf-4d4b-92a3-4919ed5e36de
+# ╠═3bed2efb-f849-4ddc-9f49-ed5e3d683370
+# ╟─62bb58f1-37c3-4adb-a7fc-939f71a56635
+# ╠═d56a8ba3-aa42-4351-a065-87275032a342
+# ╟─1be45ca2-bd2f-4b77-9188-5b338d41483b
+# ╟─89420b8d-c72e-4a04-91dd-043bc9ecef2e
+# ╟─b1000001-6f8c-4d0c-9a10-000000000001
+# ╠═b1000002-6f8c-4d0c-9a10-000000000002
+# ╠═b1000003-6f8c-4d0c-9a10-000000000003
+# ╠═b1000004-6f8c-4d0c-9a10-000000000004
+# ╠═b1000005-6f8c-4d0c-9a10-000000000005
+# ╟─298bd579-bb28-48b7-8c55-ea74804b9837
+# ╟─e4a64ef5-9e6e-4ae2-8daf-42e4fc1724ba
+# ╟─a1bf5e62-ecb8-47d7-8692-c33929c831ac
+# ╟─5983ddd0-3ea9-4304-a1e2-390065309aef
+# ╟─b7c04a6f-b24d-48ca-97d2-5a77d297aa8d
+# ╟─2c4762f5-4780-4bfa-a320-e4102d9f5d6c
+# ╟─72b2e359-c054-4efc-a834-a2f5fa99e3fc
+# ╟─4e8ac6d4-4ee4-4e41-a63a-1c93213da33f
+# ╟─d87379b7-3527-45a8-bc60-bec191c499af
+# ╟─3190e127-1d53-49f1-bfab-b9645910c2c6
+# ╟─df880704-b12e-49eb-84f2-67b6f9583a8a
+# ╟─b02ceda6-0a0d-4543-91f8-a6669231ec72
+# ╟─873f7ef2-719b-4ae6-b015-1a23c6c27836
+# ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
+# ╟─3a731972-3404-478c-a572-00a05ab652b1
+# ╠═24e60849-1c70-4df3-bd17-57d29949b7a6
+# ╠═4b16d83f-4a1d-49e7-9270-8f573fd46835
+# ╠═d69dd1ce-312a-48e0-a478-b470b299ed1b
+# ╟─14e7606a-3a13-4c8e-b860-e40dc63a6fa2
 # ╠═e1000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000002-6f8c-4d0c-9a10-000000000002
 # ╠═e1000003-6f8c-4d0c-9a10-000000000003

@@ -50,6 +50,40 @@ begin
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
     const REDUCTION_CACHE = Dict{Any,Any}()
+    const SNAPSHOT_SOURCE_CACHE = Dict{String,Vector{String}}()
+    const DIRECTORY_DISCOVERY_CACHE = Dict{String,Vector{String}}()
+    const SNAPSHOT_FINGERPRINT_CACHE = Dict{String,Any}()
+    const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
+    const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
+
+    function positive_integer_setting(name, default)
+        value = tryparse(Int, strip(get(ENV, name, string(default))))
+        isnothing(value) && error("$name must be a positive integer.")
+        value > 0 || error("$name must be a positive integer.")
+        value
+    end
+
+    # Pluto stays deliberately conservative. The batch engine raises the entry
+    # limit to the number of selected simulations, while this byte ceiling keeps
+    # large production cubes from exhausting memory.
+    const RAW_CUBE_CACHE_MAX_ENTRIES =
+        positive_integer_setting("DYNAMO_RAW_CUBE_CACHE_ENTRIES", 1)
+    const RAW_CUBE_CACHE_MAX_BYTES = positive_integer_setting(
+        "DYNAMO_RAW_CUBE_CACHE_MIB",
+        max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
+    ) * 1024^2
+
+    "Memoize remote file metadata for the duration of the Pluto session."
+    function cached_snapshot_fingerprint(path)
+        canonical = abspath(path)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_FINGERPRINT_CACHE, canonical) do
+                isdir(canonical) || return (mtime(canonical), filesize(canonical))
+                Tuple((basename(entry), mtime(entry), filesize(entry))
+                    for entry in sort(readdir(canonical; join = true)))
+            end
+        end
+    end
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
     reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
@@ -61,10 +95,19 @@ begin
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
 
-    The previous entry is evicted before a cache miss is read. Consequently a
-    slider change never leaves several raw snapshots resident in this cache.
+    Entries use LRU eviction and are bounded by both a count and a byte budget.
+    Interactive Pluto defaults to one cube. Batch comparisons may retain several
+    cubes when memory allows, preventing the same files from being reopened for
+    each requested comparative figure.
     """
     function cached_raw_cube!(key, build)
+        evict_oldest_unlocked!() = begin
+            oldest = popfirst!(RAW_CUBE_CACHE_ORDER)
+            delete!(RAW_CUBE_CACHE, oldest)
+            delete!(RAW_CUBE_CACHE_BYTES, oldest)
+            nothing
+        end
+
         hit = lock(CACHE_LOCK) do
             if haskey(RAW_CUBE_CACHE, key)
                 position = findfirst(isequal(key), RAW_CUBE_CACHE_ORDER)
@@ -76,17 +119,31 @@ begin
             end
         end
         isnothing(hit) || return hit
+
+        # Use the largest resident cube as a conservative estimate of the next
+        # allocation. Evict before reading to bound peak memory, not only the
+        # final cache size.
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            estimated_bytes = isempty(RAW_CUBE_CACHE_BYTES) ? 0 :
+                maximum(values(RAW_CUBE_CACHE_BYTES))
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    (estimated_bytes > 0 &&
+                        sum(values(RAW_CUBE_CACHE_BYTES)) + estimated_bytes >
+                            RAW_CUBE_CACHE_MAX_BYTES))
+                evict_oldest_unlocked!()
+            end
         end
+
         value = build()
         bytes = Base.summarysize(value)
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    sum(values(RAW_CUBE_CACHE_BYTES)) + bytes >
+                        RAW_CUBE_CACHE_MAX_BYTES)
+                evict_oldest_unlocked!()
+            end
             RAW_CUBE_CACHE[key] = value
             RAW_CUBE_CACHE_BYTES[key] = bytes
             push!(RAW_CUBE_CACHE_ORDER, key)
@@ -99,6 +156,75 @@ begin
     function with_hdf5_file(operation::Function, path)
         lock(HDF5_READ_LOCK) do
             h5open(path, "r") do handle
+                operation(handle)
+            end
+        end
+    end
+
+    """
+    Whether an interactive HDF5 snapshot should first be copied to node-local
+    storage. `auto` stages only `/Xnfs` paths; `true` and `false` provide an
+    explicit override through `DYNAMO_LOCAL_HDF5_CACHE`.
+    """
+    function local_hdf5_cache_enabled(path)
+        isfile(path) &&
+            lowercase(splitext(path)[2]) in (".h5", ".hdf5") || return false
+        setting = lowercase(strip(get(ENV, "DYNAMO_LOCAL_HDF5_CACHE", "auto")))
+        setting in ("0", "false", "no", "off") && return false
+        setting in ("1", "true", "yes", "on") && return true
+        setting == "auto" || error(
+            "DYNAMO_LOCAL_HDF5_CACHE must be auto, true, or false; found $(setting).")
+        startswith(normpath(abspath(path)), "/Xnfs/")
+    end
+
+    """
+    Copy `path` into a private temporary directory, retaining at most one staged
+    HDF5 file. This function is called while `HDF5_READ_LOCK` is held.
+    """
+    function stage_hdf5_snapshot_unlocked(path)
+        fingerprint = cached_snapshot_fingerprint(path)
+        previous = LOCAL_HDF5_STAGE[]
+        if !isnothing(previous) && previous.source == path &&
+                previous.fingerprint == fingerprint && isfile(previous.staged_path)
+            return previous.staged_path
+        end
+
+        if isnothing(LOCAL_HDF5_STAGE_DIRECTORY[])
+            requested_parent =
+                get(ENV, "DYNAMO_LOCAL_CACHE_DIRECTORY", tempdir())
+            parent = requested_parent == "~" ? homedir() :
+                startswith(requested_parent, "~/") ?
+                    joinpath(homedir(), requested_parent[3:end]) :
+                    requested_parent
+            isdir(parent) || mkpath(parent)
+            LOCAL_HDF5_STAGE_DIRECTORY[] =
+                mktempdir(parent; prefix = "dynamo_hdf5_")
+        end
+        if !isnothing(previous) && isfile(previous.staged_path)
+            rm(previous.staged_path; force = true)
+        end
+        LOCAL_HDF5_STAGE[] = nothing
+
+        destination = joinpath(
+            LOCAL_HDF5_STAGE_DIRECTORY[],
+            string(hash((abspath(path), fingerprint)), "_", basename(path)),
+        )
+        cp(path, destination; force = true)
+        LOCAL_HDF5_STAGE[] =
+            (source = path, fingerprint = fingerprint, staged_path = destination)
+        destination
+    end
+
+    """
+    Open an analysis snapshot, optionally from the one-file node-local cache.
+    The lock covers both staging and reading, so another Pluto task cannot evict
+    the local file while it is in use.
+    """
+    function with_analysis_hdf5_file(operation::Function, path; stage_local = false)
+        lock(HDF5_READ_LOCK) do
+            read_path = stage_local && local_hdf5_cache_enabled(path) ?
+                stage_hdf5_snapshot_unlocked(path) : path
+            h5open(read_path, "r") do handle
                 operation(handle)
             end
         end
@@ -844,13 +970,13 @@ end
 
 # ╔═╡ 3ef88702-bef5-4eca-a151-df97aa7ec2c4
 md"""
-# ZEEMAN — synthetic H I splitting
+# SHINE — synthetic H I emission
 
-Synthetic Stokes I and V spectra, Zeeman field recovery, maps, and line-of-sight diagnostics.
+21-cm radiative transfer, phase-separated H I columns, velocity moments, spectra, and RGB velocity composites.
 
-> **Reactive mode.** Open `zeeman.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
+> **Reactive mode.** Open `shine.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
 
-> **Lazy startup.** Run `run_pluto.jl` with `DYNAMO_NOTEBOOK=zeeman.jl`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
+> **Lazy startup.** Run `run_pluto.jl`, then select `shine.jl`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
 
 All dimensional quantities are converted to the physical units shown on their axes or colorbars. Projected means are density weighted unless stated otherwise, and periodic boundaries are used for spatial operations.
 """
@@ -1004,7 +1130,10 @@ begin
     # stored as Float32 are not silently widened to Float64.
     function average_faces(lower, upper)
         half = convert(float(promote_type(eltype(lower), eltype(upper))), 0.5)
-        half .* (lower .+ upper)
+        # Reuse the lower-face buffer. The fused assignment avoids allocating a
+        # third full 3-D array for every magnetic component.
+        @. lower = half * (lower + upper)
+        lower
     end
 
     """
@@ -1014,9 +1143,7 @@ begin
     simulation is re-run, instead of serving stale arrays.
     """
     function snapshot_fingerprint(path)
-        isdir(path) || return (mtime(path), filesize(path))
-        Tuple((basename(entry), mtime(entry), filesize(entry))
-            for entry in sort(readdir(path; join = true)))
+        cached_snapshot_fingerprint(path)
     end
 
     function centered_hdf5_magnetic_component(h, centered, left, right, source;
@@ -1048,15 +1175,20 @@ begin
 
     function snapshot_sources(cube_directory)
         isdir(cube_directory) || return String[]
-        fits_directory_is_snapshot(cube_directory) && return [cube_directory]
-        sources = String[]
-        for path in readdir(cube_directory; join = true)
-            if is_hdf5_file(path) || is_fits_file(path) ||
-                    fits_directory_is_snapshot(path)
-                push!(sources, path)
+        canonical = abspath(cube_directory)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_SOURCE_CACHE, canonical) do
+                fits_directory_is_snapshot(canonical) && return [canonical]
+                sources = String[]
+                for path in readdir(canonical; join = true)
+                    if is_hdf5_file(path) || is_fits_file(path) ||
+                            fits_directory_is_snapshot(path)
+                        push!(sources, path)
+                    end
+                end
+                sort(sources)
             end
         end
-        sort(sources)
     end
 
     function expand_home(path)
@@ -1066,6 +1198,18 @@ begin
 
     function discover_cube_directories(path; depth = 0, max_depth = 32)
         isdir(path) || return String[]
+        canonical = abspath(path)
+        if depth == 0
+            return lock(CACHE_LOCK) do
+                get!(DIRECTORY_DISCOVERY_CACHE, canonical) do
+                    discover_cube_directories_uncached(canonical; depth, max_depth)
+                end
+            end
+        end
+        discover_cube_directories_uncached(canonical; depth, max_depth)
+    end
+
+    function discover_cube_directories_uncached(path; depth = 0, max_depth = 32)
         direct_snapshots = snapshot_sources(path)
         isempty(direct_snapshots) || return [abspath(path)]
         depth >= max_depth && return String[]
@@ -1074,7 +1218,7 @@ begin
             startswith(entry, ".") && continue
             child = joinpath(path, entry)
             isdir(child) || continue
-            append!(found, discover_cube_directories(child;
+            append!(found, discover_cube_directories_uncached(child;
                 depth = depth + 1, max_depth))
         end
         unique(found)
@@ -1538,8 +1682,11 @@ begin
     analysis_series_labels = requested_open_labels
     comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
-    active_time_value = snapshot_time(
-        run_files[selected_run][selected_snapshot]) * time_unit_Myr
+    # Loading the selected raw cube here supplies the exact stored time and
+    # primes the one-entry cache. The analysis cell below therefore reuses the
+    # same arrays instead of opening this HDF5 file a second time.
+    active_time_value = load_raw_cube(
+        run_files[selected_run][selected_snapshot]).t * time_unit_Myr
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
@@ -1612,7 +1759,7 @@ begin
     before, the HDF5 file and every dataset handle are closed before any
     conversion happens.
     """
-    function read_raw_cube(path)
+    function read_raw_cube(path; stage_local = false)
         if is_fits_file(path) || isdir(path)
             raw_fields = (
                 rho = read_fits_field(path, :rho; primary_fallback = true),
@@ -1629,7 +1776,8 @@ begin
                 L = fits_box_length(path, size(raw_fields.rho)),
                 t = snapshot_time(path))
         end
-        raw_fields, raw_length, raw_time = with_hdf5_file(path) do h
+        raw_fields, raw_length, raw_time =
+                with_analysis_hdf5_file(path; stage_local) do h
             available_paths = hdf5_dataset_paths(h)
             raw_fields = (
                 rho = read_hdf5_field(h, :rho; source = path,
@@ -1679,7 +1827,8 @@ begin
             for (field, dataset) in HDF5_FIELD_OVERRIDES])))
 
     "Return the stored, unit-free arrays of one snapshot, reading them at most once."
-    load_raw_cube(path) = cached_raw_cube!(raw_cube_key(path), () -> read_raw_cube(path))
+    load_raw_cube(path) = cached_raw_cube!(
+        raw_cube_key(path), () -> read_raw_cube(path; stage_local = true))
 
     "Apply a unit factor to a stored field without widening its element type."
     scale_field(A, factor) = A .* convert(float(eltype(A)), factor)
@@ -2368,260 +2517,339 @@ begin
     end
 end
 
-# ╔═╡ 67f95c39-1888-4d23-a2c2-2ee3a6cd7f0f
+# ╔═╡ 478ec2f3-e057-4720-809c-17ca0a3dac21
 md"""
 ---
 
-## 15. H I Zeeman splitting
+## 18. SHINE H I post-processing
 
-Weak-splitting $\mathrm{H\,I}$ Zeeman synthesis. Select a sky pixel to compare the true weighted field with the Stokes-$V$ fit.
+Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 
-| Zeeman figure | Display |
-|:--|:--:|
-| Zeeman maps | $(@bind display_zeeman_maps PlutoUI.CheckBox(default = true)) |
-| Stokes spectra | $(@bind display_zeeman_spectra PlutoUI.CheckBox(default = true)) |
-| Circular-polarization fraction versus $N_{\rm HI}$ | $(@bind display_zeeman_p_column PlutoUI.CheckBox(default = true)) |
+**Display SHINE H I maps:** $(@bind display_shine PlutoUI.CheckBox(default = true))  
+**Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))  
+**Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
 
-| Zeeman setting | Control |
+| SHINE setting | Control |
 |:--|:--|
-| Neutral $\mathrm{H\,I}$ fraction | $(@bind zeeman_neutral_fraction PlutoUI.NumberField(0.0:0.01:1.0; default = 1.0)) |
-| Rest frequency [$\mathrm{MHz}$] | $(@bind zeeman_frequency_MHz PlutoUI.NumberField(default = 1420.40575177)) |
-| Splitting coefficient [$\mathrm{Hz}\,\mu\mathrm{G}^{-1}$] | $(@bind zeeman_coefficient_Hz_uG PlutoUI.NumberField(0.0:0.01:10.0; default = 2.80)) |
-| Non-thermal line width [$\mathrm{km\,s}^{-1}$] | $(@bind zeeman_microturbulence_kms PlutoUI.NumberField(0.05:0.05:20.0; default = 0.8)) |
-| Velocity padding [$\mathrm{km\,s}^{-1}$] | $(@bind zeeman_velocity_padding_kms PlutoUI.NumberField(1.0:0.5:50.0; default = 5.0)) |
-| Number of channels | $(@bind zeeman_channel_count PlutoUI.Select([101, 201, 301, 401]; default = 201)) |
-| First sky-axis pixel | $(@bind zeeman_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
-| Second sky-axis pixel | $(@bind zeeman_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| $\mathrm{H\,I}$-weighted $B_{\mathrm{LOS}}$ map | $(@bind show_zeeman_Bmap PlutoUI.CheckBox(default = true)) |
-| Frequency-splitting map | $(@bind show_zeeman_split_map PlutoUI.CheckBox(default = true)) |
-| Stokes-$I$ spectrum | $(@bind show_zeeman_I_spectrum PlutoUI.CheckBox(default = true)) |
-| Stokes-$V$ spectrum | $(@bind show_zeeman_V_spectrum PlutoUI.CheckBox(default = true)) |
-| Derivative-fit model | $(@bind show_zeeman_fit PlutoUI.CheckBox(default = true)) |
+| Neutral $\mathrm{H\,I}$ fraction | $(@bind shine_neutral_fraction PlutoUI.NumberField(0.0:0.01:1.0; default = 1.0)) |
+| Mass per H nucleon [$m_H$] | $(@bind shine_mu_H PlutoUI.NumberField(1.0:0.01:2.0; default = 1.4)) |
+| Thermal broadening mass $\mu$ [$m_H$] | $(@bind shine_thermal_mu PlutoUI.NumberField(0.1:0.1:5.0; default = 1.0)) |
+| Fixed line width [$\mathrm{km\,s^{-1}}$; $0$ uses thermal broadening] | $(@bind shine_fixed_width_kms PlutoUI.NumberField(0.0:0.1:30.0; default = 0.0)) |
+| Minimum velocity [$\mathrm{km\,s^{-1}}$] | $(@bind shine_velocity_min PlutoUI.NumberField(-200.0:0.5:0.0; default = -30.0)) |
+| Maximum velocity [$\mathrm{km\,s^{-1}}$] | $(@bind shine_velocity_max PlutoUI.NumberField(0.0:0.5:200.0; default = 30.0)) |
+| Channel width [$\mathrm{km\,s^{-1}}$] | $(@bind shine_velocity_step PlutoUI.NumberField(0.25:0.25:10.0; default = 1.0)) |
+| CNM/LNM boundary [$\mathrm{K}$] | $(@bind shine_TCNM PlutoUI.NumberField(10.0:10.0:2000.0; default = 200.0)) |
+| LNM/WNM boundary [$\mathrm{K}$] | $(@bind shine_TWNM PlutoUI.NumberField(100.0:50.0:20000.0; default = 2000.0)) |
+| FFT CNM threshold [$\mathrm{(km\,s^{-1})^{-1}}$] | $(@bind shine_fft_klim PlutoUI.NumberField(0.0:0.01:2.0; default = 0.12)) |
+| First sky-axis pixel | $(@bind shine_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
+| Second sky-axis pixel | $(@bind shine_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
+| Logarithmic column-density maps | $(@bind log_shine_column PlutoUI.CheckBox(default = true)) |
+| Total $N_{\mathrm{HI}}$ map | $(@bind show_shine_NHI PlutoUI.CheckBox(default = true)) |
+| CNM column-density map | $(@bind show_shine_NCNM PlutoUI.CheckBox(default = false)) |
+| LNM column-density map | $(@bind show_shine_NLNM PlutoUI.CheckBox(default = false)) |
+| WNM column-density map | $(@bind show_shine_NWNM PlutoUI.CheckBox(default = false)) |
+| Peak $T_B$ map | $(@bind show_shine_peakTb PlutoUI.CheckBox(default = true)) |
+| Moment-0 map | $(@bind show_shine_mom0 PlutoUI.CheckBox(default = true)) |
+| Moment-1 map | $(@bind show_shine_mom1 PlutoUI.CheckBox(default = true)) |
+| Moment-2 map | $(@bind show_shine_mom2 PlutoUI.CheckBox(default = true)) |
+| Peak optical-depth map | $(@bind show_shine_tau PlutoUI.CheckBox(default = false)) |
+| FFT CNM tracer map | $(@bind show_shine_fftcnm PlutoUI.CheckBox(default = false)) |
+| Optically thick $T_B(v)$ | $(@bind show_shine_Tb_spectrum PlutoUI.CheckBox(default = true)) |
+| Optical-depth spectrum $\tau(v)$ | $(@bind show_shine_tau_spectrum PlutoUI.CheckBox(default = true)) |
+| Blue/green velocity boundary [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_blue_green PlutoUI.NumberField(-200.0:0.5:200.0; default = 4.0)) |
+| Green/red velocity boundary [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_green_red PlutoUI.NumberField(-200.0:0.5:200.0; default = 10.0)) |
+| RGB stretch percentile | $(@bind shine_rgb_percentile PlutoUI.NumberField(90.0:0.5:100.0; default = 99.5)) |
+| RGB asinh softening | $(@bind shine_rgb_softening PlutoUI.NumberField(0.01:0.01:1.0; default = 0.10)) |
+| Normalize each velocity band independently | $(@bind shine_rgb_independent PlutoUI.CheckBox(default = true)) |
 """
 
-# ╔═╡ 76b9cf43-a13e-44c8-97d6-4760cc3aa486
+# ╔═╡ bcc05889-02bb-47cf-b672-139e8efe4137
 begin
-    function extract_sightline(A, i, j, line_dim, plane_dims)
-        indices = Any[Colon(), Colon(), Colon()]
-        indices[plane_dims[1]] = i
-        indices[plane_dims[2]] = j
-        vec(view(A, indices...))
+    function shine_hi_spectrum(n, velocity, temperature, channels, dz_cm, thermal_mu, fixed_width)
+        Tb = zeros(Float64, length(channels))
+        tau_front = zeros(Float64, length(channels))
+        for cell in eachindex(n)
+            (n[cell] <= 0 || temperature[cell] <= 0) && continue
+            sigma = fixed_width > 0 ? fixed_width :
+                sqrt(K_B_CGS * temperature[cell] / (M_H_CGS * thermal_mu)) / KM_CM
+            sigma = max(sigma, eps(Float64))
+            normalization = 1 / (sqrt(2pi) * sigma)
+            for channel in eachindex(channels)
+                argument = (channels[channel] - velocity[cell]) / sigma
+                profile = exp(-0.5 * argument^2) * normalization
+                tau_cell = profile * n[cell] * dz_cm / (1.823e18 * temperature[cell])
+                Tb[channel] += temperature[cell] * (-expm1(-tau_cell)) * exp(-tau_front[channel])
+                tau_front[channel] += tau_cell
+            end
+        end
+        Tb, tau_front
     end
 
-    zeeman_nHI = Float64(zeeman_neutral_fraction) .* cube.rho ./ (1.4M_H_CGS)
-    zeeman_Blos_uG_cube = GAUSS_TO_MICROGAUSS .* Bcomponents[los_dim]
-    zeeman_valid_cube = isfinite.(zeeman_nHI) .& isfinite.(zeeman_Blos_uG_cube) .&
-        (zeeman_nHI .> 0)
-    zeeman_weight_sum = finite_sum_dims(ifelse.(zeeman_valid_cube, zeeman_nHI, NaN), los_dim)
-    zeeman_B_numerator = finite_sum_dims(ifelse.(zeeman_valid_cube,
-        zeeman_nHI .* zeeman_Blos_uG_cube, NaN), los_dim)
-    zeeman_weight_sum = apply_observational_beam_2d(zeeman_weight_sum, cube, sky_dims)
-    zeeman_B_numerator = apply_observational_beam_2d(
-        zeeman_B_numerator, cube, sky_dims)
-    zeeman_Bmap_uG = zeeman_B_numerator ./ max.(zeeman_weight_sum, eps(Float64))
-    zeeman_z = Float64(zeeman_coefficient_Hz_uG)
-    zeeman_split_map_Hz = zeeman_z .* zeeman_Bmap_uG
+    shine_permutation = (sky_dims[1], sky_dims[2], los_dim)
+    shine_nHI_native = Float64(shine_neutral_fraction) .* cube.rho ./
+        (max(Float64(shine_mu_H), eps(Float64)) * M_H_CGS)
+    shine_nHI = permutedims(shine_nHI_native, shine_permutation)
+    shine_temperature = permutedims(max.(T, eps(Float64)), shine_permutation)
+    shine_velocity = permutedims((cube.vx, cube.vy, cube.vz)[los_dim], shine_permutation)
+    shine_TCNM_value = min(Float64(shine_TCNM), Float64(shine_TWNM))
+    shine_TWNM_value = max(Float64(shine_TCNM), Float64(shine_TWNM))
+    shine_nCNM = shine_nHI .* (shine_temperature .< shine_TCNM_value)
+    shine_nLNM = shine_nHI .* ((shine_temperature .>= shine_TCNM_value) .&
+        (shine_temperature .< shine_TWNM_value))
+    shine_nWNM = shine_nHI .* (shine_temperature .>= shine_TWNM_value)
+    shine_NHI = finite_sum_dims(shine_nHI, 3) .* dx_los_cm
+    shine_NCNM = finite_sum_dims(shine_nCNM, 3) .* dx_los_cm
+    shine_NLNM = finite_sum_dims(shine_nLNM, 3) .* dx_los_cm
+    shine_NWNM = finite_sum_dims(shine_nWNM, 3) .* dx_los_cm
+    shine_NHI = apply_observational_beam_2d(shine_NHI, cube, sky_dims)
+    shine_NCNM = apply_observational_beam_2d(shine_NCNM, cube, sky_dims)
+    shine_NLNM = apply_observational_beam_2d(shine_NLNM, cube, sky_dims)
+    shine_NWNM = apply_observational_beam_2d(shine_NWNM, cube, sky_dims)
 
-    zeeman_i, zeeman_j = Int(zeeman_sky_i), Int(zeeman_sky_j)
-    zeeman_v_components = (cube.vx, cube.vy, cube.vz)
-    zeeman_vlos = extract_sightline(zeeman_v_components[los_dim], zeeman_i, zeeman_j, los_dim, sky_dims)
-    zeeman_Tline = extract_sightline(T, zeeman_i, zeeman_j, los_dim, sky_dims)
-    zeeman_nline = extract_sightline(zeeman_nHI, zeeman_i, zeeman_j, los_dim, sky_dims)
-    zeeman_Bline_uG = extract_sightline(zeeman_Blos_uG_cube, zeeman_i, zeeman_j, los_dim, sky_dims)
-    zeeman_sigma_thermal = sqrt.(K_B_CGS .* max.(zeeman_Tline, 0.0) ./ M_H_CGS) ./ KM_CM
-    zeeman_sigma_kms = sqrt.(zeeman_sigma_thermal .^ 2 .+ Float64(zeeman_microturbulence_kms)^2)
-    zeeman_Ncell = zeeman_nline .* dx_los_cm
-    zeeman_line_valid = isfinite.(zeeman_vlos) .& isfinite.(zeeman_sigma_kms) .&
-        isfinite.(zeeman_Ncell) .& isfinite.(zeeman_Bline_uG) .&
-        (zeeman_sigma_kms .> 0) .& (zeeman_Ncell .>= 0)
-    zeeman_vlos = zeeman_vlos[zeeman_line_valid]
-    zeeman_sigma_kms = zeeman_sigma_kms[zeeman_line_valid]
-    zeeman_Ncell = zeeman_Ncell[zeeman_line_valid]
-    zeeman_Bline_uG = zeeman_Bline_uG[zeeman_line_valid]
-    if isempty(zeeman_vlos)
-        zeeman_vlos = [0.0]
-        zeeman_sigma_kms = [max(Float64(zeeman_microturbulence_kms), eps(Float64))]
-        zeeman_Ncell = [0.0]
-        zeeman_Bline_uG = [0.0]
+    shine_vlo = min(Float64(shine_velocity_min), Float64(shine_velocity_max))
+    shine_vhi = max(Float64(shine_velocity_min), Float64(shine_velocity_max))
+    shine_dv = max(Float64(shine_velocity_step), 0.25)
+    shine_velocity_axis = collect(shine_vlo:shine_dv:shine_vhi)
+    length(shine_velocity_axis) >= 2 || (shine_velocity_axis = [shine_vlo, shine_vlo + shine_dv])
+    shine_Tb = zeros(Float64, size(shine_nHI, 1), size(shine_nHI, 2), length(shine_velocity_axis))
+    shine_tau = similar(shine_Tb)
+    shine_mu_value = max(Float64(shine_thermal_mu), eps(Float64))
+    shine_fixed_width_value = max(Float64(shine_fixed_width_kms), 0.0)
+    Threads.@threads for i in axes(shine_nHI, 1)
+        for j in axes(shine_nHI, 2)
+            Tb_line, tau_line = shine_hi_spectrum(
+                @view(shine_nHI[i, j, :]), @view(shine_velocity[i, j, :]),
+                @view(shine_temperature[i, j, :]), shine_velocity_axis, dx_los_cm,
+                shine_mu_value, shine_fixed_width_value)
+            shine_Tb[i, j, :] .= Tb_line
+            shine_tau[i, j, :] .= tau_line
+        end
     end
-    zeeman_padding = Float64(zeeman_velocity_padding_kms)
-    zeeman_vmin = minimum(zeeman_vlos .- 4 .* zeeman_sigma_kms) - zeeman_padding
-    zeeman_vmax = maximum(zeeman_vlos .+ 4 .* zeeman_sigma_kms) + zeeman_padding
-    zeeman_velocity_axis = collect(range(zeeman_vmin, zeeman_vmax; length = Int(zeeman_channel_count)))
-    zeeman_amplitudes = zeeman_Ncell ./
-        (1.823e18 .* sqrt(2pi) .* max.(zeeman_sigma_kms, eps(Float64)))
-    zeeman_profiles = [zeeman_amplitudes[cell] *
-        exp(-0.5 * ((velocity - zeeman_vlos[cell]) / zeeman_sigma_kms[cell])^2)
-        for velocity in zeeman_velocity_axis, cell in eachindex(zeeman_vlos)]
-    zeeman_I_K = vec(sum(zeeman_profiles; dims = 2))
-    zeeman_nu0_Hz = Float64(zeeman_frequency_MHz) * 1.0e6
-    zeeman_dIdnu_profiles = [zeeman_profiles[channel, cell] *
-        (zeeman_velocity_axis[channel] - zeeman_vlos[cell]) / zeeman_sigma_kms[cell]^2 *
-        C_LIGHT_KMS / zeeman_nu0_Hz
-        for channel in eachindex(zeeman_velocity_axis), cell in eachindex(zeeman_vlos)]
-    zeeman_dIdnu = vec(sum(zeeman_dIdnu_profiles; dims = 2))
-    zeeman_V_K = 0.5zeeman_z .* vec(zeeman_dIdnu_profiles * zeeman_Bline_uG)
-    zeeman_fit_denominator = zeeman_z * sum(abs2, zeeman_dIdnu)
-    zeeman_Bfit_uG = zeeman_fit_denominator > 0 ?
-        2sum(zeeman_dIdnu .* zeeman_V_K) / zeeman_fit_denominator : NaN
-    zeeman_Vfit_K = 0.5zeeman_z * zeeman_Bfit_uG .* zeeman_dIdnu
-    zeeman_Btrue_uG = sum(zeeman_Ncell .* zeeman_Bline_uG) / max(sum(zeeman_Ncell), eps(Float64))
+    shine_Tb = apply_observational_beam_cube(shine_Tb, cube, sky_dims)
+    shine_tau = apply_observational_beam_cube(shine_tau, cube, sky_dims)
 
-    zeeman_map_specs = NamedTuple[]
-    show_zeeman_Bmap && push!(zeeman_map_specs, (data = zeeman_Bmap_uG,
-        label = L"\langle B_{\mathrm{LOS}}\rangle_{\mathrm{HI}}\;[\mu\mathrm{G}]", colormap = :balance))
-    show_zeeman_split_map && push!(zeeman_map_specs, (data = zeeman_split_map_Hz,
-        label = L"\Delta\nu_Z\;[\mathrm{Hz}]", colormap = :balance))
-    if isempty(zeeman_map_specs)
-        fig_zeeman_maps = Figure(size = (900, 180))
-        Label(fig_zeeman_maps[1, 1], L"\mathrm{Select\ at\ least\ one\ Zeeman\ map.}", fontsize = 20)
+    shine_velocity_3d = reshape(shine_velocity_axis, 1, 1, :)
+    shine_positive_weight = max.(shine_Tb, 0.0) .* shine_dv
+    shine_mom0 = finite_sum_dims(shine_positive_weight, 3)
+    shine_weight_sum = max.(shine_mom0, eps(Float64))
+    shine_mom1 = finite_sum_dims(shine_positive_weight .* shine_velocity_3d, 3) ./ shine_weight_sum
+    shine_mom2 = sqrt.(max.(finite_sum_dims(shine_positive_weight .*
+        (shine_velocity_3d .- reshape(shine_mom1, size(shine_mom1)..., 1)) .^ 2, 3) ./
+        shine_weight_sum, 0.0))
+    shine_peakTb = finite_maximum_dims(shine_Tb, 3)
+    shine_peak_tau = finite_maximum_dims(shine_tau, 3)
+    shine_fft_frequency = fftfreq(length(shine_velocity_axis), shine_dv)
+    shine_fft_indices = findall(>(Float64(shine_fft_klim)), shine_fft_frequency)
+    shine_fftcnm = zeros(Float64, size(shine_NHI))
+    if !isempty(shine_fft_indices)
+        Threads.@threads for i in axes(shine_Tb, 1)
+            for j in axes(shine_Tb, 2)
+                amplitudes = abs.(fft(@view shine_Tb[i, j, :]))
+                shine_fftcnm[i, j] = amplitudes[1] > 0 ? maximum(amplitudes[shine_fft_indices]) / amplitudes[1] : 0.0
+            end
+        end
+    end
+
+    shine_specs = NamedTuple[]
+    function add_shine_column!(enabled, data, symbol)
+        enabled || return
+        shown = log_shine_column ? safe_log10.(data) : data
+        label = log_shine_column ? latexstring("\\log_{10}(", symbol,
+            "/[\\mathrm{cm}^{-2}])") : latexstring(symbol, "\\;[\\mathrm{cm}^{-2}]")
+        push!(shine_specs, (data = shown, label, colormap = :magma, diverging = false))
+    end
+    add_shine_column!(show_shine_NHI, shine_NHI, "N_{\\mathrm{HI}}")
+    add_shine_column!(show_shine_NCNM, shine_NCNM, "N_{\\mathrm{CNM}}")
+    add_shine_column!(show_shine_NLNM, shine_NLNM, "N_{\\mathrm{LNM}}")
+    add_shine_column!(show_shine_NWNM, shine_NWNM, "N_{\\mathrm{WNM}}")
+    show_shine_peakTb && push!(shine_specs, (data = shine_peakTb,
+        label = L"\max_v T_B\;[\mathrm{K}]", colormap = :thermal, diverging = false))
+    show_shine_mom0 && push!(shine_specs, (data = shine_mom0,
+        label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", colormap = :viridis, diverging = false))
+    show_shine_mom1 && push!(shine_specs, (data = shine_mom1,
+        label = L"M_1\;[\mathrm{km\,s}^{-1}]", colormap = :balance, diverging = true))
+    show_shine_mom2 && push!(shine_specs, (data = shine_mom2,
+        label = L"M_2\;[\mathrm{km\,s}^{-1}]", colormap = :plasma, diverging = false))
+    show_shine_tau && push!(shine_specs, (data = shine_peak_tau,
+        label = L"\max_v\tau_{21}", colormap = :inferno, diverging = false))
+    show_shine_fftcnm && push!(shine_specs, (data = shine_fftcnm,
+        label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", colormap = :viridis, diverging = false))
+
+    if isempty(shine_specs)
+        fig_shine = Figure(size = (900, 180))
+        Label(fig_shine[1, 1], L"\mathrm{Select\ at\ least\ one\ SHINE\ H\,I\ map.}", fontsize = 20)
     else
-        fig_zeeman_maps = Figure(size = (540length(zeeman_map_specs), 410))
-        for (index, spec) in enumerate(zeeman_map_specs)
-            panel = fig_zeeman_maps[1, index] = GridLayout()
-            ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+        shine_ncols = length(shine_specs) == 1 ? 1 : 2
+        shine_nrows = cld(length(shine_specs), shine_ncols)
+        fig_shine = Figure(size = (550shine_ncols, 420shine_nrows))
+        for (index, spec) in enumerate(shine_specs)
+            row, col = cld(index, shine_ncols), mod1(index, shine_ncols)
+            panel = fig_shine[row, col] = GridLayout()
+            ax = latex_axis(panel[1, 1],
+                xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
                 colormap = spec.colormap,
-                colorrange = robust_colorrange(spec.data, color_percentile; diverging = true))
-            scatter!(ax, [sky_coordinates[1][zeeman_i]], [sky_coordinates[2][zeeman_j]];
-                marker = :cross, markersize = 20, strokewidth = 3, color = :white)
+                colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging))
+            scatter!(ax, [sky_coordinates[1][Int(shine_sky_i)]],
+                [sky_coordinates[2][Int(shine_sky_j)]];
+                marker = :cross, markersize = 18, strokewidth = 3, color = :white)
             latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
-    display_zeeman_maps ? fig_zeeman_maps : nothing
+    display_shine ? fig_shine : nothing
 end
 
-# ╔═╡ 82e22c29-1cf5-47dc-a54c-68577f8069bc
+# ╔═╡ 5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
 begin
-    zeeman_spectrum_specs = Symbol[]
-    show_zeeman_I_spectrum && push!(zeeman_spectrum_specs, :I)
-    show_zeeman_V_spectrum && push!(zeeman_spectrum_specs, :V)
-    if isempty(zeeman_spectrum_specs)
-        fig_zeeman_spectra = Figure(size = (900, 180))
-        Label(fig_zeeman_spectra[1, 1], L"\mathrm{Select\ at\ least\ one\ Zeeman\ spectrum.}", fontsize = 20)
-    else
-        fig_zeeman_spectra = Figure(size = (560length(zeeman_spectrum_specs), 390))
-        for (index, spectrum) in enumerate(zeeman_spectrum_specs)
-            if spectrum == :I
-                ax = latex_axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
-                    ylabel = L"I_\nu\;[\mathrm{K}]")
-                lines!(ax, zeeman_velocity_axis, zeeman_I_K; color = MHD_COLORS[1], linewidth = 2.5)
-            else
-                ax = latex_axis(fig_zeeman_spectra[1, index], xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]",
-                    ylabel = L"V_\nu\;[\mathrm{mK}]")
-                lines!(ax, zeeman_velocity_axis, 1.0e3 .* zeeman_V_K; color = MHD_COLORS[2], linewidth = 2.5)
-                show_zeeman_fit && lines!(ax, zeeman_velocity_axis, 1.0e3 .* zeeman_Vfit_K;
-                    color = :black, linewidth = 2, linestyle = :dash)
-                hlines!(ax, [0.0]; color = (:gray, 0.5), linestyle = :dot)
-            end
+    "Integrate positive H I brightness over a closed velocity interval."
+    function shine_velocity_band(Tb, velocities, lower, upper, dv;
+            include_lower = true, include_upper = true)
+        indices = findall(velocities) do velocity
+            lower_ok = include_lower ? lower <= velocity : lower < velocity
+            upper_ok = include_upper ? velocity <= upper : velocity < upper
+            lower_ok && upper_ok
         end
-    end
-    display_zeeman_spectra ? fig_zeeman_spectra : nothing
-end
-
-# ╔═╡ 8f9e5bd2-8c7f-45b9-a92c-ad4b20d9ef21
-begin
-    function zeeman_fraction_maps(nHI, vlos_cube, temperature_cube, Blos_uG_cube,
-            line_dim, plane_dims, dx_cm, microturbulence_kms,
-            rest_frequency_Hz, splitting_coefficient, channel_count)
-        map_shape = size(selectdim(nHI, line_dim, 1))
-        NHI_map = zeros(Float64, map_shape)
-        pV_map = zeros(Float64, map_shape)
-        Ipeak_map = zeros(Float64, map_shape)
-        for pixel in CartesianIndices(map_shape)
-            i, j = Tuple(pixel)
-            nline = extract_sightline(nHI, i, j, line_dim, plane_dims)
-            vline = extract_sightline(vlos_cube, i, j, line_dim, plane_dims)
-            Tline = extract_sightline(temperature_cube, i, j, line_dim, plane_dims)
-            Bline = extract_sightline(Blos_uG_cube, i, j, line_dim, plane_dims)
-            sigma = sqrt.(K_B_CGS .* max.(Tline, 0.0) ./ M_H_CGS) ./ KM_CM
-            sigma = sqrt.(sigma .^ 2 .+ microturbulence_kms^2)
-            Ncell = nline .* dx_cm
-            NHI_map[pixel] = sum(Ncell)
-            amplitudes = Ncell ./
-                (1.823e18 .* sqrt(2pi) .* max.(sigma, eps(Float64)))
-            velocity = range(minimum(vline .- 5 .* sigma),
-                maximum(vline .+ 5 .* sigma); length = channel_count)
-            Iprofile = zeros(Float64, channel_count)
-            Vprofile = zeros(Float64, channel_count)
-            for cell in eachindex(vline)
-                profile = @. amplitudes[cell] *
-                    exp(-0.5 * ((velocity - vline[cell]) / sigma[cell])^2)
-                derivative = @. profile * (velocity - vline[cell]) / sigma[cell]^2 *
-                    C_LIGHT_KMS / rest_frequency_Hz
-                Iprofile .+= profile
-                Vprofile .+= 0.5splitting_coefficient .* Bline[cell] .* derivative
-            end
-            Ipeak_map[pixel] = maximum(Iprofile)
-            pV_map[pixel] = maximum(abs, Vprofile) /
-                max(Ipeak_map[pixel], eps(Float64))
-        end
-        NHI_map, pV_map, Ipeak_map
+        isempty(indices) && return zeros(Float64, size(Tb, 1), size(Tb, 2))
+        dropdims(sum(max.(@view(Tb[:, :, indices]), 0.0); dims = 3); dims = 3) .* dv
     end
 
-    zeeman_NHI_map, zeeman_pV_map, zeeman_Ipeak_map_K = zeeman_fraction_maps(
-        zeeman_nHI, zeeman_v_components[los_dim], T, zeeman_Blos_uG_cube,
-        los_dim, sky_dims, dx_los_cm, Float64(zeeman_microturbulence_kms),
-        zeeman_nu0_Hz, zeeman_z, Int(zeeman_channel_count))
-    zeeman_pV_numerator = apply_observational_beam_2d(
-        zeeman_pV_map .* zeeman_Ipeak_map_K, cube, sky_dims)
-    zeeman_Ipeak_map_K = apply_observational_beam_2d(
-        zeeman_Ipeak_map_K, cube, sky_dims)
-    zeeman_NHI_map = apply_observational_beam_2d(zeeman_NHI_map, cube, sky_dims)
-    zeeman_pV_map = zeeman_pV_numerator ./ max.(zeeman_Ipeak_map_K, eps(Float64))
-    fig_zeeman_p_column = polarization_column_figure(
-        zeeman_NHI_map, zeeman_pV_map,
-        L"100p_V\;[\%]", MHD_COLORS[2])
-    display_zeeman_p_column ? fig_zeeman_p_column : nothing
-end
+    "Apply a robust asinh display stretch to one velocity-integrated map."
+    function shine_rgb_stretch(data, scale, softening)
+        safe_scale = max(scale, eps(Float64))
+        safe_softening = max(softening, eps(Float64))
+        stretched = asinh.(max.(data, 0.0) ./ (safe_softening * safe_scale)) ./
+            asinh(1 / safe_softening)
+        clamp.(stretched, 0.0, 1.0)
+    end
 
-# ╔═╡ fd817f74-8bc0-4df7-85ad-45a95522f80a
-begin
-    zeeman_true_text = @sprintf("%.5g", zeeman_Btrue_uG)
-    zeeman_fit_text = @sprintf("%.5g", zeeman_Bfit_uG)
-    zeeman_split_text = @sprintf("%.5g", zeeman_z * zeeman_Btrue_uG)
-    Markdown.parse("""
-    ### Selected-sightline Zeeman result
+    shine_rgb_boundary_1 = clamp(min(Float64(shine_rgb_blue_green),
+        Float64(shine_rgb_green_red)), shine_vlo, shine_vhi)
+    shine_rgb_boundary_2 = clamp(max(Float64(shine_rgb_blue_green),
+        Float64(shine_rgb_green_red)), shine_vlo, shine_vhi)
 
-    | Quantity | Recovered value |
-    |:--|:--|
-    | ``\\mathrm{H\\,I}``-weighted ``B_{\\mathrm{LOS}}`` | **$(zeeman_true_text)** ``\\mu\\mathrm{G}`` |
-    | Stokes-``V`` derivative fit | **$(zeeman_fit_text)** ``\\mu\\mathrm{G}`` |
-    | ``\\mathrm{H\\,I}``-weighted splitting | **$(zeeman_split_text)** ``\\mathrm{Hz}`` |
-    """)
-end
+    shine_rgb_blue_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
+        shine_vlo, shine_rgb_boundary_1, shine_dv; include_upper = false)
+    shine_rgb_green_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
+        shine_rgb_boundary_1, shine_rgb_boundary_2, shine_dv)
+    shine_rgb_red_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
+        shine_rgb_boundary_2, shine_vhi, shine_dv; include_lower = false)
 
-# ╔═╡ a0030003-6f8c-4d0c-9a10-000000000003
-begin
-    zeeman_structure_specs = [
-        (data = zeeman_Bmap_uG, label = L"\langle B_{\mathrm{LOS}}\rangle_{\mathrm{HI}}\;[\mu\mathrm{G}]", color = MHD_COLORS[1], period = nothing),
-        (data = zeeman_split_map_Hz, label = L"\Delta\nu_Z\;[\mathrm{Hz}]", color = MHD_COLORS[2], period = nothing),
-        (data = zeeman_NHI_map, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
-        (data = zeeman_Ipeak_map_K, label = L"\max_v I(v)\;[\mathrm{K}]", color = MHD_COLORS[4], period = nothing),
-        (data = zeeman_pV_map, label = L"p_V", color = MHD_COLORS[5], period = nothing),
+    shine_rgb_quantile = clamp(Float64(shine_rgb_percentile) / 100, 0.0, 1.0)
+    shine_rgb_scales = [quantile(filter(isfinite, vec(channel)), shine_rgb_quantile)
+        for channel in (shine_rgb_red_map, shine_rgb_green_map, shine_rgb_blue_map)]
+    if !shine_rgb_independent
+        shared_scale = maximum(shine_rgb_scales)
+        shine_rgb_scales .= shared_scale
+    end
+    shine_rgb_softening_value = max(Float64(shine_rgb_softening), 0.01)
+    shine_rgb_red = shine_rgb_stretch(shine_rgb_red_map, shine_rgb_scales[1],
+        shine_rgb_softening_value)
+    shine_rgb_green = shine_rgb_stretch(shine_rgb_green_map, shine_rgb_scales[2],
+        shine_rgb_softening_value)
+    shine_rgb_blue = shine_rgb_stretch(shine_rgb_blue_map, shine_rgb_scales[3],
+        shine_rgb_softening_value)
+    shine_rgb_image = RGBf.(shine_rgb_red, shine_rgb_green, shine_rgb_blue)
+
+    fig_shine_rgb = Figure(size = (820, 670))
+    shine_rgb_axis = latex_axis(fig_shine_rgb[1, 1],
+        xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+        ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"),
+        title = L"\mathrm{H\,I\ velocity\ composite}")
+    image!(shine_rgb_axis,
+        (first(sky_coordinates[1]), last(sky_coordinates[1])),
+        (first(sky_coordinates[2]), last(sky_coordinates[2])),
+        shine_rgb_image)
+    rowsize!(fig_shine_rgb.layout, 1, Aspect(1, 1))
+
+    shine_rgb_labels = [
+        latexstring("R:\\ ", @sprintf("%.4g", shine_rgb_boundary_2),
+            "<v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_vhi),
+            "\\;\\mathrm{km\\,s}^{-1}"),
+        latexstring("G:\\ ", @sprintf("%.4g", shine_rgb_boundary_1),
+            "\\leq v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_rgb_boundary_2),
+            "\\;\\mathrm{km\\,s}^{-1}"),
+        latexstring("B:\\ ", @sprintf("%.4g", shine_vlo),
+            "\\leq v_{\\mathrm{LOS}}<", @sprintf("%.4g", shine_rgb_boundary_1),
+            "\\;\\mathrm{km\\,s}^{-1}"),
     ]
-    fig_zeeman_structure = display_observational_structure_functions ?
-        observational_structure_figure(zeeman_structure_specs, cube, sky_dims,
+    shine_rgb_label_colors = [RGBf(0.86, 0.16, 0.20), RGBf(0.05, 0.62, 0.34), RGBf(0.12, 0.35, 0.92)]
+    shine_rgb_legend = GridLayout(fig_shine_rgb[2, 1])
+    for index in eachindex(shine_rgb_labels)
+        Label(shine_rgb_legend[1, index], shine_rgb_labels[index];
+            color = shine_rgb_label_colors[index], fontsize = 16, tellwidth = true)
+    end
+    display_shine_rgb ? fig_shine_rgb : nothing
+end
+
+# ╔═╡ 27e51ba5-4592-4766-9dde-0de383a889a0
+begin
+    shine_spectrum_specs = Symbol[]
+    show_shine_Tb_spectrum && push!(shine_spectrum_specs, :brightness)
+    show_shine_tau_spectrum && push!(shine_spectrum_specs, :optical_depth)
+    if isempty(shine_spectrum_specs)
+        fig_shine_spectrum = Figure(size = (900, 180))
+        Label(fig_shine_spectrum[1, 1], L"\mathrm{Select\ at\ least\ one\ H\,I\ spectrum.}", fontsize = 20)
+    else
+        fig_shine_spectrum = Figure(size = (570length(shine_spectrum_specs), 390))
+        for (index, spectrum_type) in enumerate(shine_spectrum_specs)
+            if spectrum_type == :brightness
+                ax = latex_axis(fig_shine_spectrum[1, index],
+                    xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]", ylabel = L"T_B\;[\mathrm{K}]")
+                show_shine_Tb_spectrum && lines!(ax, shine_velocity_axis,
+                    @view(shine_Tb[Int(shine_sky_i), Int(shine_sky_j), :]);
+                    color = MHD_COLORS[1], linewidth = 2.5, label = "T_B")
+                axislegend(ax; position = :rt, framevisible = false)
+            else
+                ax = latex_axis(fig_shine_spectrum[1, index],
+                    xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]", ylabel = L"\tau_{21}")
+                lines!(ax, shine_velocity_axis,
+                    @view(shine_tau[Int(shine_sky_i), Int(shine_sky_j), :]);
+                    color = MHD_COLORS[5], linewidth = 2.5)
+            end
+        end
+    end
+    display_shine_spectrum ? fig_shine_spectrum : nothing
+end
+
+# ╔═╡ a0050005-6f8c-4d0c-9a10-000000000005
+begin
+    shine_structure_specs = [
+        (data = shine_NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[1], period = nothing),
+        (data = shine_NCNM, label = L"N_{\mathrm{CNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[2], period = nothing),
+        (data = shine_NLNM, label = L"N_{\mathrm{LNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
+        (data = shine_NWNM, label = L"N_{\mathrm{WNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[4], period = nothing),
+        (data = shine_peakTb, label = L"\max_v T_B\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
+        (data = shine_mom0, label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", color = MHD_COLORS[6], period = nothing),
+        (data = shine_mom1, label = L"M_1\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[1], period = nothing),
+        (data = shine_mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[2], period = nothing),
+        (data = shine_peak_tau, label = L"\max_v\tau_{21}", color = MHD_COLORS[3], period = nothing),
+        (data = shine_fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", color = MHD_COLORS[4], period = nothing),
+        (data = shine_rgb_blue_map, label = L"W_{\mathrm{blue}}\;[\mathrm{K\,km\,s}^{-1}]", color = :dodgerblue3, period = nothing),
+        (data = shine_rgb_green_map, label = L"W_{\mathrm{green}}\;[\mathrm{K\,km\,s}^{-1}]", color = :seagreen3, period = nothing),
+        (data = shine_rgb_red_map, label = L"W_{\mathrm{red}}\;[\mathrm{K\,km\,s}^{-1}]", color = :firebrick3, period = nothing),
+    ]
+    fig_shine_structure = display_observational_structure_functions ?
+        observational_structure_figure(shine_structure_specs, cube, sky_dims,
             observational_structure_order, observational_structure_samples;
-            heading = "Zeeman observable structure functions") : Figure(size = (900, 120))
-    display_observational_structure_functions ? fig_zeeman_structure : nothing
+            heading = "SHINE observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_shine_structure : nothing
 end
 
 # ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
 begin
     export_figure_options = [
-        "zeeman_maps" => "Zeeman maps",
-        "zeeman_structure" => "Zeeman observable structure functions",
-        "zeeman_spectra" => "Zeeman Stokes spectra",
-        "zeeman_p_column" => "Zeeman polarization versus column density",
+        "shine" => "SHINE H I maps",
+        "shine_structure" => "SHINE observable structure functions",
+        "shine_rgb" => "SHINE velocity RGB composite",
+        "shine_spectrum" => "SHINE H I spectrum",
     ]
     export_figure_registry = Dict(
-        "zeeman_maps" => fig_zeeman_maps,
-        "zeeman_structure" => fig_zeeman_structure,
-        "zeeman_spectra" => fig_zeeman_spectra,
-        "zeeman_p_column" => fig_zeeman_p_column,
+        "shine" => fig_shine,
+        "shine_structure" => fig_shine_structure,
+        "shine_rgb" => fig_shine_rgb,
+        "shine_spectrum" => fig_shine_spectrum,
     )
     nothing
 end
@@ -2634,7 +2862,7 @@ md"""
 
 | Export setting | Control |
 |:--|:--|
-| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "zeeman_maps")) |
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "shine")) |
 | Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
 """
 
@@ -2646,7 +2874,7 @@ begin
     show(export_buffer, export_mime, export_figure_registry[export_figure_key])
     export_bytes = take!(export_buffer)
     export_run_slug = replace(lowercase(selected_run), r"[^a-z0-9]+" => "_")
-    export_filename = "zeeman_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
+    export_filename = "shine_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
     PlutoUI.DownloadButton(export_bytes, export_filename)
 end
 
@@ -4692,12 +4920,11 @@ version = "4.1.0+0"
 # ╟─c12d1f54-40b8-4865-9562-8dcb519f924a
 # ╟─62440e86-b560-44ad-bb0a-43ae62e73fc3
 # ╠═47b786d6-c7b5-44f4-946a-b8c485ad6380
-# ╟─67f95c39-1888-4d23-a2c2-2ee3a6cd7f0f
-# ╟─76b9cf43-a13e-44c8-97d6-4760cc3aa486
-# ╟─82e22c29-1cf5-47dc-a54c-68577f8069bc
-# ╟─8f9e5bd2-8c7f-45b9-a92c-ad4b20d9ef21
-# ╟─fd817f74-8bc0-4df7-85ad-45a95522f80a
-# ╠═a0030003-6f8c-4d0c-9a10-000000000003
+# ╟─478ec2f3-e057-4720-809c-17ca0a3dac21
+# ╟─bcc05889-02bb-47cf-b672-139e8efe4137
+# ╠═5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
+# ╟─27e51ba5-4592-4766-9dde-0de383a889a0
+# ╠═a0050005-6f8c-4d0c-9a10-000000000005
 # ╠═e1000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000002-6f8c-4d0c-9a10-000000000002
 # ╠═e1000003-6f8c-4d0c-9a10-000000000003

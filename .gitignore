@@ -1,1 +1,20 @@
-# Julia project and manifest TOML files are intentionally versioned.
+.DS_Store
+
+# Figures et exports générés.
+figures/
+exports/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.tif
+*.tiff
+*.pdf
+*.html
+
+# Les cubes de simulation ne doivent pas être versionnés avec le code.
+*.h5
+*.hdf5
+*.fits
+*.fit
+*.fts

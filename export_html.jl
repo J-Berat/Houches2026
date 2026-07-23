@@ -5,11 +5,26 @@ Pkg.instantiate()
 
 using Pluto
 
-notebook_name = get(ENV, "DYNAMO_NOTEBOOK", "dynamo.jl")
-notebook_path = abspath(joinpath(@__DIR__, notebook_name))
-isfile(notebook_path) || error("Notebook not found: $notebook_path")
-default_html_name = splitext(basename(notebook_path))[1] * ".html"
-html_path = get(ENV, "DYNAMO_HTML_PATH", joinpath(@__DIR__, default_html_name))
+requested_notebook =
+    get(ENV, "DYNAMO_NOTEBOOK", "dynamo_diagnostics.jl")
+candidate_paths = [
+    abspath(joinpath(@__DIR__, requested_notebook)),
+    abspath(joinpath(@__DIR__, "notebooks", basename(requested_notebook))),
+]
+notebook_index = findfirst(isfile, candidate_paths)
+isnothing(notebook_index) &&
+    error("Notebook introuvable : $requested_notebook")
+notebook_path = candidate_paths[notebook_index]
+html_path = abspath(get(
+    ENV,
+    "DYNAMO_HTML_PATH",
+    joinpath(
+        @__DIR__,
+        "exports",
+        splitext(basename(notebook_path))[1] * ".html",
+    ),
+))
+mkpath(dirname(html_path))
 
 session = Pluto.ServerSession()
 session.options.evaluation.workspace_use_distributed = false
@@ -26,15 +41,15 @@ try
     failed_cells = filter(cell -> cell.errored, notebook.cells)
     if !isempty(failed_cells)
         for cell in failed_cells
-            println(stderr, "\nPluto cell evaluation failed: ", cell.cell_id)
+            println(stderr, "\nÉchec de la cellule Pluto : ", cell.cell_id)
             show(stderr, MIME"text/plain"(), cell.output.body)
             println(stderr)
         end
-        error("Cannot export notebook: $(length(failed_cells)) Pluto cell(s) failed.")
+        error("Export interrompu : $(length(failed_cells)) cellule(s) en erreur.")
     end
     html = Pluto.generate_html(notebook; offline_bundle = true)
     write(html_path, html)
-    println("HTML exported to: $html_path")
+    println("HTML enregistré : ", html_path)
 finally
     Pluto.SessionActions.shutdown(session, notebook; async = false)
 end

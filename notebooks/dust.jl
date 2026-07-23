@@ -50,6 +50,40 @@ begin
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
     const REDUCTION_CACHE = Dict{Any,Any}()
+    const SNAPSHOT_SOURCE_CACHE = Dict{String,Vector{String}}()
+    const DIRECTORY_DISCOVERY_CACHE = Dict{String,Vector{String}}()
+    const SNAPSHOT_FINGERPRINT_CACHE = Dict{String,Any}()
+    const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
+    const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
+
+    function positive_integer_setting(name, default)
+        value = tryparse(Int, strip(get(ENV, name, string(default))))
+        isnothing(value) && error("$name must be a positive integer.")
+        value > 0 || error("$name must be a positive integer.")
+        value
+    end
+
+    # Pluto stays deliberately conservative. The batch engine raises the entry
+    # limit to the number of selected simulations, while this byte ceiling keeps
+    # large production cubes from exhausting memory.
+    const RAW_CUBE_CACHE_MAX_ENTRIES =
+        positive_integer_setting("DYNAMO_RAW_CUBE_CACHE_ENTRIES", 1)
+    const RAW_CUBE_CACHE_MAX_BYTES = positive_integer_setting(
+        "DYNAMO_RAW_CUBE_CACHE_MIB",
+        max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
+    ) * 1024^2
+
+    "Memoize remote file metadata for the duration of the Pluto session."
+    function cached_snapshot_fingerprint(path)
+        canonical = abspath(path)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_FINGERPRINT_CACHE, canonical) do
+                isdir(canonical) || return (mtime(canonical), filesize(canonical))
+                Tuple((basename(entry), mtime(entry), filesize(entry))
+                    for entry in sort(readdir(canonical; join = true)))
+            end
+        end
+    end
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
     reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
@@ -61,10 +95,19 @@ begin
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
 
-    The previous entry is evicted before a cache miss is read. Consequently a
-    slider change never leaves several raw snapshots resident in this cache.
+    Entries use LRU eviction and are bounded by both a count and a byte budget.
+    Interactive Pluto defaults to one cube. Batch comparisons may retain several
+    cubes when memory allows, preventing the same files from being reopened for
+    each requested comparative figure.
     """
     function cached_raw_cube!(key, build)
+        evict_oldest_unlocked!() = begin
+            oldest = popfirst!(RAW_CUBE_CACHE_ORDER)
+            delete!(RAW_CUBE_CACHE, oldest)
+            delete!(RAW_CUBE_CACHE_BYTES, oldest)
+            nothing
+        end
+
         hit = lock(CACHE_LOCK) do
             if haskey(RAW_CUBE_CACHE, key)
                 position = findfirst(isequal(key), RAW_CUBE_CACHE_ORDER)
@@ -76,17 +119,31 @@ begin
             end
         end
         isnothing(hit) || return hit
+
+        # Use the largest resident cube as a conservative estimate of the next
+        # allocation. Evict before reading to bound peak memory, not only the
+        # final cache size.
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            estimated_bytes = isempty(RAW_CUBE_CACHE_BYTES) ? 0 :
+                maximum(values(RAW_CUBE_CACHE_BYTES))
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    (estimated_bytes > 0 &&
+                        sum(values(RAW_CUBE_CACHE_BYTES)) + estimated_bytes >
+                            RAW_CUBE_CACHE_MAX_BYTES))
+                evict_oldest_unlocked!()
+            end
         end
+
         value = build()
         bytes = Base.summarysize(value)
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    sum(values(RAW_CUBE_CACHE_BYTES)) + bytes >
+                        RAW_CUBE_CACHE_MAX_BYTES)
+                evict_oldest_unlocked!()
+            end
             RAW_CUBE_CACHE[key] = value
             RAW_CUBE_CACHE_BYTES[key] = bytes
             push!(RAW_CUBE_CACHE_ORDER, key)
@@ -99,6 +156,75 @@ begin
     function with_hdf5_file(operation::Function, path)
         lock(HDF5_READ_LOCK) do
             h5open(path, "r") do handle
+                operation(handle)
+            end
+        end
+    end
+
+    """
+    Whether an interactive HDF5 snapshot should first be copied to node-local
+    storage. `auto` stages only `/Xnfs` paths; `true` and `false` provide an
+    explicit override through `DYNAMO_LOCAL_HDF5_CACHE`.
+    """
+    function local_hdf5_cache_enabled(path)
+        isfile(path) &&
+            lowercase(splitext(path)[2]) in (".h5", ".hdf5") || return false
+        setting = lowercase(strip(get(ENV, "DYNAMO_LOCAL_HDF5_CACHE", "auto")))
+        setting in ("0", "false", "no", "off") && return false
+        setting in ("1", "true", "yes", "on") && return true
+        setting == "auto" || error(
+            "DYNAMO_LOCAL_HDF5_CACHE must be auto, true, or false; found $(setting).")
+        startswith(normpath(abspath(path)), "/Xnfs/")
+    end
+
+    """
+    Copy `path` into a private temporary directory, retaining at most one staged
+    HDF5 file. This function is called while `HDF5_READ_LOCK` is held.
+    """
+    function stage_hdf5_snapshot_unlocked(path)
+        fingerprint = cached_snapshot_fingerprint(path)
+        previous = LOCAL_HDF5_STAGE[]
+        if !isnothing(previous) && previous.source == path &&
+                previous.fingerprint == fingerprint && isfile(previous.staged_path)
+            return previous.staged_path
+        end
+
+        if isnothing(LOCAL_HDF5_STAGE_DIRECTORY[])
+            requested_parent =
+                get(ENV, "DYNAMO_LOCAL_CACHE_DIRECTORY", tempdir())
+            parent = requested_parent == "~" ? homedir() :
+                startswith(requested_parent, "~/") ?
+                    joinpath(homedir(), requested_parent[3:end]) :
+                    requested_parent
+            isdir(parent) || mkpath(parent)
+            LOCAL_HDF5_STAGE_DIRECTORY[] =
+                mktempdir(parent; prefix = "dynamo_hdf5_")
+        end
+        if !isnothing(previous) && isfile(previous.staged_path)
+            rm(previous.staged_path; force = true)
+        end
+        LOCAL_HDF5_STAGE[] = nothing
+
+        destination = joinpath(
+            LOCAL_HDF5_STAGE_DIRECTORY[],
+            string(hash((abspath(path), fingerprint)), "_", basename(path)),
+        )
+        cp(path, destination; force = true)
+        LOCAL_HDF5_STAGE[] =
+            (source = path, fingerprint = fingerprint, staged_path = destination)
+        destination
+    end
+
+    """
+    Open an analysis snapshot, optionally from the one-file node-local cache.
+    The lock covers both staging and reading, so another Pluto task cannot evict
+    the local file while it is in use.
+    """
+    function with_analysis_hdf5_file(operation::Function, path; stage_local = false)
+        lock(HDF5_READ_LOCK) do
+            read_path = stage_local && local_hdf5_cache_enabled(path) ?
+                stage_hdf5_snapshot_unlocked(path) : path
+            h5open(read_path, "r") do handle
                 operation(handle)
             end
         end
@@ -844,13 +970,13 @@ end
 
 # ╔═╡ 3ef88702-bef5-4eca-a151-df97aa7ec2c4
 md"""
-# SHINE — synthetic H I emission
+# Dust — thermal polarization
 
-21-cm radiative transfer, phase-separated H I columns, velocity moments, spectra, and RGB velocity composites.
+Synthetic thermal-dust Stokes emission, polarization maps, spectra, statistics, and polarization fraction versus column density.
 
-> **Reactive mode.** Open `shine.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
+> **Reactive mode.** Open `dust.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
 
-> **Lazy startup.** Run `run_pluto.jl` with `DYNAMO_NOTEBOOK=shine.jl`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
+> **Lazy startup.** Run `run_pluto.jl`, then select `dust.jl`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
 
 All dimensional quantities are converted to the physical units shown on their axes or colorbars. Projected means are density weighted unless stated otherwise, and periodic boundaries are used for spatial operations.
 """
@@ -1004,7 +1130,10 @@ begin
     # stored as Float32 are not silently widened to Float64.
     function average_faces(lower, upper)
         half = convert(float(promote_type(eltype(lower), eltype(upper))), 0.5)
-        half .* (lower .+ upper)
+        # Reuse the lower-face buffer. The fused assignment avoids allocating a
+        # third full 3-D array for every magnetic component.
+        @. lower = half * (lower + upper)
+        lower
     end
 
     """
@@ -1014,9 +1143,7 @@ begin
     simulation is re-run, instead of serving stale arrays.
     """
     function snapshot_fingerprint(path)
-        isdir(path) || return (mtime(path), filesize(path))
-        Tuple((basename(entry), mtime(entry), filesize(entry))
-            for entry in sort(readdir(path; join = true)))
+        cached_snapshot_fingerprint(path)
     end
 
     function centered_hdf5_magnetic_component(h, centered, left, right, source;
@@ -1048,15 +1175,20 @@ begin
 
     function snapshot_sources(cube_directory)
         isdir(cube_directory) || return String[]
-        fits_directory_is_snapshot(cube_directory) && return [cube_directory]
-        sources = String[]
-        for path in readdir(cube_directory; join = true)
-            if is_hdf5_file(path) || is_fits_file(path) ||
-                    fits_directory_is_snapshot(path)
-                push!(sources, path)
+        canonical = abspath(cube_directory)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_SOURCE_CACHE, canonical) do
+                fits_directory_is_snapshot(canonical) && return [canonical]
+                sources = String[]
+                for path in readdir(canonical; join = true)
+                    if is_hdf5_file(path) || is_fits_file(path) ||
+                            fits_directory_is_snapshot(path)
+                        push!(sources, path)
+                    end
+                end
+                sort(sources)
             end
         end
-        sort(sources)
     end
 
     function expand_home(path)
@@ -1066,6 +1198,18 @@ begin
 
     function discover_cube_directories(path; depth = 0, max_depth = 32)
         isdir(path) || return String[]
+        canonical = abspath(path)
+        if depth == 0
+            return lock(CACHE_LOCK) do
+                get!(DIRECTORY_DISCOVERY_CACHE, canonical) do
+                    discover_cube_directories_uncached(canonical; depth, max_depth)
+                end
+            end
+        end
+        discover_cube_directories_uncached(canonical; depth, max_depth)
+    end
+
+    function discover_cube_directories_uncached(path; depth = 0, max_depth = 32)
         direct_snapshots = snapshot_sources(path)
         isempty(direct_snapshots) || return [abspath(path)]
         depth >= max_depth && return String[]
@@ -1074,7 +1218,7 @@ begin
             startswith(entry, ".") && continue
             child = joinpath(path, entry)
             isdir(child) || continue
-            append!(found, discover_cube_directories(child;
+            append!(found, discover_cube_directories_uncached(child;
                 depth = depth + 1, max_depth))
         end
         unique(found)
@@ -1538,8 +1682,11 @@ begin
     analysis_series_labels = requested_open_labels
     comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
-    active_time_value = snapshot_time(
-        run_files[selected_run][selected_snapshot]) * time_unit_Myr
+    # Loading the selected raw cube here supplies the exact stored time and
+    # primes the one-entry cache. The analysis cell below therefore reuses the
+    # same arrays instead of opening this HDF5 file a second time.
+    active_time_value = load_raw_cube(
+        run_files[selected_run][selected_snapshot]).t * time_unit_Myr
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
@@ -1612,7 +1759,7 @@ begin
     before, the HDF5 file and every dataset handle are closed before any
     conversion happens.
     """
-    function read_raw_cube(path)
+    function read_raw_cube(path; stage_local = false)
         if is_fits_file(path) || isdir(path)
             raw_fields = (
                 rho = read_fits_field(path, :rho; primary_fallback = true),
@@ -1629,7 +1776,8 @@ begin
                 L = fits_box_length(path, size(raw_fields.rho)),
                 t = snapshot_time(path))
         end
-        raw_fields, raw_length, raw_time = with_hdf5_file(path) do h
+        raw_fields, raw_length, raw_time =
+                with_analysis_hdf5_file(path; stage_local) do h
             available_paths = hdf5_dataset_paths(h)
             raw_fields = (
                 rho = read_hdf5_field(h, :rho; source = path,
@@ -1679,7 +1827,8 @@ begin
             for (field, dataset) in HDF5_FIELD_OVERRIDES])))
 
     "Return the stored, unit-free arrays of one snapshot, reading them at most once."
-    load_raw_cube(path) = cached_raw_cube!(raw_cube_key(path), () -> read_raw_cube(path))
+    load_raw_cube(path) = cached_raw_cube!(
+        raw_cube_key(path), () -> read_raw_cube(path; stage_local = true))
 
     "Apply a unit factor to a stored field without widening its element type."
     scale_field(A, factor) = A .* convert(float(eltype(A)), factor)
@@ -2368,339 +2517,367 @@ begin
     end
 end
 
-# ╔═╡ 478ec2f3-e057-4720-809c-17ca0a3dac21
+# ╔═╡ d6a2f4b1-59ac-4e77-a10a-4b74c0d89231
 md"""
 ---
 
-## 18. SHINE H I post-processing
+## 13. Thermal-dust polarization
 
-Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
+Optically thin thermal-dust Stokes emission. Statistical plots compare all selected simulations with shared bins.
 
-**Display SHINE H I maps:** $(@bind display_shine PlutoUI.CheckBox(default = true))  
-**Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))  
-**Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
+| Dust figure | Display |
+|:--|:--:|
+| Polarization maps | $(@bind display_dust_maps PlutoUI.CheckBox(default = true)) |
+| Polarization statistics | $(@bind display_dust_statistics PlutoUI.CheckBox(default = true)) |
+| Pixel $I_\nu$, $Q_\nu$, and $U_\nu$ spectra | $(@bind display_dust_pixel_spectrum PlutoUI.CheckBox(default = true)) |
 
-| SHINE setting | Control |
+| Dust setting | Control |
 |:--|:--|
-| Neutral $\mathrm{H\,I}$ fraction | $(@bind shine_neutral_fraction PlutoUI.NumberField(0.0:0.01:1.0; default = 1.0)) |
-| Mass per H nucleon [$m_H$] | $(@bind shine_mu_H PlutoUI.NumberField(1.0:0.01:2.0; default = 1.4)) |
-| Thermal broadening mass $\mu$ [$m_H$] | $(@bind shine_thermal_mu PlutoUI.NumberField(0.1:0.1:5.0; default = 1.0)) |
-| Fixed line width [$\mathrm{km\,s^{-1}}$; $0$ uses thermal broadening] | $(@bind shine_fixed_width_kms PlutoUI.NumberField(0.0:0.1:30.0; default = 0.0)) |
-| Minimum velocity [$\mathrm{km\,s^{-1}}$] | $(@bind shine_velocity_min PlutoUI.NumberField(-200.0:0.5:0.0; default = -30.0)) |
-| Maximum velocity [$\mathrm{km\,s^{-1}}$] | $(@bind shine_velocity_max PlutoUI.NumberField(0.0:0.5:200.0; default = 30.0)) |
-| Channel width [$\mathrm{km\,s^{-1}}$] | $(@bind shine_velocity_step PlutoUI.NumberField(0.25:0.25:10.0; default = 1.0)) |
-| CNM/LNM boundary [$\mathrm{K}$] | $(@bind shine_TCNM PlutoUI.NumberField(10.0:10.0:2000.0; default = 200.0)) |
-| LNM/WNM boundary [$\mathrm{K}$] | $(@bind shine_TWNM PlutoUI.NumberField(100.0:50.0:20000.0; default = 2000.0)) |
-| FFT CNM threshold [$\mathrm{(km\,s^{-1})^{-1}}$] | $(@bind shine_fft_klim PlutoUI.NumberField(0.0:0.01:2.0; default = 0.12)) |
-| First sky-axis pixel | $(@bind shine_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
-| Second sky-axis pixel | $(@bind shine_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| Logarithmic column-density maps | $(@bind log_shine_column PlutoUI.CheckBox(default = true)) |
-| Total $N_{\mathrm{HI}}$ map | $(@bind show_shine_NHI PlutoUI.CheckBox(default = true)) |
-| CNM column-density map | $(@bind show_shine_NCNM PlutoUI.CheckBox(default = false)) |
-| LNM column-density map | $(@bind show_shine_NLNM PlutoUI.CheckBox(default = false)) |
-| WNM column-density map | $(@bind show_shine_NWNM PlutoUI.CheckBox(default = false)) |
-| Peak $T_B$ map | $(@bind show_shine_peakTb PlutoUI.CheckBox(default = true)) |
-| Moment-0 map | $(@bind show_shine_mom0 PlutoUI.CheckBox(default = true)) |
-| Moment-1 map | $(@bind show_shine_mom1 PlutoUI.CheckBox(default = true)) |
-| Moment-2 map | $(@bind show_shine_mom2 PlutoUI.CheckBox(default = true)) |
-| Peak optical-depth map | $(@bind show_shine_tau PlutoUI.CheckBox(default = false)) |
-| FFT CNM tracer map | $(@bind show_shine_fftcnm PlutoUI.CheckBox(default = false)) |
-| Optically thick $T_B(v)$ | $(@bind show_shine_Tb_spectrum PlutoUI.CheckBox(default = true)) |
-| Optical-depth spectrum $\tau(v)$ | $(@bind show_shine_tau_spectrum PlutoUI.CheckBox(default = true)) |
-| Blue/green velocity boundary [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_blue_green PlutoUI.NumberField(-200.0:0.5:200.0; default = 4.0)) |
-| Green/red velocity boundary [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_green_red PlutoUI.NumberField(-200.0:0.5:200.0; default = 10.0)) |
-| RGB stretch percentile | $(@bind shine_rgb_percentile PlutoUI.NumberField(90.0:0.5:100.0; default = 99.5)) |
-| RGB asinh softening | $(@bind shine_rgb_softening PlutoUI.NumberField(0.01:0.01:1.0; default = 0.10)) |
-| Normalize each velocity band independently | $(@bind shine_rgb_independent PlutoUI.CheckBox(default = true)) |
+| Observing frequency [$\mathrm{GHz}$] | $(@bind dust_frequency_GHz PlutoUI.NumberField(30.0:1.0:1200.0; default = 353.0)) |
+| Dust temperature [$\mathrm{K}$] | $(@bind dust_temperature_K PlutoUI.NumberField(2.8:0.1:100.0; default = 19.6)) |
+| Cross-section at $353\,\mathrm{GHz}$ [$\mathrm{cm^2\,H^{-1}}$] | $(@bind dust_sigma353_cm2 PlutoUI.NumberField(default = 1.0e-26)) |
+| Emissivity index $\beta_{\mathrm d}$ | $(@bind dust_beta PlutoUI.NumberField(0.0:0.05:4.0; default = 1.6)) |
+| Intrinsic polarization fraction $p_0$ | $(@bind dust_p0 PlutoUI.NumberField(0.0:0.005:0.5; default = 0.20)) |
+| Gas mass per H nucleon [$m_H$] | $(@bind dust_mu_H PlutoUI.NumberField(1.0:0.01:2.0; default = 1.4)) |
+| $I_\nu$ map | $(@bind show_dust_I PlutoUI.CheckBox(default = true)) |
+| $Q_\nu$ map | $(@bind show_dust_Q PlutoUI.CheckBox(default = false)) |
+| $U_\nu$ map | $(@bind show_dust_U PlutoUI.CheckBox(default = false)) |
+| Polarized intensity $P_\nu$ | $(@bind show_dust_P PlutoUI.CheckBox(default = true)) |
+| Polarization fraction $p$ | $(@bind show_dust_fraction PlutoUI.CheckBox(default = true)) |
+| Polarization angle $\psi$ | $(@bind show_dust_angle PlutoUI.CheckBox(default = false)) |
+| Logarithmic $I_\nu$ and $P_\nu$ | $(@bind log_dust_positive PlutoUI.CheckBox(default = true)) |
+| Symmetric-logarithmic $Q_\nu$ and $U_\nu$ | $(@bind log_dust_signed PlutoUI.CheckBox(default = false)) |
+| Polarization pseudo-vectors over $I_\nu$ | $(@bind show_dust_vectors PlutoUI.CheckBox(default = true)) |
+| Pseudo-vector stride | $(@bind dust_vector_stride PlutoUI.Slider(2:1:16; default = 5, show_value = true)) |
+| $p$ versus $N_{\mathrm H}$ relation | $(@bind show_dust_p_column PlutoUI.CheckBox(default = true)) |
+| Polarization-fraction PDF | $(@bind show_dust_p_pdf PlutoUI.CheckBox(default = true)) |
+
+### Stokes spectrum at one sky pixel
+
+The selected pixel is marked by a white cross on every dust map. The spectral panels evaluate the optically thin modified-blackbody model over the requested frequency interval. A vertical line and marker identify the **observing frequency** selected above. With the present single-temperature, single-$\beta_{\mathrm d}$ prescription, $I_\nu$, $Q_\nu$, and $U_\nu$ share the same frequency scaling while retaining their line-of-sight geometric amplitudes and signs.
+
+| Pixel-spectrum setting | Control |
+|:--|:--|
+| First sky-axis pixel | $(@bind dust_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
+| Second sky-axis pixel | $(@bind dust_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
+| Minimum spectral frequency [$\mathrm{GHz}$] | $(@bind dust_spectrum_min_GHz PlutoUI.NumberField(1.0:1.0:2000.0; default = 30.0)) |
+| Maximum spectral frequency [$\mathrm{GHz}$] | $(@bind dust_spectrum_max_GHz PlutoUI.NumberField(2.0:1.0:3000.0; default = 1200.0)) |
+| Number of frequency samples | $(@bind dust_spectrum_samples PlutoUI.Select([64, 128, 256, 512]; default = 256)) |
+| Logarithmic frequency axis | $(@bind log_dust_frequency_axis PlutoUI.CheckBox(default = true)) |
+| $I_\nu$ spectrum | $(@bind show_dust_I_spectrum PlutoUI.CheckBox(default = true)) |
+| $Q_\nu$ spectrum | $(@bind show_dust_Q_spectrum PlutoUI.CheckBox(default = true)) |
+| $U_\nu$ spectrum | $(@bind show_dust_U_spectrum PlutoUI.CheckBox(default = true)) |
 """
 
-# ╔═╡ bcc05889-02bb-47cf-b672-139e8efe4137
+# ╔═╡ 130ccf03-d7cc-4b71-9210-dbc0e43dfa82
 begin
-    function shine_hi_spectrum(n, velocity, temperature, channels, dz_cm, thermal_mu, fixed_width)
-        Tb = zeros(Float64, length(channels))
-        tau_front = zeros(Float64, length(channels))
-        for cell in eachindex(n)
-            (n[cell] <= 0 || temperature[cell] <= 0) && continue
-            sigma = fixed_width > 0 ? fixed_width :
-                sqrt(K_B_CGS * temperature[cell] / (M_H_CGS * thermal_mu)) / KM_CM
-            sigma = max(sigma, eps(Float64))
-            normalization = 1 / (sqrt(2pi) * sigma)
-            for channel in eachindex(channels)
-                argument = (channels[channel] - velocity[cell]) / sigma
-                profile = exp(-0.5 * argument^2) * normalization
-                tau_cell = profile * n[cell] * dz_cm / (1.823e18 * temperature[cell])
-                Tb[channel] += temperature[cell] * (-expm1(-tau_cell)) * exp(-tau_front[channel])
-                tau_front[channel] += tau_cell
-            end
-        end
-        Tb, tau_front
-    end
+    dust_nu_Hz = Float64(dust_frequency_GHz) * 1.0e9
+    dust_T_K = max(Float64(dust_temperature_K), 2.8)
+    dust_planck_MJysr = (2H_PLANCK_CGS * dust_nu_Hz^3 / C_LIGHT_CGS^2) /
+        expm1(H_PLANCK_CGS * dust_nu_Hz / (K_B_CGS * dust_T_K)) * 1.0e17
+    dust_sigma_cm2 = Float64(dust_sigma353_cm2) *
+        (dust_nu_Hz / 353.0e9)^Float64(dust_beta)
+    dust_nH = cube.rho ./ (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
+    dust_Blos = Bcomponents[los_dim]
+    dust_B1 = Bcomponents[sky_dims[1]]
+    dust_B2 = Bcomponents[sky_dims[2]]
+    dust_Bnorm2 = max.(mag.B2, eps(Float64))
+    dust_cos2gamma = clamp.((dust_B1 .^ 2 .+ dust_B2 .^ 2) ./ dust_Bnorm2, 0.0, 1.0)
+    dust_phi = atan.(dust_B2, dust_B1) .+ pi / 2
+    dust_p0_value = Float64(dust_p0)
+    dust_column_weight = dx_los_cm .* dust_nH
+    dust_I_geometry = finite_sum_dims(dust_column_weight .*
+        (1 .- dust_p0_value .* (dust_cos2gamma .- 2 / 3)),
+        los_dim)
+    dust_Q_geometry = finite_sum_dims(dust_column_weight .* dust_p0_value .* dust_cos2gamma .*
+        cos.(2 .* dust_phi), los_dim)
+    dust_U_geometry = finite_sum_dims(dust_column_weight .* dust_p0_value .* dust_cos2gamma .*
+        sin.(2 .* dust_phi), los_dim)
+    dust_I_geometry = apply_observational_beam_2d(dust_I_geometry, cube, sky_dims)
+    dust_Q_geometry = apply_observational_beam_2d(dust_Q_geometry, cube, sky_dims)
+    dust_U_geometry = apply_observational_beam_2d(dust_U_geometry, cube, sky_dims)
+    dust_spectral_factor = dust_planck_MJysr * dust_sigma_cm2
+    dust_I = dust_spectral_factor .* dust_I_geometry
+    dust_Q = dust_spectral_factor .* dust_Q_geometry
+    dust_U = dust_spectral_factor .* dust_U_geometry
+    dust_P = sqrt.(dust_Q .^ 2 .+ dust_U .^ 2)
+    dust_fraction = dust_P ./ max.(dust_I, eps(Float64))
+    dust_angle_deg = rad2deg.(0.5 .* atan.(dust_U, dust_Q))
 
-    shine_permutation = (sky_dims[1], sky_dims[2], los_dim)
-    shine_nHI_native = Float64(shine_neutral_fraction) .* cube.rho ./
-        (max(Float64(shine_mu_H), eps(Float64)) * M_H_CGS)
-    shine_nHI = permutedims(shine_nHI_native, shine_permutation)
-    shine_temperature = permutedims(max.(T, eps(Float64)), shine_permutation)
-    shine_velocity = permutedims((cube.vx, cube.vy, cube.vz)[los_dim], shine_permutation)
-    shine_TCNM_value = min(Float64(shine_TCNM), Float64(shine_TWNM))
-    shine_TWNM_value = max(Float64(shine_TCNM), Float64(shine_TWNM))
-    shine_nCNM = shine_nHI .* (shine_temperature .< shine_TCNM_value)
-    shine_nLNM = shine_nHI .* ((shine_temperature .>= shine_TCNM_value) .&
-        (shine_temperature .< shine_TWNM_value))
-    shine_nWNM = shine_nHI .* (shine_temperature .>= shine_TWNM_value)
-    shine_NHI = finite_sum_dims(shine_nHI, 3) .* dx_los_cm
-    shine_NCNM = finite_sum_dims(shine_nCNM, 3) .* dx_los_cm
-    shine_NLNM = finite_sum_dims(shine_nLNM, 3) .* dx_los_cm
-    shine_NWNM = finite_sum_dims(shine_nWNM, 3) .* dx_los_cm
-    shine_NHI = apply_observational_beam_2d(shine_NHI, cube, sky_dims)
-    shine_NCNM = apply_observational_beam_2d(shine_NCNM, cube, sky_dims)
-    shine_NLNM = apply_observational_beam_2d(shine_NLNM, cube, sky_dims)
-    shine_NWNM = apply_observational_beam_2d(shine_NWNM, cube, sky_dims)
+    dust_map_specs = NamedTuple[]
+    show_dust_I && push!(dust_map_specs, (data = log_dust_positive ? safe_log10.(dust_I) : dust_I,
+        label = log_dust_positive ? L"\log_{10}(I_\nu/[\mathrm{MJy\,sr}^{-1}])" : L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]",
+        colormap = :magma, diverging = false, fixed_range = nothing, vectors = show_dust_vectors))
+    show_dust_Q && push!(dust_map_specs, (data = log_dust_signed ? symlog10(dust_Q) : dust_Q,
+        label = log_dust_signed ? L"\operatorname{symlog}_{10}(Q_\nu/[\mathrm{MJy\,sr}^{-1}])" : L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]",
+        colormap = :balance, diverging = true, fixed_range = nothing, vectors = false))
+    show_dust_U && push!(dust_map_specs, (data = log_dust_signed ? symlog10(dust_U) : dust_U,
+        label = log_dust_signed ? L"\operatorname{symlog}_{10}(U_\nu/[\mathrm{MJy\,sr}^{-1}])" : L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]",
+        colormap = :balance, diverging = true, fixed_range = nothing, vectors = false))
+    show_dust_P && push!(dust_map_specs, (data = log_dust_positive ? safe_log10.(dust_P) : dust_P,
+        label = log_dust_positive ? L"\log_{10}(P_\nu/[\mathrm{MJy\,sr}^{-1}])" : L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]",
+        colormap = :viridis, diverging = false, fixed_range = nothing, vectors = false))
+    show_dust_fraction && push!(dust_map_specs, (data = dust_fraction,
+        label = L"p=P_\nu/I_\nu", colormap = :plasma, diverging = false,
+        fixed_range = (0.0, max(finite_quantile(dust_fraction, 0.995; default = 1.0e-6),
+            1.0e-6)), vectors = false))
+    show_dust_angle && push!(dust_map_specs, (data = dust_angle_deg,
+        label = L"\psi\;[{}^\circ]", colormap = :hsv, diverging = false,
+        fixed_range = (-90.0, 90.0), vectors = false))
 
-    shine_vlo = min(Float64(shine_velocity_min), Float64(shine_velocity_max))
-    shine_vhi = max(Float64(shine_velocity_min), Float64(shine_velocity_max))
-    shine_dv = max(Float64(shine_velocity_step), 0.25)
-    shine_velocity_axis = collect(shine_vlo:shine_dv:shine_vhi)
-    length(shine_velocity_axis) >= 2 || (shine_velocity_axis = [shine_vlo, shine_vlo + shine_dv])
-    shine_Tb = zeros(Float64, size(shine_nHI, 1), size(shine_nHI, 2), length(shine_velocity_axis))
-    shine_tau = similar(shine_Tb)
-    shine_mu_value = max(Float64(shine_thermal_mu), eps(Float64))
-    shine_fixed_width_value = max(Float64(shine_fixed_width_kms), 0.0)
-    Threads.@threads for i in axes(shine_nHI, 1)
-        for j in axes(shine_nHI, 2)
-            Tb_line, tau_line = shine_hi_spectrum(
-                @view(shine_nHI[i, j, :]), @view(shine_velocity[i, j, :]),
-                @view(shine_temperature[i, j, :]), shine_velocity_axis, dx_los_cm,
-                shine_mu_value, shine_fixed_width_value)
-            shine_Tb[i, j, :] .= Tb_line
-            shine_tau[i, j, :] .= tau_line
-        end
-    end
-    shine_Tb = apply_observational_beam_cube(shine_Tb, cube, sky_dims)
-    shine_tau = apply_observational_beam_cube(shine_tau, cube, sky_dims)
-
-    shine_velocity_3d = reshape(shine_velocity_axis, 1, 1, :)
-    shine_positive_weight = max.(shine_Tb, 0.0) .* shine_dv
-    shine_mom0 = finite_sum_dims(shine_positive_weight, 3)
-    shine_weight_sum = max.(shine_mom0, eps(Float64))
-    shine_mom1 = finite_sum_dims(shine_positive_weight .* shine_velocity_3d, 3) ./ shine_weight_sum
-    shine_mom2 = sqrt.(max.(finite_sum_dims(shine_positive_weight .*
-        (shine_velocity_3d .- reshape(shine_mom1, size(shine_mom1)..., 1)) .^ 2, 3) ./
-        shine_weight_sum, 0.0))
-    shine_peakTb = finite_maximum_dims(shine_Tb, 3)
-    shine_peak_tau = finite_maximum_dims(shine_tau, 3)
-    shine_fft_frequency = fftfreq(length(shine_velocity_axis), shine_dv)
-    shine_fft_indices = findall(>(Float64(shine_fft_klim)), shine_fft_frequency)
-    shine_fftcnm = zeros(Float64, size(shine_NHI))
-    if !isempty(shine_fft_indices)
-        Threads.@threads for i in axes(shine_Tb, 1)
-            for j in axes(shine_Tb, 2)
-                amplitudes = abs.(fft(@view shine_Tb[i, j, :]))
-                shine_fftcnm[i, j] = amplitudes[1] > 0 ? maximum(amplitudes[shine_fft_indices]) / amplitudes[1] : 0.0
-            end
-        end
-    end
-
-    shine_specs = NamedTuple[]
-    function add_shine_column!(enabled, data, symbol)
-        enabled || return
-        shown = log_shine_column ? safe_log10.(data) : data
-        label = log_shine_column ? latexstring("\\log_{10}(", symbol,
-            "/[\\mathrm{cm}^{-2}])") : latexstring(symbol, "\\;[\\mathrm{cm}^{-2}]")
-        push!(shine_specs, (data = shown, label, colormap = :magma, diverging = false))
-    end
-    add_shine_column!(show_shine_NHI, shine_NHI, "N_{\\mathrm{HI}}")
-    add_shine_column!(show_shine_NCNM, shine_NCNM, "N_{\\mathrm{CNM}}")
-    add_shine_column!(show_shine_NLNM, shine_NLNM, "N_{\\mathrm{LNM}}")
-    add_shine_column!(show_shine_NWNM, shine_NWNM, "N_{\\mathrm{WNM}}")
-    show_shine_peakTb && push!(shine_specs, (data = shine_peakTb,
-        label = L"\max_v T_B\;[\mathrm{K}]", colormap = :thermal, diverging = false))
-    show_shine_mom0 && push!(shine_specs, (data = shine_mom0,
-        label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", colormap = :viridis, diverging = false))
-    show_shine_mom1 && push!(shine_specs, (data = shine_mom1,
-        label = L"M_1\;[\mathrm{km\,s}^{-1}]", colormap = :balance, diverging = true))
-    show_shine_mom2 && push!(shine_specs, (data = shine_mom2,
-        label = L"M_2\;[\mathrm{km\,s}^{-1}]", colormap = :plasma, diverging = false))
-    show_shine_tau && push!(shine_specs, (data = shine_peak_tau,
-        label = L"\max_v\tau_{21}", colormap = :inferno, diverging = false))
-    show_shine_fftcnm && push!(shine_specs, (data = shine_fftcnm,
-        label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", colormap = :viridis, diverging = false))
-
-    if isempty(shine_specs)
-        fig_shine = Figure(size = (900, 180))
-        Label(fig_shine[1, 1], L"\mathrm{Select\ at\ least\ one\ SHINE\ H\,I\ map.}", fontsize = 20)
+    if isempty(dust_map_specs)
+        fig_dust = Figure(size = (900, 180))
+        Label(fig_dust[1, 1], L"\mathrm{Select\ at\ least\ one\ dust\ product.}", fontsize = 20)
     else
-        shine_ncols = length(shine_specs) == 1 ? 1 : 2
-        shine_nrows = cld(length(shine_specs), shine_ncols)
-        fig_shine = Figure(size = (550shine_ncols, 420shine_nrows))
-        for (index, spec) in enumerate(shine_specs)
-            row, col = cld(index, shine_ncols), mod1(index, shine_ncols)
-            panel = fig_shine[row, col] = GridLayout()
-            ax = latex_axis(panel[1, 1],
-                xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+        dust_ncols = length(dust_map_specs) == 1 ? 1 : 2
+        dust_nrows = cld(length(dust_map_specs), dust_ncols)
+        fig_dust = Figure(size = (560dust_ncols, 420dust_nrows))
+        for (index, spec) in enumerate(dust_map_specs)
+            row, col = cld(index, dust_ncols), mod1(index, dust_ncols)
+            panel = fig_dust[row, col] = GridLayout()
+            ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
+            dust_range = isnothing(spec.fixed_range) ?
+                robust_colorrange(spec.data, color_percentile; diverging = spec.diverging) : spec.fixed_range
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
-                colormap = spec.colormap,
-                colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging))
-            scatter!(ax, [sky_coordinates[1][Int(shine_sky_i)]],
-                [sky_coordinates[2][Int(shine_sky_j)]];
-                marker = :cross, markersize = 18, strokewidth = 3, color = :white)
+                colormap = spec.colormap, colorrange = dust_range)
+            scatter!(ax,
+                [sky_coordinates[1][Int(dust_sky_i)]],
+                [sky_coordinates[2][Int(dust_sky_j)]];
+                marker = :cross, markersize = 18, strokewidth = 3,
+                color = :white)
             latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
-        end
-    end
-    display_shine ? fig_shine : nothing
-end
-
-# ╔═╡ 5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
-begin
-    "Integrate positive H I brightness over a closed velocity interval."
-    function shine_velocity_band(Tb, velocities, lower, upper, dv;
-            include_lower = true, include_upper = true)
-        indices = findall(velocities) do velocity
-            lower_ok = include_lower ? lower <= velocity : lower < velocity
-            upper_ok = include_upper ? velocity <= upper : velocity < upper
-            lower_ok && upper_ok
-        end
-        isempty(indices) && return zeros(Float64, size(Tb, 1), size(Tb, 2))
-        dropdims(sum(max.(@view(Tb[:, :, indices]), 0.0); dims = 3); dims = 3) .* dv
-    end
-
-    "Apply a robust asinh display stretch to one velocity-integrated map."
-    function shine_rgb_stretch(data, scale, softening)
-        safe_scale = max(scale, eps(Float64))
-        safe_softening = max(softening, eps(Float64))
-        stretched = asinh.(max.(data, 0.0) ./ (safe_softening * safe_scale)) ./
-            asinh(1 / safe_softening)
-        clamp.(stretched, 0.0, 1.0)
-    end
-
-    shine_rgb_boundary_1 = clamp(min(Float64(shine_rgb_blue_green),
-        Float64(shine_rgb_green_red)), shine_vlo, shine_vhi)
-    shine_rgb_boundary_2 = clamp(max(Float64(shine_rgb_blue_green),
-        Float64(shine_rgb_green_red)), shine_vlo, shine_vhi)
-
-    shine_rgb_blue_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
-        shine_vlo, shine_rgb_boundary_1, shine_dv; include_upper = false)
-    shine_rgb_green_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
-        shine_rgb_boundary_1, shine_rgb_boundary_2, shine_dv)
-    shine_rgb_red_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
-        shine_rgb_boundary_2, shine_vhi, shine_dv; include_lower = false)
-
-    shine_rgb_quantile = clamp(Float64(shine_rgb_percentile) / 100, 0.0, 1.0)
-    shine_rgb_scales = [quantile(filter(isfinite, vec(channel)), shine_rgb_quantile)
-        for channel in (shine_rgb_red_map, shine_rgb_green_map, shine_rgb_blue_map)]
-    if !shine_rgb_independent
-        shared_scale = maximum(shine_rgb_scales)
-        shine_rgb_scales .= shared_scale
-    end
-    shine_rgb_softening_value = max(Float64(shine_rgb_softening), 0.01)
-    shine_rgb_red = shine_rgb_stretch(shine_rgb_red_map, shine_rgb_scales[1],
-        shine_rgb_softening_value)
-    shine_rgb_green = shine_rgb_stretch(shine_rgb_green_map, shine_rgb_scales[2],
-        shine_rgb_softening_value)
-    shine_rgb_blue = shine_rgb_stretch(shine_rgb_blue_map, shine_rgb_scales[3],
-        shine_rgb_softening_value)
-    shine_rgb_image = RGBf.(shine_rgb_red, shine_rgb_green, shine_rgb_blue)
-
-    fig_shine_rgb = Figure(size = (820, 670))
-    shine_rgb_axis = latex_axis(fig_shine_rgb[1, 1],
-        xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
-        ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"),
-        title = L"\mathrm{H\,I\ velocity\ composite}")
-    image!(shine_rgb_axis,
-        (first(sky_coordinates[1]), last(sky_coordinates[1])),
-        (first(sky_coordinates[2]), last(sky_coordinates[2])),
-        shine_rgb_image)
-    rowsize!(fig_shine_rgb.layout, 1, Aspect(1, 1))
-
-    shine_rgb_labels = [
-        latexstring("R:\\ ", @sprintf("%.4g", shine_rgb_boundary_2),
-            "<v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_vhi),
-            "\\;\\mathrm{km\\,s}^{-1}"),
-        latexstring("G:\\ ", @sprintf("%.4g", shine_rgb_boundary_1),
-            "\\leq v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_rgb_boundary_2),
-            "\\;\\mathrm{km\\,s}^{-1}"),
-        latexstring("B:\\ ", @sprintf("%.4g", shine_vlo),
-            "\\leq v_{\\mathrm{LOS}}<", @sprintf("%.4g", shine_rgb_boundary_1),
-            "\\;\\mathrm{km\\,s}^{-1}"),
-    ]
-    shine_rgb_label_colors = [RGBf(0.86, 0.16, 0.20), RGBf(0.05, 0.62, 0.34), RGBf(0.12, 0.35, 0.92)]
-    shine_rgb_legend = GridLayout(fig_shine_rgb[2, 1])
-    for index in eachindex(shine_rgb_labels)
-        Label(shine_rgb_legend[1, index], shine_rgb_labels[index];
-            color = shine_rgb_label_colors[index], fontsize = 16, tellwidth = true)
-    end
-    display_shine_rgb ? fig_shine_rgb : nothing
-end
-
-# ╔═╡ 27e51ba5-4592-4766-9dde-0de383a889a0
-begin
-    shine_spectrum_specs = Symbol[]
-    show_shine_Tb_spectrum && push!(shine_spectrum_specs, :brightness)
-    show_shine_tau_spectrum && push!(shine_spectrum_specs, :optical_depth)
-    if isempty(shine_spectrum_specs)
-        fig_shine_spectrum = Figure(size = (900, 180))
-        Label(fig_shine_spectrum[1, 1], L"\mathrm{Select\ at\ least\ one\ H\,I\ spectrum.}", fontsize = 20)
-    else
-        fig_shine_spectrum = Figure(size = (570length(shine_spectrum_specs), 390))
-        for (index, spectrum_type) in enumerate(shine_spectrum_specs)
-            if spectrum_type == :brightness
-                ax = latex_axis(fig_shine_spectrum[1, index],
-                    xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]", ylabel = L"T_B\;[\mathrm{K}]")
-                show_shine_Tb_spectrum && lines!(ax, shine_velocity_axis,
-                    @view(shine_Tb[Int(shine_sky_i), Int(shine_sky_j), :]);
-                    color = MHD_COLORS[1], linewidth = 2.5, label = "T_B")
-                axislegend(ax; position = :rt, framevisible = false)
-            else
-                ax = latex_axis(fig_shine_spectrum[1, index],
-                    xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]", ylabel = L"\tau_{21}")
-                lines!(ax, shine_velocity_axis,
-                    @view(shine_tau[Int(shine_sky_i), Int(shine_sky_j), :]);
-                    color = MHD_COLORS[5], linewidth = 2.5)
+            if spec.vectors
+                stride = Int(dust_vector_stride)
+                ix = collect(1:stride:size(dust_angle_deg, 1))
+                iy = collect(1:stride:size(dust_angle_deg, 2))
+                points = [Point2f(sky_coordinates[1][i], sky_coordinates[2][j]) for i in ix for j in iy]
+                directions = [Vec2f(cosd(dust_angle_deg[i, j]), sind(dust_angle_deg[i, j])) for i in ix for j in iy]
+                arrows2d!(ax, points, directions; normalize = true,
+                    lengthscale = 0.65stride * step(sky_coordinates[1]), align = :center,
+                    color = (:white, 0.88), shaftwidth = 1.4, tipwidth = 0, tiplength = 0)
             end
         end
     end
-    display_shine_spectrum ? fig_shine_spectrum : nothing
+    display_dust_maps ? fig_dust : nothing
 end
 
-# ╔═╡ a0050005-6f8c-4d0c-9a10-000000000005
+# ╔═╡ 5b3f6a91-246e-4cc3-8f68-164f7ff2f07c
 begin
-    shine_structure_specs = [
-        (data = shine_NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[1], period = nothing),
-        (data = shine_NCNM, label = L"N_{\mathrm{CNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[2], period = nothing),
-        (data = shine_NLNM, label = L"N_{\mathrm{LNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
-        (data = shine_NWNM, label = L"N_{\mathrm{WNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[4], period = nothing),
-        (data = shine_peakTb, label = L"\max_v T_B\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
-        (data = shine_mom0, label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", color = MHD_COLORS[6], period = nothing),
-        (data = shine_mom1, label = L"M_1\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[1], period = nothing),
-        (data = shine_mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[2], period = nothing),
-        (data = shine_peak_tau, label = L"\max_v\tau_{21}", color = MHD_COLORS[3], period = nothing),
-        (data = shine_fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", color = MHD_COLORS[4], period = nothing),
-        (data = shine_rgb_blue_map, label = L"W_{\mathrm{blue}}\;[\mathrm{K\,km\,s}^{-1}]", color = :dodgerblue3, period = nothing),
-        (data = shine_rgb_green_map, label = L"W_{\mathrm{green}}\;[\mathrm{K\,km\,s}^{-1}]", color = :seagreen3, period = nothing),
-        (data = shine_rgb_red_map, label = L"W_{\mathrm{red}}\;[\mathrm{K\,km\,s}^{-1}]", color = :firebrick3, period = nothing),
+    dust_selected_frequency_GHz = Float64(dust_frequency_GHz)
+    dust_frequency_low_GHz = max(min(Float64(dust_spectrum_min_GHz),
+        Float64(dust_spectrum_max_GHz), dust_selected_frequency_GHz), eps(Float64))
+    dust_frequency_high_GHz = max(max(Float64(dust_spectrum_min_GHz),
+        Float64(dust_spectrum_max_GHz), dust_selected_frequency_GHz),
+        dust_frequency_low_GHz * (1 + sqrt(eps(Float64))))
+    dust_frequency_axis_GHz = log_dust_frequency_axis ?
+        10.0 .^ range(log10(dust_frequency_low_GHz), log10(dust_frequency_high_GHz);
+            length = Int(dust_spectrum_samples)) :
+        collect(range(dust_frequency_low_GHz, dust_frequency_high_GHz;
+            length = Int(dust_spectrum_samples)))
+    dust_frequency_axis_Hz = dust_frequency_axis_GHz .* 1.0e9
+    dust_planck_spectrum_MJysr = @. (2H_PLANCK_CGS * dust_frequency_axis_Hz^3 /
+        C_LIGHT_CGS^2) / expm1(H_PLANCK_CGS * dust_frequency_axis_Hz /
+        (K_B_CGS * dust_T_K)) * 1.0e17
+    dust_sigma_spectrum_cm2 = @. Float64(dust_sigma353_cm2) *
+        (dust_frequency_axis_Hz / 353.0e9)^Float64(dust_beta)
+    dust_pixel_spectral_factor = dust_planck_spectrum_MJysr .* dust_sigma_spectrum_cm2
+    dust_pixel_index = (Int(dust_sky_i), Int(dust_sky_j))
+    dust_pixel_I_spectrum = dust_pixel_spectral_factor .* dust_I_geometry[dust_pixel_index...]
+    dust_pixel_Q_spectrum = dust_pixel_spectral_factor .* dust_Q_geometry[dust_pixel_index...]
+    dust_pixel_U_spectrum = dust_pixel_spectral_factor .* dust_U_geometry[dust_pixel_index...]
+
+    dust_pixel_spectrum_specs = NamedTuple[]
+    show_dust_I_spectrum && push!(dust_pixel_spectrum_specs, (
+        values = dust_pixel_I_spectrum,
+        selected_value = dust_I[dust_pixel_index...],
+        ylabel = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]",
+        color = MHD_COLORS[1], signed = false))
+    show_dust_Q_spectrum && push!(dust_pixel_spectrum_specs, (
+        values = dust_pixel_Q_spectrum,
+        selected_value = dust_Q[dust_pixel_index...],
+        ylabel = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]",
+        color = MHD_COLORS[2], signed = true))
+    show_dust_U_spectrum && push!(dust_pixel_spectrum_specs, (
+        values = dust_pixel_U_spectrum,
+        selected_value = dust_U[dust_pixel_index...],
+        ylabel = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]",
+        color = MHD_COLORS[3], signed = true))
+
+    if isempty(dust_pixel_spectrum_specs)
+        fig_dust_pixel_spectrum = Figure(size = (900, 180))
+        Label(fig_dust_pixel_spectrum[1, 1],
+            L"\mathrm{Select\ at\ least\ one\ dust\ Stokes\ spectrum.}", fontsize = 20)
+    else
+        fig_dust_pixel_spectrum = Figure(
+            size = (430length(dust_pixel_spectrum_specs), 390))
+        for (index, spec) in enumerate(dust_pixel_spectrum_specs)
+            axis = latex_axis(fig_dust_pixel_spectrum[1, index],
+                xlabel = L"\nu\;[\mathrm{GHz}]", ylabel = spec.ylabel,
+                xscale = log_dust_frequency_axis ? log10 : identity,
+                xticks = log_dust_frequency_axis ? DECADE_TICKS : Makie.automatic,
+                xminorticks = log_dust_frequency_axis ? IntervalsBetween(9) : IntervalsBetween(5),
+                xminorticksvisible = true)
+            spec.signed && hlines!(axis, [0.0];
+                color = (:gray45, 0.55), linestyle = :dash, linewidth = 1.4)
+            lines!(axis, dust_frequency_axis_GHz, spec.values;
+                color = spec.color, linewidth = 2.7)
+            vlines!(axis, [dust_selected_frequency_GHz];
+                color = :black, linestyle = :dot, linewidth = 1.8)
+            scatter!(axis, [dust_selected_frequency_GHz], [spec.selected_value];
+                color = spec.color, marker = :star5, markersize = 14,
+                strokecolor = :black, strokewidth = 0.8)
+        end
+    end
+    display_dust_pixel_spectrum ? fig_dust_pixel_spectrum : nothing
+end
+
+# ╔═╡ 61c3b28c-9d62-4689-a85d-bc827e89641d
+begin
+    function dust_distribution_products(c)
+        local_mag = magnetic_fields(c)
+        local_Bcomponents = (c.bx, c.by, c.bz)
+        local_B1 = local_Bcomponents[sky_dims[1]]
+        local_B2 = local_Bcomponents[sky_dims[2]]
+        local_cos2gamma = clamp.((local_B1 .^ 2 .+ local_B2 .^ 2) ./
+            max.(local_mag.B2, eps(Float64)), 0.0, 1.0)
+        local_phi = atan.(local_B2, local_B1) .+ pi / 2
+        local_dx_cm = c.L[los_dim] / size(c.rho, los_dim) * PC_CM
+        local_nH = c.rho ./ (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
+        local_weight = local_dx_cm .* local_nH
+        local_p0 = Float64(dust_p0)
+        local_I = finite_sum_dims(local_weight .*
+            (1 .- local_p0 .* (local_cos2gamma .- 2 / 3)), los_dim)
+        local_Q = finite_sum_dims(local_weight .* local_p0 .* local_cos2gamma .*
+            cos.(2 .* local_phi), los_dim)
+        local_U = finite_sum_dims(local_weight .* local_p0 .* local_cos2gamma .*
+            sin.(2 .* local_phi), los_dim)
+        local_I = apply_observational_beam_2d(local_I, c, sky_dims)
+        local_Q = apply_observational_beam_2d(local_Q, c, sky_dims)
+        local_U = apply_observational_beam_2d(local_U, c, sky_dims)
+        local_fraction = sqrt.(local_Q .^ 2 .+ local_U .^ 2) ./
+            max.(local_I, eps(Float64))
+        local_column = finite_sum_dims(c.rho, los_dim) .* local_dx_cm ./
+            (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
+        (column = local_column, fraction = local_fraction)
+    end
+
+    dust_distributions_by_run = Dict(label =>
+        dust_distribution_products(comparison_cube(label))
+        for label in comparison_run_labels)
+    dust_stat_specs = Symbol[]
+    show_dust_p_column && push!(dust_stat_specs, :column_relation)
+    show_dust_p_pdf && push!(dust_stat_specs, :fraction_pdf)
+    if isempty(dust_stat_specs)
+        fig_dust_statistics = Figure(size = (900, 180))
+        Label(fig_dust_statistics[1, 1], L"\mathrm{Select\ at\ least\ one\ dust\ statistic.}", fontsize = 20)
+    else
+        fig_dust_statistics = Figure(size = (540length(dust_stat_specs), 470))
+        dust_distribution_vectors = Dict(label => begin
+            products = dust_distributions_by_run[label]
+            local_N = vec(Float64.(products.column))
+            local_p = 100 .* vec(Float64.(products.fraction))
+            valid = isfinite.(local_N) .& isfinite.(local_p) .&
+                (local_N .> 0) .& (local_p .>= 0)
+            (N = local_N[valid], p = local_p[valid])
+        end for label in comparison_run_labels)
+        all_dust_p = vcat([dust_distribution_vectors[label].p
+            for label in comparison_run_labels]...)
+        dust_pdf_upper = isempty(all_dust_p) ? 1.0e-6 :
+            max(quantile(all_dust_p, 0.999), 1.0e-6)
+        dust_pdf_edges = range(0, dust_pdf_upper; length = 45)
+        for (index, statistic) in enumerate(dust_stat_specs)
+            if statistic == :column_relation
+                ax = latex_axis(fig_dust_statistics[1, index], xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
+                    ylabel = L"100p_{\mathrm d}\;[\%]", xscale = log10,
+                    xticks = DECADE_TICKS,
+                    xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+                for label in comparison_run_labels
+                    dust_N_valid = dust_distribution_vectors[label].N
+                    dust_p_valid = dust_distribution_vectors[label].p
+                    sample_step = max(1, cld(length(dust_N_valid), 6000))
+                    sample = 1:sample_step:length(dust_N_valid)
+                    scatter!(ax, dust_N_valid[sample], dust_p_valid[sample];
+                        color = (run_colors[label], 0.16), markersize = 4)
+                    if !isempty(dust_N_valid)
+                        edges = 10 .^ range(extrema(log10.(dust_N_valid))...; length = 18)
+                        centers, medians = Float64[], Float64[]
+                        for bin in 1:length(edges)-1
+                            members = (dust_N_valid .>= edges[bin]) .&
+                                (dust_N_valid .< edges[bin + 1])
+                            any(members) || continue
+                            push!(centers, sqrt(edges[bin] * edges[bin + 1]))
+                            push!(medians, median(dust_p_valid[members]))
+                        end
+                        lines!(ax, centers, medians; color = run_colors[label],
+                            linewidth = 3, label = legend_run_label(label))
+                        scatter!(ax, centers, medians;
+                            color = run_colors[label], markersize = 7)
+                    end
+                end
+            else
+                ax = latex_axis(fig_dust_statistics[1, index], xlabel = L"100p_{\mathrm d}\;[\%]",
+                    ylabel = L"\mathrm{PDF}(100p_{\mathrm d})")
+                for label in comparison_run_labels
+                    dust_p_valid = dust_distribution_vectors[label].p
+                    isempty(dust_p_valid) && continue
+                    histogram = fit(Histogram,
+                        clamp.(dust_p_valid, 0, prevfloat(dust_pdf_upper)),
+                        dust_pdf_edges)
+                    centers = (dust_pdf_edges[1:end-1] .+ dust_pdf_edges[2:end]) ./ 2
+                    probability = histogram.weights ./
+                        max(sum(histogram.weights .* diff(dust_pdf_edges)), eps(Float64))
+                    stairs!(ax, centers, probability; color = run_colors[label],
+                        linewidth = 2.5, step = :center,
+                        label = legend_run_label(label))
+                end
+            end
+        end
+        Legend(fig_dust_statistics[2, 1:length(dust_stat_specs)],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true, framevisible = false)
+    end
+    fig_dust_p_column = polarization_column_figure(
+        column_density, dust_fraction,
+        L"100p_{\mathrm d}\;[\%]", MHD_COLORS[2])
+    display_dust_statistics ? fig_dust_statistics : nothing
+end
+
+# ╔═╡ a0010001-6f8c-4d0c-9a10-000000000001
+begin
+    dust_structure_specs = [
+        (data = dust_I, label = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[1], period = nothing),
+        (data = dust_Q, label = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[2], period = nothing),
+        (data = dust_U, label = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[3], period = nothing),
+        (data = dust_P, label = L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[4], period = nothing),
+        (data = dust_fraction, label = L"p_{\mathrm d}", color = MHD_COLORS[5], period = nothing),
+        (data = dust_angle_deg, label = L"\psi_{\mathrm d}\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
     ]
-    fig_shine_structure = display_observational_structure_functions ?
-        observational_structure_figure(shine_structure_specs, cube, sky_dims,
+    fig_dust_structure = display_observational_structure_functions ?
+        observational_structure_figure(dust_structure_specs, cube, sky_dims,
             observational_structure_order, observational_structure_samples;
-            heading = "SHINE observable structure functions") : Figure(size = (900, 120))
-    display_observational_structure_functions ? fig_shine_structure : nothing
+            heading = "Dust observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_dust_structure : nothing
 end
 
 # ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
 begin
     export_figure_options = [
-        "shine" => "SHINE H I maps",
-        "shine_structure" => "SHINE observable structure functions",
-        "shine_rgb" => "SHINE velocity RGB composite",
-        "shine_spectrum" => "SHINE H I spectrum",
+        "dust_polarization" => "Dust-polarization maps",
+        "dust_structure" => "Dust observable structure functions",
+        "dust_pixel_spectrum" => "Dust Stokes spectrum",
+        "dust_statistics" => "Dust comparative statistics",
+        "dust_p_column" => "Dust polarization versus column density",
     ]
     export_figure_registry = Dict(
-        "shine" => fig_shine,
-        "shine_structure" => fig_shine_structure,
-        "shine_rgb" => fig_shine_rgb,
-        "shine_spectrum" => fig_shine_spectrum,
+        "dust_polarization" => fig_dust,
+        "dust_structure" => fig_dust_structure,
+        "dust_pixel_spectrum" => fig_dust_pixel_spectrum,
+        "dust_statistics" => fig_dust_statistics,
+        "dust_p_column" => fig_dust_p_column,
     )
     nothing
 end
@@ -2713,7 +2890,7 @@ md"""
 
 | Export setting | Control |
 |:--|:--|
-| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "shine")) |
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "dust_polarization")) |
 | Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
 """
 
@@ -2725,7 +2902,7 @@ begin
     show(export_buffer, export_mime, export_figure_registry[export_figure_key])
     export_bytes = take!(export_buffer)
     export_run_slug = replace(lowercase(selected_run), r"[^a-z0-9]+" => "_")
-    export_filename = "shine_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
+    export_filename = "dust_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
     PlutoUI.DownloadButton(export_bytes, export_filename)
 end
 
@@ -4771,11 +4948,11 @@ version = "4.1.0+0"
 # ╟─c12d1f54-40b8-4865-9562-8dcb519f924a
 # ╟─62440e86-b560-44ad-bb0a-43ae62e73fc3
 # ╠═47b786d6-c7b5-44f4-946a-b8c485ad6380
-# ╟─478ec2f3-e057-4720-809c-17ca0a3dac21
-# ╟─bcc05889-02bb-47cf-b672-139e8efe4137
-# ╠═5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
-# ╟─27e51ba5-4592-4766-9dde-0de383a889a0
-# ╠═a0050005-6f8c-4d0c-9a10-000000000005
+# ╟─d6a2f4b1-59ac-4e77-a10a-4b74c0d89231
+# ╟─130ccf03-d7cc-4b71-9210-dbc0e43dfa82
+# ╟─5b3f6a91-246e-4cc3-8f68-164f7ff2f07c
+# ╟─61c3b28c-9d62-4689-a85d-bc827e89641d
+# ╠═a0010001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000002-6f8c-4d0c-9a10-000000000002
 # ╠═e1000003-6f8c-4d0c-9a10-000000000003

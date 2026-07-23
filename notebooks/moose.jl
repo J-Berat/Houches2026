@@ -50,6 +50,40 @@ begin
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
     const REDUCTION_CACHE = Dict{Any,Any}()
+    const SNAPSHOT_SOURCE_CACHE = Dict{String,Vector{String}}()
+    const DIRECTORY_DISCOVERY_CACHE = Dict{String,Vector{String}}()
+    const SNAPSHOT_FINGERPRINT_CACHE = Dict{String,Any}()
+    const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
+    const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
+
+    function positive_integer_setting(name, default)
+        value = tryparse(Int, strip(get(ENV, name, string(default))))
+        isnothing(value) && error("$name must be a positive integer.")
+        value > 0 || error("$name must be a positive integer.")
+        value
+    end
+
+    # Pluto stays deliberately conservative. The batch engine raises the entry
+    # limit to the number of selected simulations, while this byte ceiling keeps
+    # large production cubes from exhausting memory.
+    const RAW_CUBE_CACHE_MAX_ENTRIES =
+        positive_integer_setting("DYNAMO_RAW_CUBE_CACHE_ENTRIES", 1)
+    const RAW_CUBE_CACHE_MAX_BYTES = positive_integer_setting(
+        "DYNAMO_RAW_CUBE_CACHE_MIB",
+        max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
+    ) * 1024^2
+
+    "Memoize remote file metadata for the duration of the Pluto session."
+    function cached_snapshot_fingerprint(path)
+        canonical = abspath(path)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_FINGERPRINT_CACHE, canonical) do
+                isdir(canonical) || return (mtime(canonical), filesize(canonical))
+                Tuple((basename(entry), mtime(entry), filesize(entry))
+                    for entry in sort(readdir(canonical; join = true)))
+            end
+        end
+    end
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
     reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
@@ -61,10 +95,19 @@ begin
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
 
-    The previous entry is evicted before a cache miss is read. Consequently a
-    slider change never leaves several raw snapshots resident in this cache.
+    Entries use LRU eviction and are bounded by both a count and a byte budget.
+    Interactive Pluto defaults to one cube. Batch comparisons may retain several
+    cubes when memory allows, preventing the same files from being reopened for
+    each requested comparative figure.
     """
     function cached_raw_cube!(key, build)
+        evict_oldest_unlocked!() = begin
+            oldest = popfirst!(RAW_CUBE_CACHE_ORDER)
+            delete!(RAW_CUBE_CACHE, oldest)
+            delete!(RAW_CUBE_CACHE_BYTES, oldest)
+            nothing
+        end
+
         hit = lock(CACHE_LOCK) do
             if haskey(RAW_CUBE_CACHE, key)
                 position = findfirst(isequal(key), RAW_CUBE_CACHE_ORDER)
@@ -76,17 +119,31 @@ begin
             end
         end
         isnothing(hit) || return hit
+
+        # Use the largest resident cube as a conservative estimate of the next
+        # allocation. Evict before reading to bound peak memory, not only the
+        # final cache size.
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            estimated_bytes = isempty(RAW_CUBE_CACHE_BYTES) ? 0 :
+                maximum(values(RAW_CUBE_CACHE_BYTES))
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    (estimated_bytes > 0 &&
+                        sum(values(RAW_CUBE_CACHE_BYTES)) + estimated_bytes >
+                            RAW_CUBE_CACHE_MAX_BYTES))
+                evict_oldest_unlocked!()
+            end
         end
+
         value = build()
         bytes = Base.summarysize(value)
         lock(CACHE_LOCK) do
-            empty!(RAW_CUBE_CACHE)
-            empty!(RAW_CUBE_CACHE_BYTES)
-            empty!(RAW_CUBE_CACHE_ORDER)
+            while !isempty(RAW_CUBE_CACHE_ORDER) && (
+                    length(RAW_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    sum(values(RAW_CUBE_CACHE_BYTES)) + bytes >
+                        RAW_CUBE_CACHE_MAX_BYTES)
+                evict_oldest_unlocked!()
+            end
             RAW_CUBE_CACHE[key] = value
             RAW_CUBE_CACHE_BYTES[key] = bytes
             push!(RAW_CUBE_CACHE_ORDER, key)
@@ -99,6 +156,75 @@ begin
     function with_hdf5_file(operation::Function, path)
         lock(HDF5_READ_LOCK) do
             h5open(path, "r") do handle
+                operation(handle)
+            end
+        end
+    end
+
+    """
+    Whether an interactive HDF5 snapshot should first be copied to node-local
+    storage. `auto` stages only `/Xnfs` paths; `true` and `false` provide an
+    explicit override through `DYNAMO_LOCAL_HDF5_CACHE`.
+    """
+    function local_hdf5_cache_enabled(path)
+        isfile(path) &&
+            lowercase(splitext(path)[2]) in (".h5", ".hdf5") || return false
+        setting = lowercase(strip(get(ENV, "DYNAMO_LOCAL_HDF5_CACHE", "auto")))
+        setting in ("0", "false", "no", "off") && return false
+        setting in ("1", "true", "yes", "on") && return true
+        setting == "auto" || error(
+            "DYNAMO_LOCAL_HDF5_CACHE must be auto, true, or false; found $(setting).")
+        startswith(normpath(abspath(path)), "/Xnfs/")
+    end
+
+    """
+    Copy `path` into a private temporary directory, retaining at most one staged
+    HDF5 file. This function is called while `HDF5_READ_LOCK` is held.
+    """
+    function stage_hdf5_snapshot_unlocked(path)
+        fingerprint = cached_snapshot_fingerprint(path)
+        previous = LOCAL_HDF5_STAGE[]
+        if !isnothing(previous) && previous.source == path &&
+                previous.fingerprint == fingerprint && isfile(previous.staged_path)
+            return previous.staged_path
+        end
+
+        if isnothing(LOCAL_HDF5_STAGE_DIRECTORY[])
+            requested_parent =
+                get(ENV, "DYNAMO_LOCAL_CACHE_DIRECTORY", tempdir())
+            parent = requested_parent == "~" ? homedir() :
+                startswith(requested_parent, "~/") ?
+                    joinpath(homedir(), requested_parent[3:end]) :
+                    requested_parent
+            isdir(parent) || mkpath(parent)
+            LOCAL_HDF5_STAGE_DIRECTORY[] =
+                mktempdir(parent; prefix = "dynamo_hdf5_")
+        end
+        if !isnothing(previous) && isfile(previous.staged_path)
+            rm(previous.staged_path; force = true)
+        end
+        LOCAL_HDF5_STAGE[] = nothing
+
+        destination = joinpath(
+            LOCAL_HDF5_STAGE_DIRECTORY[],
+            string(hash((abspath(path), fingerprint)), "_", basename(path)),
+        )
+        cp(path, destination; force = true)
+        LOCAL_HDF5_STAGE[] =
+            (source = path, fingerprint = fingerprint, staged_path = destination)
+        destination
+    end
+
+    """
+    Open an analysis snapshot, optionally from the one-file node-local cache.
+    The lock covers both staging and reading, so another Pluto task cannot evict
+    the local file while it is in use.
+    """
+    function with_analysis_hdf5_file(operation::Function, path; stage_local = false)
+        lock(HDF5_READ_LOCK) do
+            read_path = stage_local && local_hdf5_cache_enabled(path) ?
+                stage_hdf5_snapshot_unlocked(path) : path
+            h5open(read_path, "r") do handle
                 operation(handle)
             end
         end
@@ -844,13 +970,13 @@ end
 
 # ╔═╡ 3ef88702-bef5-4eca-a151-df97aa7ec2c4
 md"""
-# StarlightPol — dichroic polarization
+# MOOSE — Faraday tomography
 
-Cell-by-cell Mueller propagation for background starlight through the simulated magnetized medium.
+Mock synchrotron emission, Faraday rotation, interferometric filtering, and RM synthesis.
 
-> **Reactive mode.** Open `starlightpol.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
+> **Reactive mode.** Open `moose.jl` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
 
-> **Lazy startup.** Run `run_pluto.jl` with `DYNAMO_NOTEBOOK=starlightpol.jl`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
+> **Lazy startup.** Run `run_pluto.jl`, then select `moose.jl`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
 
 All dimensional quantities are converted to the physical units shown on their axes or colorbars. Projected means are density weighted unless stated otherwise, and periodic boundaries are used for spatial operations.
 """
@@ -1004,7 +1130,10 @@ begin
     # stored as Float32 are not silently widened to Float64.
     function average_faces(lower, upper)
         half = convert(float(promote_type(eltype(lower), eltype(upper))), 0.5)
-        half .* (lower .+ upper)
+        # Reuse the lower-face buffer. The fused assignment avoids allocating a
+        # third full 3-D array for every magnetic component.
+        @. lower = half * (lower + upper)
+        lower
     end
 
     """
@@ -1014,9 +1143,7 @@ begin
     simulation is re-run, instead of serving stale arrays.
     """
     function snapshot_fingerprint(path)
-        isdir(path) || return (mtime(path), filesize(path))
-        Tuple((basename(entry), mtime(entry), filesize(entry))
-            for entry in sort(readdir(path; join = true)))
+        cached_snapshot_fingerprint(path)
     end
 
     function centered_hdf5_magnetic_component(h, centered, left, right, source;
@@ -1048,15 +1175,20 @@ begin
 
     function snapshot_sources(cube_directory)
         isdir(cube_directory) || return String[]
-        fits_directory_is_snapshot(cube_directory) && return [cube_directory]
-        sources = String[]
-        for path in readdir(cube_directory; join = true)
-            if is_hdf5_file(path) || is_fits_file(path) ||
-                    fits_directory_is_snapshot(path)
-                push!(sources, path)
+        canonical = abspath(cube_directory)
+        lock(CACHE_LOCK) do
+            get!(SNAPSHOT_SOURCE_CACHE, canonical) do
+                fits_directory_is_snapshot(canonical) && return [canonical]
+                sources = String[]
+                for path in readdir(canonical; join = true)
+                    if is_hdf5_file(path) || is_fits_file(path) ||
+                            fits_directory_is_snapshot(path)
+                        push!(sources, path)
+                    end
+                end
+                sort(sources)
             end
         end
-        sort(sources)
     end
 
     function expand_home(path)
@@ -1066,6 +1198,18 @@ begin
 
     function discover_cube_directories(path; depth = 0, max_depth = 32)
         isdir(path) || return String[]
+        canonical = abspath(path)
+        if depth == 0
+            return lock(CACHE_LOCK) do
+                get!(DIRECTORY_DISCOVERY_CACHE, canonical) do
+                    discover_cube_directories_uncached(canonical; depth, max_depth)
+                end
+            end
+        end
+        discover_cube_directories_uncached(canonical; depth, max_depth)
+    end
+
+    function discover_cube_directories_uncached(path; depth = 0, max_depth = 32)
         direct_snapshots = snapshot_sources(path)
         isempty(direct_snapshots) || return [abspath(path)]
         depth >= max_depth && return String[]
@@ -1074,7 +1218,7 @@ begin
             startswith(entry, ".") && continue
             child = joinpath(path, entry)
             isdir(child) || continue
-            append!(found, discover_cube_directories(child;
+            append!(found, discover_cube_directories_uncached(child;
                 depth = depth + 1, max_depth))
         end
         unique(found)
@@ -1538,8 +1682,11 @@ begin
     analysis_series_labels = requested_open_labels
     comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
-    active_time_value = snapshot_time(
-        run_files[selected_run][selected_snapshot]) * time_unit_Myr
+    # Loading the selected raw cube here supplies the exact stored time and
+    # primes the one-entry cache. The analysis cell below therefore reuses the
+    # same arrays instead of opening this HDF5 file a second time.
+    active_time_value = load_raw_cube(
+        run_files[selected_run][selected_snapshot]).t * time_unit_Myr
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
@@ -1612,7 +1759,7 @@ begin
     before, the HDF5 file and every dataset handle are closed before any
     conversion happens.
     """
-    function read_raw_cube(path)
+    function read_raw_cube(path; stage_local = false)
         if is_fits_file(path) || isdir(path)
             raw_fields = (
                 rho = read_fits_field(path, :rho; primary_fallback = true),
@@ -1629,7 +1776,8 @@ begin
                 L = fits_box_length(path, size(raw_fields.rho)),
                 t = snapshot_time(path))
         end
-        raw_fields, raw_length, raw_time = with_hdf5_file(path) do h
+        raw_fields, raw_length, raw_time =
+                with_analysis_hdf5_file(path; stage_local) do h
             available_paths = hdf5_dataset_paths(h)
             raw_fields = (
                 rho = read_hdf5_field(h, :rho; source = path,
@@ -1679,7 +1827,8 @@ begin
             for (field, dataset) in HDF5_FIELD_OVERRIDES])))
 
     "Return the stored, unit-free arrays of one snapshot, reading them at most once."
-    load_raw_cube(path) = cached_raw_cube!(raw_cube_key(path), () -> read_raw_cube(path))
+    load_raw_cube(path) = cached_raw_cube!(
+        raw_cube_key(path), () -> read_raw_cube(path; stage_local = true))
 
     "Apply a unit factor to a stored field without widening its element type."
     scale_field(A, factor) = A .* convert(float(eltype(A)), factor)
@@ -2166,6 +2315,63 @@ md"""
 
 """
 
+# ╔═╡ 496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
+begin
+    function density_pdf(values, weights, edges)
+        valid = isfinite.(values) .& isfinite.(weights) .& (weights .>= 0)
+        values, weights = Float64.(values[valid]), Float64.(weights[valid])
+        isempty(values) && return (Float64[], Float64[])
+        h = fit(Histogram, values, Weights(weights), edges)
+        centers = (edges[1:end-1] .+ edges[2:end]) ./ 2
+        pdf = h.weights ./ max(sum(h.weights .* diff(edges)), eps())
+        centers, pdf
+    end
+
+    function cube_pdf_samples(c)
+        local_mag = magnetic_fields(c)
+        local_turb = turbulent_velocity(c)
+        local_weights = pdf_weighting == "mass" ?
+            vec(Float64.(c.rho)) : ones(length(c.rho))
+        local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
+        local_v = sqrt.(local_turb.dv2)
+        local_mean_B = finite_mean(local_mag.B)
+        (
+            density = vec(safe_log10.(number_density(c.rho))),
+            magnetic = vec(safe_log10.(local_B)),
+            velocity = vec(safe_log10.(local_v)),
+            normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
+            weights = local_weights,
+        )
+    end
+
+    function comparative_pdf(samples_by_run, field, bins)
+        combined = vcat([finite_values(getfield(samples_by_run[label], field))
+            for label in comparison_run_labels]...)
+        isempty(combined) && return Dict{String, Any}()
+        lo, hi = quantile(combined, (0.001, 0.999))
+        lo == hi && ((lo, hi) = (lo - 0.5, hi + 0.5))
+        edges = range(lo, hi; length = Int(bins) + 1)
+        Dict(label => density_pdf(getfield(samples_by_run[label], field),
+                samples_by_run[label].weights, edges)
+            for label in comparison_run_labels)
+    end
+
+    number_density_cells = number_density(cube.rho)
+    magnetic_strength_uG = GAUSS_TO_MICROGAUSS .* mag.B
+    turbulent_speed_kms = sqrt.(turb.dv2)
+    mean_B = finite_mean(mag.B)
+    sB = vec(safe_log10.(mag.B ./ mean_B))
+    logn = vec(safe_log10.(number_density_cells))
+    logBphysical = vec(safe_log10.(magnetic_strength_uG))
+    logvphysical = vec(safe_log10.(turbulent_speed_kms))
+    comparative_pdf_samples = Dict(label => cube_pdf_samples(comparison_cube(label))
+        for label in comparison_run_labels)
+    density_pdfs = comparative_pdf(comparative_pdf_samples, :density, nbins)
+    magnetic_pdfs = comparative_pdf(comparative_pdf_samples, :magnetic, nbins)
+    velocity_pdfs = comparative_pdf(comparative_pdf_samples, :velocity, nbins)
+    normalized_B_pdfs = comparative_pdf(comparative_pdf_samples, :normalized_B, nbins)
+end
+
 # ╔═╡ 62440e86-b560-44ad-bb0a-43ae62e73fc3
 md"""
 ---
@@ -2368,356 +2574,273 @@ begin
     end
 end
 
-# ╔═╡ 6f4e2d11-2a88-41f4-93dc-01b51d86fb4f
+# ╔═╡ 62b61ef2-8e5d-4fe9-a435-e18fb5be9461
 md"""
 ---
 
-## 14. Dichroic starlight polarization
+## 16. MOOSE Faraday post-processing
 
-Cell-by-cell dichroic Mueller propagation toward background stars at the selected distance.
+Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis.
 
-| Starlight figure | Display |
+| MOOSE figure | Display |
 |:--|:--:|
-| Final Stokes and polarization maps | $(@bind display_starlight_maps PlutoUI.CheckBox(default = true)) |
-| Selected sight-line profiles | $(@bind display_starlight_profiles PlutoUI.CheckBox(default = true)) |
-| Polarization fraction versus $N_{\rm H}$ | $(@bind display_starlight_p_column PlutoUI.CheckBox(default = true)) |
+| Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = true)) |
+| Faraday tomography | $(@bind display_moose_tomography PlutoUI.CheckBox(default = true)) |
+| Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = true)) |
 
-| Physical setting | Control |
+| MOOSE setting | Control |
 |:--|:--|
-| Star distance [$\mathrm{pc}$] | $(@bind starlight_star_distance_pc PlutoUI.NumberField(default = cube.L[los_dim])) |
-| Intrinsic dichroic polarization $p_0$ | $(@bind starlight_p0 PlutoUI.NumberField(0.0:0.005:0.95; default = 0.20)) |
-| $N_{\rm H}/A_V$ [$\mathrm{cm}^{-2}$] | $(@bind starlight_nh_per_av PlutoUI.NumberField(default = 1.8e21)) |
-| Gas mass per H nucleon [$m_{\rm H}$] | $(@bind starlight_mu_H PlutoUI.NumberField(1.0:0.01:2.0; default = 1.4)) |
-| Incident $I_0$ | $(@bind starlight_initial_I PlutoUI.NumberField(default = 1.0)) |
-| Incident $Q_0$ | $(@bind starlight_initial_Q PlutoUI.NumberField(default = 0.0)) |
-| Incident $U_0$ | $(@bind starlight_initial_U PlutoUI.NumberField(default = 0.0)) |
-| Incident $V_0$ | $(@bind starlight_initial_V PlutoUI.NumberField(default = 0.0)) |
-| First sky-axis pixel | $(@bind starlight_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
-| Second sky-axis pixel | $(@bind starlight_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-
-| Final map | Display |
-|:--|:--:|
-| Transmitted intensity $I/I_0$ | $(@bind show_starlight_I_map PlutoUI.CheckBox(default = true)) |
-| Stokes $Q/I_0$ | $(@bind show_starlight_Q_map PlutoUI.CheckBox(default = false)) |
-| Stokes $U/I_0$ | $(@bind show_starlight_U_map PlutoUI.CheckBox(default = false)) |
-| Polarization fraction $p_\star$ | $(@bind show_starlight_p_map PlutoUI.CheckBox(default = true)) |
-| Polarization angle $\psi_\star$ | $(@bind show_starlight_angle_map PlutoUI.CheckBox(default = true)) |
-| Effective optical depth $\tau_V$ | $(@bind show_starlight_tau_map PlutoUI.CheckBox(default = true)) |
-| Density-weighted $B_{\rm LOS}$ | $(@bind show_starlight_blos_map PlutoUI.CheckBox(default = false)) |
-
-| Selected-pixel profile | Display |
-|:--|:--:|
-| $I/I_0$ | $(@bind show_starlight_I_profile PlutoUI.CheckBox(default = true)) |
-| $Q/I_0$ | $(@bind show_starlight_Q_profile PlutoUI.CheckBox(default = true)) |
-| $U/I_0$ | $(@bind show_starlight_U_profile PlutoUI.CheckBox(default = true)) |
-| $p_\star$ | $(@bind show_starlight_p_profile PlutoUI.CheckBox(default = true)) |
-| $\psi_\star$ | $(@bind show_starlight_angle_profile PlutoUI.CheckBox(default = true)) |
-| Cumulative $\tau_V$ | $(@bind show_starlight_tau_profile PlutoUI.CheckBox(default = true)) |
-| Local $B_{\rm LOS}$ | $(@bind show_starlight_blos_profile PlutoUI.CheckBox(default = false)) |
-| Local magnetic inclination $\gamma_B$ | $(@bind show_starlight_gamma_profile PlutoUI.CheckBox(default = false)) |
+| Electron prescription | $(@bind moose_electron_model PlutoUI.Select(["Two-phase ionization", "Constant ionization fraction"]; default = "Two-phase ionization")) |
+| Constant $x_e$ | $(@bind moose_constant_xe PlutoUI.NumberField(default = 0.01)) |
+| CNM $x_e$ | $(@bind moose_cnm_xe PlutoUI.NumberField(default = 1.0e-4)) |
+| WNM $x_e$ | $(@bind moose_wnm_xe PlutoUI.NumberField(default = 1.0e-2)) |
+| CNM/WNM transition temperature [$\mathrm{K}$] | $(@bind moose_transition_T PlutoUI.NumberField(default = 200.0)) |
+| Cosmic-ray electron index $p$ | $(@bind moose_cr_index PlutoUI.NumberField(1.0:0.1:5.0; default = 3.0)) |
+| Observing frequency [$\mathrm{MHz}$] | $(@bind moose_frequency_MHz PlutoUI.NumberField(50.0:1.0:2000.0; default = 150.0)) |
+| Synchrotron normalization [$\mathrm{K}\,(\mu\mathrm{G})^{-(p+1)/2}\,\mathrm{pc}^{-1}$] | $(@bind moose_synchrotron_norm PlutoUI.NumberField(default = 1.0)) |
+| Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
+| Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
+| Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
+| Add MOOSE Gaussian noise to $Q/U$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = false)) |
+| Polarized signal-to-noise ratio | $(@bind moose_instrument_snr PlutoUI.NumberField(0.1:0.1:1000.0; default = 10.0)) |
+| Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
+| Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
+| Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
+| Synchrotron brightness | $(@bind show_moose_I PlutoUI.CheckBox(default = true)) |
+| Polarized brightness | $(@bind show_moose_P PlutoUI.CheckBox(default = true)) |
+| Polarization fraction | $(@bind show_moose_fraction PlutoUI.CheckBox(default = true)) |
+| RM-synthesis band start [$\mathrm{MHz}$] | $(@bind moose_band_start_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 120.0)) |
+| RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 167.0)) |
+| Frequency-channel width [$\mathrm{MHz}$] | $(@bind moose_band_step_MHz PlutoUI.NumberField(0.05:0.05:20.0; default = 1.0)) |
+| Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -20.0)) |
+| Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 20.0)) |
+| Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
+| First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
+| Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
+| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = true)) |
+| Faraday-spectrum amplitude | $(@bind show_moose_F_abs PlutoUI.CheckBox(default = true)) |
+| $\Re F(\phi)$ spectrum | $(@bind show_moose_F_real PlutoUI.CheckBox(default = true)) |
+| $\Im F(\phi)$ spectrum | $(@bind show_moose_F_imag PlutoUI.CheckBox(default = true)) |
 """
 
-# ╔═╡ a2d5319b-06f4-4efc-b3d7-3a9719292305
+# ╔═╡ 0e8d9cab-aef2-42cd-959d-973764340f08
 begin
-    function starlight_mueller_step(I, Q, U, V, tau, psi, p0)
-        delta_tau_factor = log((1 + p0) / (1 - p0))
-        delta_tau = tau .* delta_tau_factor
-        qtrans = exp.(-(tau .+ delta_tau))
-        rtrans = exp.(-(tau .- delta_tau))
-        sin2psi = sin.(2 .* psi)
-        cos2psi = cos.(2 .* psi)
-        qplus = qtrans .+ rtrans
-        qminus = qtrans .- rtrans
-        root = sqrt.(max.(qtrans .* rtrans, 0.0))
-        cross = cos2psi .* sin2psi
-        Inew = 0.5 .* (qplus .* I .+ qminus .* cos2psi .* Q .+
-            qminus .* sin2psi .* U)
-        Qnew = 0.5 .* (qminus .* cos2psi .* I .+
-            (qplus .* cos2psi .^ 2 .+ 2 .* root .* sin2psi .^ 2) .* Q .+
-            (qplus .- 2 .* root) .* cross .* U)
-        Unew = 0.5 .* (qminus .* sin2psi .* I .+
-            (qplus .- 2 .* root) .* cross .* Q .+
-            (qplus .* sin2psi .^ 2 .+ 2 .* root .* cos2psi .^ 2) .* U)
-        Vnew = root .* V
-        Inew, Qnew, Unew, Vnew
-    end
-
-    starlight_nlos = size(cube.rho, los_dim)
-    starlight_dx_pc = cube.L[los_dim] / starlight_nlos
-    starlight_requested_distance_pc = clamp(Float64(starlight_star_distance_pc),
-        starlight_dx_pc, cube.L[los_dim])
-    starlight_cell_count = clamp(ceil(Int,
-        starlight_requested_distance_pc / starlight_dx_pc), 1, starlight_nlos)
-    starlight_distance_pc = collect(1:starlight_cell_count) .* starlight_dx_pc
-    starlight_actual_distance_pc = last(starlight_distance_pc)
-    starlight_shape = size(selectdim(cube.rho, los_dim, 1))
-    starlight_I0 = Float64(starlight_initial_I)
-    starlight_I0 > 0 || error("Incident starlight intensity I0 must be positive.")
-    starlight_Q0 = Float64(starlight_initial_Q)
-    starlight_U0 = Float64(starlight_initial_U)
-    starlight_V0 = Float64(starlight_initial_V)
-    starlight_p0_value = clamp(Float64(starlight_p0), 0.0, 1 - eps(Float64))
-    starlight_nh_av = max(Float64(starlight_nh_per_av), eps(Float64))
-    starlight_I_map = fill(starlight_I0, starlight_shape)
-    starlight_Q_map = fill(starlight_Q0, starlight_shape)
-    starlight_U_map = fill(starlight_U0, starlight_shape)
-    starlight_V_map = fill(starlight_V0, starlight_shape)
-    starlight_tau_map = zeros(Float64, starlight_shape)
-    starlight_blos_numerator = zeros(Float64, starlight_shape)
-    starlight_column = zeros(Float64, starlight_shape)
-    starlight_pixel_index = (Int(starlight_sky_i), Int(starlight_sky_j))
-    starlight_I_profile = Float64[]
-    starlight_Q_profile = Float64[]
-    starlight_U_profile = Float64[]
-    starlight_V_profile = Float64[]
-    starlight_tau_profile = Float64[]
-    starlight_blos_profile = Float64[]
-    starlight_gamma_profile_deg = Float64[]
-    starlight_local_psi_deg = Float64[]
-    starlight_east_component = Bcomponents[sky_dims[1]]
-    starlight_north_component = Bcomponents[sky_dims[2]]
-
-    for cell_index in 1:starlight_cell_count
-        density_slice = selectdim(cube.rho, los_dim, cell_index) ./
-            (max(Float64(starlight_mu_H), eps(Float64)) * M_H_CGS)
-        blos_slice = selectdim(Bcomponents[los_dim], los_dim, cell_index)
-        beast_slice = selectdim(starlight_east_component, los_dim, cell_index)
-        bnorth_slice = selectdim(starlight_north_component, los_dim, cell_index)
-        bnorm_slice = sqrt.(blos_slice .^ 2 .+ beast_slice .^ 2 .+ bnorth_slice .^ 2)
-        psi_slice = atan.(beast_slice, bnorth_slice)
-        tau_slice = density_slice .* (starlight_dx_pc * PC_CM) ./ starlight_nh_av
-        next_I_map, next_Q_map, next_U_map, next_V_map =
-            starlight_mueller_step(starlight_I_map, starlight_Q_map,
-                starlight_U_map, starlight_V_map, tau_slice, psi_slice,
-                starlight_p0_value)
-        starlight_I_map .= next_I_map
-        starlight_Q_map .= next_Q_map
-        starlight_U_map .= next_U_map
-        starlight_V_map .= next_V_map
-        starlight_tau_map .+= tau_slice
-        starlight_blos_numerator .+= density_slice .* blos_slice
-        starlight_column .+= density_slice
-        push!(starlight_I_profile, starlight_I_map[starlight_pixel_index...])
-        push!(starlight_Q_profile, starlight_Q_map[starlight_pixel_index...])
-        push!(starlight_U_profile, starlight_U_map[starlight_pixel_index...])
-        push!(starlight_V_profile, starlight_V_map[starlight_pixel_index...])
-        push!(starlight_tau_profile, starlight_tau_map[starlight_pixel_index...])
-        push!(starlight_blos_profile,
-            GAUSS_TO_MICROGAUSS * blos_slice[starlight_pixel_index...])
-        local_B = bnorm_slice[starlight_pixel_index...]
-        local_blos = blos_slice[starlight_pixel_index...]
-        push!(starlight_gamma_profile_deg, local_B > 0 ?
-            rad2deg(acos(clamp(local_blos / local_B, -1.0, 1.0))) : NaN)
-        push!(starlight_local_psi_deg,
-            rad2deg(psi_slice[starlight_pixel_index...]))
-    end
-
-    starlight_I_map = apply_observational_beam_2d(starlight_I_map, cube, sky_dims)
-    starlight_Q_map = apply_observational_beam_2d(starlight_Q_map, cube, sky_dims)
-    starlight_U_map = apply_observational_beam_2d(starlight_U_map, cube, sky_dims)
-    starlight_V_map = apply_observational_beam_2d(starlight_V_map, cube, sky_dims)
-    starlight_I_normalized = starlight_I_map ./ starlight_I0
-    starlight_Q_normalized = starlight_Q_map ./ starlight_I0
-    starlight_U_normalized = starlight_U_map ./ starlight_I0
-    starlight_p_map = clamp.(sqrt.(starlight_Q_map .^ 2 .+
-        starlight_U_map .^ 2) ./ max.(abs.(starlight_I_map), eps(Float64)), 0.0, 1.0)
-    starlight_angle_deg = rad2deg.(0.5 .* atan.(starlight_U_map, starlight_Q_map))
-    starlight_NH_map = starlight_column .* (starlight_dx_pc * PC_CM)
-    starlight_blos_map_uG = GAUSS_TO_MICROGAUSS .* starlight_blos_numerator ./
-        max.(starlight_column, eps(Float64))
-    starlight_I_profile_normalized = starlight_I_profile ./ starlight_I0
-    starlight_Q_profile_normalized = starlight_Q_profile ./ starlight_I0
-    starlight_U_profile_normalized = starlight_U_profile ./ starlight_I0
-    starlight_p_profile = clamp.(sqrt.(starlight_Q_profile .^ 2 .+
-        starlight_U_profile .^ 2) ./ max.(abs.(starlight_I_profile), eps(Float64)), 0.0, 1.0)
-    starlight_angle_profile_deg = rad2deg.(0.5 .* atan.(
-        starlight_U_profile, starlight_Q_profile))
-end
-
-# ╔═╡ d1e7626c-81d7-48cd-90be-695a13aa9997
-begin
-    starlight_final_I = starlight_I_normalized[starlight_pixel_index...]
-    starlight_final_Q = starlight_Q_normalized[starlight_pixel_index...]
-    starlight_final_U = starlight_U_normalized[starlight_pixel_index...]
-    starlight_final_p = starlight_p_map[starlight_pixel_index...]
-    starlight_final_angle = starlight_angle_deg[starlight_pixel_index...]
-    starlight_final_tau = starlight_tau_map[starlight_pixel_index...]
-    Markdown.parse("""
-    ### Active starlight sight line
-
-    | Quantity | Value |
-    |:--|:--|
-    | Sky pixel | **($(starlight_sky_i), $(starlight_sky_j))** |
-    | Integrated stellar distance | **$(@sprintf("%.6g", starlight_actual_distance_pc))** ``\\mathrm{pc}`` |
-    | Final ``I/I_0`` | **$(@sprintf("%.6g", starlight_final_I))** |
-    | Final ``Q/I_0`` | **$(@sprintf("%.6g", starlight_final_Q))** |
-    | Final ``U/I_0`` | **$(@sprintf("%.6g", starlight_final_U))** |
-    | Polarization fraction ``p_\\star`` | **$(@sprintf("%.6g", starlight_final_p))** |
-    | Polarization angle ``\\psi_\\star`` | **$(@sprintf("%.6g", starlight_final_angle))** ``{}^\\circ`` |
-    | Effective optical depth ``\\tau_V`` | **$(@sprintf("%.6g", starlight_final_tau))** |
-    """)
-end
-
-# ╔═╡ bcc9a131-9df2-455a-bdac-586323fd58d0
-begin
-    starlight_map_specs = NamedTuple[]
-    show_starlight_I_map && push!(starlight_map_specs, (
-        data = starlight_I_normalized, label = L"I/I_0", colormap = :magma,
-        diverging = false, fixed_range = nothing))
-    show_starlight_Q_map && push!(starlight_map_specs, (
-        data = starlight_Q_normalized, label = L"Q/I_0", colormap = :balance,
-        diverging = true, fixed_range = nothing))
-    show_starlight_U_map && push!(starlight_map_specs, (
-        data = starlight_U_normalized, label = L"U/I_0", colormap = :balance,
-        diverging = true, fixed_range = nothing))
-    show_starlight_p_map && push!(starlight_map_specs, (
-        data = starlight_p_map, label = L"p_\star", colormap = :plasma,
-        diverging = false, fixed_range = (0.0,
-            max(finite_quantile(starlight_p_map, 0.995; default = 1.0e-6), 1.0e-6))))
-    show_starlight_angle_map && push!(starlight_map_specs, (
-        data = starlight_angle_deg, label = L"\psi_\star\;[{}^\circ]", colormap = :hsv,
-        diverging = false, fixed_range = (-90.0, 90.0)))
-    show_starlight_tau_map && push!(starlight_map_specs, (
-        data = starlight_tau_map, label = L"\tau_V", colormap = :viridis,
-        diverging = false, fixed_range = nothing))
-    show_starlight_blos_map && push!(starlight_map_specs, (
-        data = starlight_blos_map_uG,
-        label = L"\langle B_{\mathrm{LOS}}\rangle_n\;[\mu\mathrm{G}]",
-        colormap = :balance, diverging = true, fixed_range = nothing))
-
-    if isempty(starlight_map_specs)
-        fig_starlight_maps = Figure(size = (900, 180))
-        Label(fig_starlight_maps[1, 1],
-            L"\mathrm{Select\ at\ least\ one\ starlight\ map.}", fontsize = 20)
+    moose_ne = if moose_electron_model == "Constant ionization fraction"
+        Float64(moose_constant_xe) .* number_density_cells
     else
-        starlight_map_ncols = length(starlight_map_specs) == 1 ? 1 : 2
-        starlight_map_nrows = cld(length(starlight_map_specs), starlight_map_ncols)
-        fig_starlight_maps = Figure(
-            size = (560starlight_map_ncols, 420starlight_map_nrows))
-        for (index, spec) in enumerate(starlight_map_specs)
-            row, col = cld(index, starlight_map_ncols), mod1(index, starlight_map_ncols)
-            panel = fig_starlight_maps[row, col] = GridLayout()
-            axis = latex_axis(panel[1, 1],
+        ionization_fraction = ifelse.(T .< Float64(moose_transition_T),
+            Float64(moose_cnm_xe), Float64(moose_wnm_xe))
+        ionization_fraction .* number_density_cells
+    end
+
+    moose_Blos_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[los_dim]
+    moose_Bsky1_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[1]]
+    moose_Bsky2_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[2]]
+    moose_Bperp_uG = sqrt.(moose_Bsky1_uG .^ 2 .+ moose_Bsky2_uG .^ 2)
+    moose_phi_increment = 0.812 .* moose_ne .* moose_Blos_uG .* dx_los_pc
+    moose_phi_to_cell = cumsum(moose_phi_increment; dims = los_dim) .- 0.5 .* moose_phi_increment
+    moose_phi_map = finite_sum_dims(moose_phi_increment, los_dim)
+
+    moose_p = Float64(moose_cr_index)
+    moose_B_exponent = (moose_p + 1) / 2
+    moose_temperature_spectral_index = -(moose_p + 3) / 2
+    moose_frequency_scale = (Float64(moose_frequency_MHz) / 150.0)^moose_temperature_spectral_index
+    moose_emissivity_Kpc = Float64(moose_synchrotron_norm) .* moose_frequency_scale .*
+        moose_Bperp_uG .^ moose_B_exponent
+    moose_intrinsic_angle = atan.(moose_Bsky2_uG, moose_Bsky1_uG) .+ pi / 2
+    moose_lambda2_m2 = (299_792_458.0 / (Float64(moose_frequency_MHz) * 1.0e6))^2
+    moose_polarization_phase = 2 .* (moose_intrinsic_angle .+ moose_phi_to_cell .* moose_lambda2_m2)
+    moose_I_K = finite_sum_dims(moose_emissivity_Kpc, los_dim) .* dx_los_pc
+    moose_Q_K = finite_sum_dims(moose_emissivity_Kpc .* cos.(moose_polarization_phase),
+        los_dim) .* dx_los_pc
+    moose_U_K = finite_sum_dims(moose_emissivity_Kpc .* sin.(moose_polarization_phase),
+        los_dim) .* dx_los_pc
+    moose_uv_transfer = moose_instrument_transfer(size(moose_I_K),
+        moose_largest_scale_pix, moose_smallest_scale_pix)
+    if apply_moose_interferometer
+        moose_I_K = apply_moose_interferometer_2d(moose_I_K, moose_uv_transfer)
+        moose_Q_K = apply_moose_interferometer_2d(moose_Q_K, moose_uv_transfer)
+        moose_U_K = apply_moose_interferometer_2d(moose_U_K, moose_uv_transfer)
+    end
+    moose_I_K = apply_observational_beam_2d(moose_I_K, cube, sky_dims)
+    moose_Q_K = apply_observational_beam_2d(moose_Q_K, cube, sky_dims)
+    moose_U_K = apply_observational_beam_2d(moose_U_K, cube, sky_dims)
+    add_moose_noise && add_moose_qu_noise!(moose_Q_K, moose_U_K,
+        moose_instrument_snr, MersenneTwister(Int(moose_instrument_seed)))
+    moose_P_K = sqrt.(moose_Q_K .^ 2 .+ moose_U_K .^ 2)
+    moose_fraction = moose_P_K ./ max.(abs.(moose_I_K), eps(Float64))
+
+    moose_specs = NamedTuple[]
+    show_moose_phi && push!(moose_specs, (data = moose_phi_map,
+        label = L"\phi\;[\mathrm{rad\,m}^{-2}]", colormap = :balance, diverging = true))
+    show_moose_I && push!(moose_specs, (data = moose_I_K,
+        label = L"T_{\mathrm{syn}}\;[\mathrm{K}]", colormap = :magma, diverging = false))
+    show_moose_P && push!(moose_specs, (data = moose_P_K,
+        label = L"P_\nu\;[\mathrm{K}]", colormap = :viridis, diverging = false))
+    show_moose_fraction && push!(moose_specs, (data = moose_fraction,
+        label = L"P_\nu/I_\nu", colormap = :plasma, diverging = false))
+    show_moose_uv_mask && push!(moose_specs, (data = FFTW.fftshift(moose_uv_transfer),
+        label = L"H(u,v)", colormap = :grays, diverging = false))
+
+    if isempty(moose_specs)
+        fig_moose = Figure(size = (900, 180))
+        Label(fig_moose[1, 1], L"\mathrm{Select\ at\ least\ one\ MOOSE\ product.}", fontsize = 20)
+    else
+        moose_ncols = length(moose_specs) == 1 ? 1 : 2
+        moose_nrows = cld(length(moose_specs), moose_ncols)
+        fig_moose = Figure(size = (560moose_ncols, 420moose_nrows))
+        for (index, spec) in enumerate(moose_specs)
+            row, col = cld(index, moose_ncols), mod1(index, moose_ncols)
+            panel = fig_moose[row, col] = GridLayout()
+            ax = latex_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
-            colorrange = isnothing(spec.fixed_range) ?
-                robust_colorrange(spec.data, color_percentile;
-                    diverging = spec.diverging) : spec.fixed_range
-            heat = heatmap!(axis, sky_coordinates[1], sky_coordinates[2], spec.data;
-                colormap = spec.colormap, colorrange)
-            scatter!(axis,
-                [sky_coordinates[1][Int(starlight_sky_i)]],
-                [sky_coordinates[2][Int(starlight_sky_j)]];
-                marker = :star5, markersize = 17, color = :white,
-                strokecolor = :black, strokewidth = 1.2)
-            latex_colorbar(panel[1, 2], heat; label = as_latex(spec.label),
-                tickformat = latex_ticklabels)
+            moose_colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
+            hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
+                colormap = spec.colormap, colorrange = moose_colorrange)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
             colsize!(panel, 2, 22)
         end
     end
-    display_starlight_maps ? fig_starlight_maps : nothing
+    display_moose ? fig_moose : nothing
 end
 
-# ╔═╡ 0c8f7453-06e8-47ea-ae0f-4f09a89b16ae
+# ╔═╡ 9a0f6ce3-9d80-46ca-ba3d-be5c31eaf032
 begin
-    starlight_profile_specs = NamedTuple[]
-    show_starlight_I_profile && push!(starlight_profile_specs, (
-        values = starlight_I_profile_normalized, ylabel = L"I/I_0",
-        color = MHD_COLORS[1], signed = false))
-    show_starlight_Q_profile && push!(starlight_profile_specs, (
-        values = starlight_Q_profile_normalized, ylabel = L"Q/I_0",
-        color = MHD_COLORS[2], signed = true))
-    show_starlight_U_profile && push!(starlight_profile_specs, (
-        values = starlight_U_profile_normalized, ylabel = L"U/I_0",
-        color = MHD_COLORS[3], signed = true))
-    show_starlight_p_profile && push!(starlight_profile_specs, (
-        values = starlight_p_profile, ylabel = L"p_\star",
-        color = MHD_COLORS[4], signed = false))
-    show_starlight_angle_profile && push!(starlight_profile_specs, (
-        values = starlight_angle_profile_deg, ylabel = L"\psi_\star\;[{}^\circ]",
-        color = MHD_COLORS[5], signed = true))
-    show_starlight_tau_profile && push!(starlight_profile_specs, (
-        values = starlight_tau_profile, ylabel = L"\tau_V(<d)",
-        color = MHD_COLORS[6], signed = false))
-    show_starlight_blos_profile && push!(starlight_profile_specs, (
-        values = starlight_blos_profile,
-        ylabel = L"B_{\mathrm{LOS}}\;[\mu\mathrm{G}]",
-        color = MHD_COLORS[1], signed = true))
-    show_starlight_gamma_profile && push!(starlight_profile_specs, (
-        values = starlight_gamma_profile_deg,
-        ylabel = L"\gamma_B\;[{}^\circ]",
-        color = MHD_COLORS[4], signed = false))
+    fig_moose_p_column = polarization_column_figure(
+        column_density, moose_fraction,
+        L"100p_{\mathrm F}=100P_\nu/I_\nu\;[\%]", MHD_COLORS[5])
+    display_moose_p_column ? fig_moose_p_column : nothing
+end
 
-    if isempty(starlight_profile_specs)
-        fig_starlight_profiles = Figure(size = (900, 180))
-        Label(fig_starlight_profiles[1, 1],
-            L"\mathrm{Select\ at\ least\ one\ starlight\ profile.}", fontsize = 20)
+# ╔═╡ c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
+begin
+    moose_band_lo = min(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
+    moose_band_hi = max(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
+    moose_band_step = max(Float64(moose_band_step_MHz), 0.05)
+    moose_band_frequency_MHz = collect(moose_band_lo:moose_band_step:moose_band_hi)
+    length(moose_band_frequency_MHz) >= 2 ||
+        (moose_band_frequency_MHz = [moose_band_lo, moose_band_hi + moose_band_step])
+    moose_band_frequency_Hz = moose_band_frequency_MHz .* 1.0e6
+    moose_band_lambda2_m2 = (299_792_458.0 ./ moose_band_frequency_Hz) .^ 2
+    moose_phi_lo = min(Float64(moose_phi_min), Float64(moose_phi_max))
+    moose_phi_hi = max(Float64(moose_phi_min), Float64(moose_phi_max))
+    moose_phi_step = max(Float64(moose_dphi), 0.05)
+    moose_phi_axis = collect(moose_phi_lo:moose_phi_step:moose_phi_hi)
+    length(moose_phi_axis) >= 2 || (moose_phi_axis = [moose_phi_lo, moose_phi_lo + moose_phi_step])
+
+    moose_sky_shape = size(moose_phi_map)
+    moose_nfrequency = length(moose_band_frequency_MHz)
+    moose_Q_band_K = Array{Float64}(undef, moose_sky_shape..., moose_nfrequency)
+    moose_U_band_K = similar(moose_Q_band_K)
+    moose_emissivity_base_Kpc = Float64(moose_synchrotron_norm) .* moose_Bperp_uG .^ moose_B_exponent
+    for channel in eachindex(moose_band_frequency_MHz)
+        frequency_scale = (moose_band_frequency_MHz[channel] / 150.0)^moose_temperature_spectral_index
+        phase = 2 .* (moose_intrinsic_angle .+
+            moose_phi_to_cell .* moose_band_lambda2_m2[channel])
+        moose_Q_band_K[:, :, channel] .= finite_sum_dims(
+            moose_emissivity_base_Kpc .* frequency_scale .* cos.(phase), los_dim) .* dx_los_pc
+        moose_U_band_K[:, :, channel] .= finite_sum_dims(
+            moose_emissivity_base_Kpc .* frequency_scale .* sin.(phase), los_dim) .* dx_los_pc
+    end
+    if apply_moose_interferometer
+        moose_Q_band_K = apply_moose_interferometer_cube(
+            moose_Q_band_K, moose_uv_transfer)
+        moose_U_band_K = apply_moose_interferometer_cube(
+            moose_U_band_K, moose_uv_transfer)
+    end
+    moose_Q_band_K = apply_observational_beam_cube(
+        moose_Q_band_K, cube, sky_dims)
+    moose_U_band_K = apply_observational_beam_cube(
+        moose_U_band_K, cube, sky_dims)
+    add_moose_noise && add_moose_qu_noise!(moose_Q_band_K, moose_U_band_K,
+        moose_instrument_snr, MersenneTwister(Int(moose_instrument_seed)))
+
+    moose_lambda0_sq_m2 = mean(moose_band_lambda2_m2)
+    moose_rm_phase_matrix = [cis(-2.0 * phi * (lambda2 - moose_lambda0_sq_m2))
+        for lambda2 in moose_band_lambda2_m2, phi in moose_phi_axis]
+    moose_P_band_matrix = reshape(complex.(moose_Q_band_K, moose_U_band_K), :, moose_nfrequency)
+    moose_F_matrix = moose_P_band_matrix * moose_rm_phase_matrix / moose_nfrequency
+    moose_F_complex = reshape(moose_F_matrix, moose_sky_shape..., length(moose_phi_axis))
+    moose_F_abs = abs.(moose_F_complex)
+    moose_pmax_K = finite_maximum_dims(moose_F_abs, 3)
+end
+
+# ╔═╡ e9c46999-b6cb-4bf4-93ff-e23d727698e1
+begin
+    moose_tomography_specs = Symbol[]
+    show_moose_pmax && push!(moose_tomography_specs, :pmax)
+    (show_moose_F_abs || show_moose_F_real || show_moose_F_imag) &&
+        push!(moose_tomography_specs, :spectrum)
+    if isempty(moose_tomography_specs)
+        fig_moose_tomography = Figure(size = (900, 180))
+        Label(fig_moose_tomography[1, 1],
+            L"\mathrm{Select\ the\ }p_{\max}\mathrm{\ map\ or\ an\ }F(\phi)\mathrm{\ component.}", fontsize = 20)
     else
-        starlight_profile_ncols = length(starlight_profile_specs) == 1 ? 1 : 2
-        starlight_profile_nrows = cld(length(starlight_profile_specs),
-            starlight_profile_ncols)
-        fig_starlight_profiles = Figure(
-            size = (540starlight_profile_ncols, 350starlight_profile_nrows))
-        for (index, spec) in enumerate(starlight_profile_specs)
-            row, col = cld(index, starlight_profile_ncols),
-                mod1(index, starlight_profile_ncols)
-            axis = latex_axis(fig_starlight_profiles[row, col],
-                xlabel = L"d\;[\mathrm{pc}]", ylabel = spec.ylabel)
-            spec.signed && hlines!(axis, [0.0]; color = (:gray45, 0.55),
-                linestyle = :dash, linewidth = 1.3)
-            valid = isfinite.(starlight_distance_pc) .& isfinite.(spec.values)
-            lines!(axis, starlight_distance_pc[valid], spec.values[valid];
-                color = spec.color, linewidth = 2.6)
-            any(valid) && scatter!(axis,
-                [starlight_distance_pc[findlast(valid)]],
-                [spec.values[findlast(valid)]];
-                color = spec.color, marker = :star5, markersize = 12,
-                strokecolor = :black, strokewidth = 0.7)
+        fig_moose_tomography = Figure(size = (570length(moose_tomography_specs), 410))
+        for (index, product) in enumerate(moose_tomography_specs)
+            if product == :pmax
+                panel = fig_moose_tomography[1, index] = GridLayout()
+                ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+                    ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
+                hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], moose_pmax_K;
+                    colormap = :viridis,
+                    colorrange = robust_colorrange(moose_pmax_K, color_percentile))
+                scatter!(ax, [sky_coordinates[1][Int(moose_sky_i)]],
+                    [sky_coordinates[2][Int(moose_sky_j)]];
+                    marker = :cross, markersize = 20, strokewidth = 3, color = :white)
+                latex_colorbar(panel[1, 2], hm; label = L"p_{\max}=\max_\phi|F(\phi)|\;[\mathrm{K}]",
+                    tickformat = latex_ticklabels)
+                colsize!(panel, 2, 22)
+            else
+                ax = latex_axis(fig_moose_tomography[1, index],
+                    xlabel = L"\phi\;[\mathrm{rad\,m}^{-2}]", ylabel = L"F(\phi)\;[\mathrm{K}]")
+                spectrum = @view moose_F_complex[Int(moose_sky_i), Int(moose_sky_j), :]
+                show_moose_F_abs && lines!(ax, moose_phi_axis, abs.(spectrum);
+                    color = :black, linewidth = 2.8, label = "|F(φ)|")
+                show_moose_F_real && lines!(ax, moose_phi_axis, real.(spectrum);
+                    color = MHD_COLORS[1], linewidth = 2, label = "Re F(φ)")
+                show_moose_F_imag && lines!(ax, moose_phi_axis, imag.(spectrum);
+                    color = MHD_COLORS[2], linewidth = 2, label = "Im F(φ)")
+                hlines!(ax, [0.0]; color = (:gray, 0.5), linestyle = :dot)
+                axislegend(ax; position = :rt, framevisible = false)
+            end
         end
     end
-    display_starlight_profiles ? fig_starlight_profiles : nothing
+    display_moose_tomography ? fig_moose_tomography : nothing
 end
 
-# ╔═╡ a0020002-6f8c-4d0c-9a10-000000000002
+# ╔═╡ a0040004-6f8c-4d0c-9a10-000000000004
 begin
-    starlight_structure_specs = [
-        (data = starlight_I_normalized, label = L"I/I_0", color = MHD_COLORS[1], period = nothing),
-        (data = starlight_Q_normalized, label = L"Q/I_0", color = MHD_COLORS[2], period = nothing),
-        (data = starlight_U_normalized, label = L"U/I_0", color = MHD_COLORS[3], period = nothing),
-        (data = starlight_V_map ./ starlight_I0, label = L"V/I_0", color = MHD_COLORS[4], period = nothing),
-        (data = starlight_p_map, label = L"p_\star", color = MHD_COLORS[5], period = nothing),
-        (data = starlight_angle_deg, label = L"\psi_\star\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
-        (data = starlight_tau_map, label = L"\tau_V", color = MHD_COLORS[1], period = nothing),
-        (data = starlight_blos_map_uG, label = L"\langle B_{\mathrm{LOS}}\rangle_n\;[\mu\mathrm{G}]", color = MHD_COLORS[2], period = nothing),
+    moose_structure_specs = [
+        (data = moose_phi_map, label = L"\phi\;[\mathrm{rad\,m}^{-2}]", color = MHD_COLORS[1], period = nothing),
+        (data = moose_I_K, label = L"T_{\mathrm{syn}}\;[\mathrm{K}]", color = MHD_COLORS[2], period = nothing),
+        (data = moose_Q_K, label = L"Q_\nu\;[\mathrm{K}]", color = MHD_COLORS[3], period = nothing),
+        (data = moose_U_K, label = L"U_\nu\;[\mathrm{K}]", color = MHD_COLORS[4], period = nothing),
+        (data = moose_P_K, label = L"P_\nu\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
+        (data = moose_fraction, label = L"P_\nu/I_\nu", color = MHD_COLORS[6], period = nothing),
+        (data = moose_pmax_K, label = L"p_{\max}\;[\mathrm{K}]", color = MHD_COLORS[1], period = nothing),
     ]
-    fig_starlight_structure = display_observational_structure_functions ?
-        observational_structure_figure(starlight_structure_specs, cube, sky_dims,
+    fig_moose_structure = display_observational_structure_functions ?
+        observational_structure_figure(moose_structure_specs, cube, sky_dims,
             observational_structure_order, observational_structure_samples;
-            heading = "Starlight observable structure functions") : Figure(size = (900, 120))
-    display_observational_structure_functions ? fig_starlight_structure : nothing
-end
-
-# ╔═╡ 7e8d4ac1-7b6e-44a8-981b-9c3a19c8de10
-begin
-    fig_starlight_p_column = polarization_column_figure(
-        starlight_NH_map, starlight_p_map,
-        L"100p_\star\;[\%]", MHD_COLORS[4])
-    display_starlight_p_column ? fig_starlight_p_column : nothing
+            heading = "MOOSE observable structure functions") : Figure(size = (900, 120))
+    display_observational_structure_functions ? fig_moose_structure : nothing
 end
 
 # ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
 begin
     export_figure_options = [
-        "starlight_maps" => "Starlight-polarization maps",
-        "starlight_structure" => "Starlight observable structure functions",
-        "starlight_profiles" => "Starlight sight-line profiles",
-        "starlight_p_column" => "Starlight polarization versus column density",
+        "moose" => "MOOSE maps",
+        "moose_structure" => "MOOSE observable structure functions",
+        "moose_tomography" => "MOOSE Faraday tomography",
+        "moose_p_column" => "Faraday polarization versus column density",
     ]
     export_figure_registry = Dict(
-        "starlight_maps" => fig_starlight_maps,
-        "starlight_structure" => fig_starlight_structure,
-        "starlight_profiles" => fig_starlight_profiles,
-        "starlight_p_column" => fig_starlight_p_column,
+        "moose" => fig_moose,
+        "moose_structure" => fig_moose_structure,
+        "moose_tomography" => fig_moose_tomography,
+        "moose_p_column" => fig_moose_p_column,
     )
     nothing
 end
@@ -2730,7 +2853,7 @@ md"""
 
 | Export setting | Control |
 |:--|:--|
-| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "starlight_maps")) |
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "moose")) |
 | Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
 """
 
@@ -2742,7 +2865,7 @@ begin
     show(export_buffer, export_mime, export_figure_registry[export_figure_key])
     export_bytes = take!(export_buffer)
     export_run_slug = replace(lowercase(selected_run), r"[^a-z0-9]+" => "_")
-    export_filename = "starlightpol_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
+    export_filename = "moose_$(export_figure_key)_$(export_run_slug)_snapshot_$(lpad(selected_snapshot, 3, '0')).$(export_extension)"
     PlutoUI.DownloadButton(export_bytes, export_filename)
 end
 
@@ -4786,15 +4909,15 @@ version = "4.1.0+0"
 # ╟─32110739-b60e-4592-856a-dd74f7a37401
 # ╟─94a0a0dc-baf6-4e62-a51e-dc6124d98fd4
 # ╟─c12d1f54-40b8-4865-9562-8dcb519f924a
+# ╟─496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
 # ╟─62440e86-b560-44ad-bb0a-43ae62e73fc3
 # ╠═47b786d6-c7b5-44f4-946a-b8c485ad6380
-# ╟─6f4e2d11-2a88-41f4-93dc-01b51d86fb4f
-# ╠═a2d5319b-06f4-4efc-b3d7-3a9719292305
-# ╟─d1e7626c-81d7-48cd-90be-695a13aa9997
-# ╟─bcc9a131-9df2-455a-bdac-586323fd58d0
-# ╟─0c8f7453-06e8-47ea-ae0f-4f09a89b16ae
-# ╠═a0020002-6f8c-4d0c-9a10-000000000002
-# ╟─7e8d4ac1-7b6e-44a8-981b-9c3a19c8de10
+# ╟─62b61ef2-8e5d-4fe9-a435-e18fb5be9461
+# ╟─0e8d9cab-aef2-42cd-959d-973764340f08
+# ╟─9a0f6ce3-9d80-46ca-ba3d-be5c31eaf032
+# ╟─c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
+# ╟─e9c46999-b6cb-4bf4-93ff-e23d727698e1
+# ╠═a0040004-6f8c-4d0c-9a10-000000000004
 # ╠═e1000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000002-6f8c-4d0c-9a10-000000000002
 # ╠═e1000003-6f8c-4d0c-9a10-000000000003

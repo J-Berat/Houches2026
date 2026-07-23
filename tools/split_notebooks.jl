@@ -1,10 +1,13 @@
 import Pkg
 
-Pkg.activate(@__DIR__)
+const PROJECT_DIRECTORY = normpath(joinpath(@__DIR__, ".."))
+const OUTPUT_DIRECTORY = joinpath(PROJECT_DIRECTORY, "notebooks")
 
+Pkg.activate(PROJECT_DIRECTORY)
 using Pluto
 
-const SOURCE_NOTEBOOK = joinpath(@__DIR__, "dynamo_diagnostics.jl")
+const SOURCE_NOTEBOOK =
+    joinpath(PROJECT_DIRECTORY, "dynamo_diagnostics.jl")
 
 const NOTEBOOK_SPECS = [
     (
@@ -140,7 +143,7 @@ function hero_code(title, summary, filename)
 
     > **Reactive mode.** Open `$filename` with Pluto. Selecting a repository, run, snapshot, or line of sight updates all dependent products automatically.
 
-    > **Lazy startup.** Run `run_pluto.jl` with `DYNAMO_NOTEBOOK=$filename`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
+    > **Lazy startup.** Run `run_pluto.jl`, then select `$filename`. Pluto starts without evaluating the expensive cells; run the result cells you need and Pluto will resolve their upstream dependencies.
 
     All dimensional quantities are converted to the physical units shown on their axes or colorbars. Projected means are density weighted unless stated otherwise, and periodic boundaries are used for spatial operations.
     \"\"\""""
@@ -226,7 +229,8 @@ function build_notebook(source, spec)
         Pluto.Cell(EXPORT_DOWNLOAD_CELL_ID, export_download_code(spec.filename)),
     )
 
-    output_path = joinpath(@__DIR__, spec.filename)
+    mkpath(OUTPUT_DIRECTORY)
+    output_path = joinpath(OUTPUT_DIRECTORY, spec.filename)
     output_notebook = Pluto.Notebook(output_cells, output_path)
     output_notebook.nbpkg_ctx = source.nbpkg_ctx
     output_notebook.nbpkg_ctx_instantiated = source.nbpkg_ctx_instantiated

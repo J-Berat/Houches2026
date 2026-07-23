@@ -10,13 +10,15 @@ using .DynamoAnalysis
 # CONFIGURATION À MODIFIER
 # =============================================================================
 
+const DEFAULT_DATA_REPOSITORY = "/Xnfs/Houches2026/DynSim"
+
 const CONFIG = BatchConfig(
-    # Ce chemin peut pointer vers n'importe quel dossier contenant les
-    # simulations. Les cubes ne sont ouverts qu'au lancement de ce script.
+    # Racine commune utilisée par les notebooks sur le serveur. Le moteur
+    # découvre récursivement les simulations et leurs dossiers DataCubes.
     data_repository = get(
         ENV,
         "DYNAMO_DATA_REPOSITORY",
-        "/chemin/vers/les/simulations",
+        DEFAULT_DATA_REPOSITORY,
     ),
     simulations = [
         "run_turb_cooling_mhd_lo_mach",

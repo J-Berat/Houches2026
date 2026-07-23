@@ -93,7 +93,7 @@ Ouvrir `run_figures.jl` et modifier uniquement le bloc `CONFIG` :
 
 ```julia
 const CONFIG = BatchConfig(
-    data_repository = "/chemin/vers/les/simulations",
+    data_repository = "/Xnfs/Houches2026/DynSim",
     simulations = [
         "simulation_1",
         "simulation_2",

@@ -125,7 +125,11 @@ Le moteur batch :
 - calcule l'union des dépendances des figures demandées une seule fois ;
 - réutilise les cubes avec un cache LRU borné en mémoire ;
 - ferme les fichiers HDF5 après lecture ;
+- affiche une barre de progression et la phase scientifique en cours ;
 - écrit directement les figures PNG ou PDF dans `output_directory`.
+
+À la fin, le script affiche la durée totale, le dossier de sortie absolu et le
+chemin complet de chaque figure créée.
 
 La première simulation sert aux cartes non comparatives. Les diagnostics
 comparatifs utilisent toutes les simulations listées.

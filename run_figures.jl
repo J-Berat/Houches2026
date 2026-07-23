@@ -7,14 +7,14 @@ include(joinpath(PROJECT_DIRECTORY, "src", "DynamoAnalysis.jl"))
 using .DynamoAnalysis
 
 # =============================================================================
-# CONFIGURATION À MODIFIER
+# CONFIGURATION TO EDIT
 # =============================================================================
 
 const DEFAULT_DATA_REPOSITORY = "/Xnfs/Houches2026/DynSim"
 
 const CONFIG = BatchConfig(
-    # Racine commune utilisée par les notebooks sur le serveur. Le moteur
-    # découvre récursivement les simulations et leurs dossiers DataCubes.
+    # Shared data root used by the notebooks on the server. The engine
+    # recursively discovers simulations and their DataCubes directories.
     data_repository = get(
         ENV,
         "DYNAMO_DATA_REPOSITORY",
@@ -37,12 +37,12 @@ const CONFIG = BatchConfig(
 )
 
 # =============================================================================
-# EXÉCUTION — NE RIEN MODIFIER SOUS CETTE LIGNE
+# EXECUTION — DO NOT EDIT BELOW THIS LINE
 # =============================================================================
 
 try
     run_batch(CONFIG)
 catch error_value
-    println(stderr, "\nErreur : ", sprint(showerror, error_value))
+    println(stderr, "\nError: ", sprint(showerror, error_value))
     exit(1)
 end

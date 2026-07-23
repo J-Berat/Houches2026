@@ -53,6 +53,7 @@ begin
     const SNAPSHOT_SOURCE_CACHE = Dict{String,Vector{String}}()
     const DIRECTORY_DISCOVERY_CACHE = Dict{String,Vector{String}}()
     const SNAPSHOT_FINGERPRINT_CACHE = Dict{String,Any}()
+    const UNREADABLE_DIRECTORY_WARNINGS = Set{String}()
     const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
     const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
 
@@ -87,6 +88,37 @@ begin
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
     reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
+
+    """
+    List a directory during recursive data discovery.
+
+    Shared simulation roots can contain unrelated directories that are not
+    readable by every user. Report each such path once and skip it instead of
+    aborting discovery of the accessible `DataCubes` directories.
+    """
+    function discovery_readdir(path; join = false)
+        canonical = abspath(path)
+        try
+            readdir(canonical; join)
+        catch error_value
+            if error_value isa Base.IOError || error_value isa SystemError
+                should_warn = lock(CACHE_LOCK) do
+                    canonical in UNREADABLE_DIRECTORY_WARNINGS && return false
+                    push!(UNREADABLE_DIRECTORY_WARNINGS, canonical)
+                    true
+                end
+                should_warn && println(
+                    stderr,
+                    "Warning: skipping unreadable directory during data " *
+                    "discovery: $canonical (",
+                    sprint(showerror, error_value),
+                    ")",
+                )
+                return String[]
+            end
+            rethrow()
+        end
+    end
 
     "Memoize a scalar summary and return it."
     store_reduction!(key, value) =
@@ -1160,8 +1192,11 @@ begin
 
     function fits_directory_is_snapshot(path)
         isdir(path) || return false
-        stems = Set(normalize_field_name(splitext(file)[1]) for file in readdir(path)
-            if is_fits_file(joinpath(path, file)))
+        stems = Set(
+            normalize_field_name(splitext(file)[1])
+            for file in discovery_readdir(path)
+            if is_fits_file(joinpath(path, file))
+        )
         any(alias -> normalize_field_name(alias) in stems, FIELD_ALIASES[:rho]) &&
             all(field -> any(alias -> normalize_field_name(alias) in stems,
                 FIELD_ALIASES[field]), (:vx, :vy, :vz))
@@ -1174,7 +1209,7 @@ begin
             get!(SNAPSHOT_SOURCE_CACHE, canonical) do
                 fits_directory_is_snapshot(canonical) && return [canonical]
                 sources = String[]
-                for path in readdir(canonical; join = true)
+                for path in discovery_readdir(canonical; join = true)
                     if is_hdf5_file(path) || is_fits_file(path) ||
                             fits_directory_is_snapshot(path)
                         push!(sources, path)
@@ -1208,7 +1243,7 @@ begin
         isempty(direct_snapshots) || return [abspath(path)]
         depth >= max_depth && return String[]
         found = String[]
-        for entry in sort(readdir(path))
+        for entry in sort(discovery_readdir(path))
             startswith(entry, ".") && continue
             child = joinpath(path, entry)
             isdir(child) || continue

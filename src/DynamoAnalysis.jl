@@ -1,6 +1,7 @@
 module DynamoAnalysis
 
 using CairoMakie
+using Printf
 import REPL
 
 export BatchConfig, available_figures, run_batch
@@ -39,6 +40,58 @@ module_getfield(workspace, name) =
     Base.invokelatest(getfield, workspace, name)
 module_names(workspace) =
     Base.invokelatest(names, workspace; all = true)
+
+function format_duration(seconds)
+    seconds < 60 && return @sprintf("%.1f s", seconds)
+    minutes, remaining_seconds = divrem(round(Int, seconds), 60)
+    minutes < 60 &&
+        return @sprintf("%d min %02d s", minutes, remaining_seconds)
+    hours, remaining_minutes = divrem(minutes, 60)
+    @sprintf("%d h %02d min %02d s", hours, remaining_minutes, remaining_seconds)
+end
+
+terminal_is_interactive() =
+    lowercase(get(ENV, "TERM", "dumb")) != "dumb" &&
+    lowercase(get(ENV, "CI", "false")) ∉ ("1", "true", "yes")
+
+"""
+Display a compact progress bar in an interactive terminal.
+
+When stdout is redirected to a log file, emit bounded progress messages instead
+of carriage-return animations so the resulting log remains readable.
+"""
+function show_progress(completed, total, label; force = false)
+    total > 0 || return
+    completed = clamp(completed, 0, total)
+    fraction = completed / total
+    percentage = round(Int, 100 * fraction)
+    bar_width = 30
+    filled = clamp(floor(Int, bar_width * fraction), 0, bar_width)
+    bar = repeat("█", filled) * repeat("░", bar_width - filled)
+
+    if terminal_is_interactive()
+        print(
+            stdout,
+            "\r\e[2K[", bar, "] ",
+            lpad(percentage, 3), "%  ",
+            label,
+        )
+        completed == total && println(stdout)
+        flush(stdout)
+        return
+    end
+
+    reporting_step = max(1, cld(total, 10))
+    if force || completed == 0 || completed == total ||
+            completed % reporting_step == 0
+        println(
+            stdout,
+            "[", lpad(percentage, 3), "%] ",
+            label,
+            " (", completed, "/", total, ")",
+        )
+    end
+end
 
 function source_checksum(path)
     checksum = UInt64(0xcbf29ce484222325)
@@ -116,15 +169,15 @@ function navigation_code(config::BatchConfig)
             !isnothing(directory_match) && return run_labels[directory_match]
 
             error(
-                "Simulation introuvable: " * requested_name *
-                ". Simulations disponibles: " * join(run_labels, ", ")
+                "Simulation not found: " * requested_name *
+                ". Available simulations: " * join(run_labels, ", ")
             )
         end
 
         comparison_run_selection =
             unique(configured_run_label.(configured_simulations))
         isempty(comparison_run_selection) &&
-            error("La liste des simulations ne doit pas être vide.")
+            error("The simulation list must not be empty.")
 
         selected_run = first(comparison_run_selection)
         requested_snapshot = $snapshot_literal
@@ -133,7 +186,7 @@ function navigation_code(config::BatchConfig)
             clamp(Int(requested_snapshot), 1, length(run_files[selected_run]))
         los_name = $los_literal
         los_name in ("x", "y", "z") ||
-            error("La ligne de visée doit être x, y ou z.")
+            error("The line of sight must be x, y, or z.")
         nothing
     end
     """
@@ -185,6 +238,37 @@ function selected_cell_ids(figures)
     selected
 end
 
+function cell_description(cell_id, code, config)
+    cell_id == NAVIGATION_CELL_ID &&
+        return "Selecting simulations and snapshot"
+    cell_id in EARLY_DEFINITION_CELL_IDS &&
+        return "Initializing scientific functions"
+
+    for figure_name in config.figures
+        figure_variable = string(FIGURE_REGISTRY[figure_name])
+        assignment = Regex("\\b" * figure_variable * "\\s*=")
+        occursin(assignment, code) &&
+            return "Building figure \"$figure_name\""
+    end
+
+    phases = [
+        "comparison_cubes" => "Reading comparison cubes",
+        "temporal_run_series" => "Computing time series",
+        "power_spectrum" => "Computing power spectra",
+        "structure_function" => "Computing structure functions",
+        "dust_" => "Computing dust observables",
+        "starlight_" => "Computing starlight polarization",
+        "zeeman_" => "Computing Zeeman observables",
+        "moose_" => "Computing MOOSE observables",
+        "shine_" => "Computing SHINE observables",
+        "load_raw_cube" => "Reading and converting cubes",
+    ]
+    for (needle, description) in phases
+        occursin(needle, code) && return description
+    end
+    "Computing scientific dependencies"
+end
+
 function execute_cells(config::BatchConfig)
     validate_source_index()
     cells = read_notebook_cells(MASTER_NOTEBOOK)
@@ -206,11 +290,16 @@ function execute_cells(config::BatchConfig)
         [id for id in EARLY_DEFINITION_CELL_IDS if id in selected],
         CELL_EXECUTION_ORDER,
     ))
+    planned_cells = [id for id in execution_sequence if id in selected]
+    total_cells = length(planned_cells)
+    println("Scientific plan: ", total_cells, " required cells")
+
     executed = 0
-    for cell_id in execution_sequence
-        cell_id in selected || continue
+    for cell_id in planned_cells
         code = cell_id == NAVIGATION_CELL_ID ?
             navigation_code(config) : cells[cell_id]
+        description = cell_description(cell_id, code, config)
+        show_progress(executed, total_cells, description; force = true)
         try
             Base.include_string(
                 REPL.softscope,
@@ -219,34 +308,45 @@ function execute_cells(config::BatchConfig)
                 MASTER_NOTEBOOK,
             )
         catch error_value
-            println(stderr, "\nErreur dans la cellule ", cell_id, " :")
+            terminal_is_interactive() && println(stdout)
+            println(stderr, "\nError in cell ", cell_id, ":")
             showerror(stderr, error_value, catch_backtrace())
             println(stderr)
             rethrow()
         end
         executed += 1
+        show_progress(executed, total_cells, description)
     end
     workspace, executed
 end
 
 function validate(config::BatchConfig)
     isdir(config.data_repository) ||
-        error("Répertoire de données introuvable: $(config.data_repository)")
+        error("Data directory not found: $(config.data_repository)")
     isempty(config.simulations) &&
-        error("La liste des simulations ne doit pas être vide.")
+        error("The simulation list must not be empty.")
     config.line_of_sight in ("x", "y", "z") ||
-        error("La ligne de visée doit être x, y ou z.")
+        error("The line of sight must be x, y, or z.")
     lowercase(config.output_format) in ("png", "pdf") ||
-        error("Le format doit être \"png\" ou \"pdf\".")
+        error("The output format must be \"png\" or \"pdf\".")
     unknown = setdiff(config.figures, available_figures())
     isempty(unknown) ||
-        error("Figures inconnues: $(join(unknown, ", "))")
+        error("Unknown figures: $(join(unknown, ", "))")
 end
 
 function save_figures(workspace, config::BatchConfig)
-    mkpath(config.output_directory)
+    output_directory = abspath(config.output_directory)
+    mkpath(output_directory)
     destinations = String[]
-    for figure_name in config.figures
+    total_figures = length(config.figures)
+    println("\nSaving ", total_figures, " figure(s)")
+    for (index, figure_name) in enumerate(config.figures)
+        show_progress(
+            index - 1,
+            total_figures,
+            "Writing \"$figure_name\"";
+            force = true,
+        )
         figure_symbol = FIGURE_REGISTRY[figure_name]
         if !module_isdefined(workspace, figure_symbol)
             defined_figures = sort!(
@@ -256,28 +356,33 @@ function save_figures(workspace, config::BatchConfig)
                 )),
             )
             error(
-                "La figure $figure_name n'a pas été calculée. Variables de " *
-                "figure définies: $(join(defined_figures, ", ")).",
+                "Figure $figure_name was not computed. Defined figure " *
+                "variables: $(join(defined_figures, ", ")).",
             )
         end
         figure = module_getfield(workspace, figure_symbol)
         isnothing(figure) &&
-            error("La figure $figure_name est restée indéfinie après le calcul.")
+            error("Figure $figure_name remained undefined after computation.")
         destination = joinpath(
-            config.output_directory,
+            output_directory,
             "$(figure_name).$(lowercase(config.output_format))",
         )
         CairoMakie.save(destination, figure)
         push!(destinations, destination)
-        println("Figure enregistrée : ", destination)
+        show_progress(
+            index,
+            total_figures,
+            "Saved figure: $figure_name",
+        )
     end
     destinations
 end
 
 function run_batch(config::BatchConfig)
+    started_at = time_ns()
     validate(config)
     if isempty(config.figures)
-        println("Figures disponibles :")
+        println("Available figures:")
         foreach(name -> println("  \"", name, "\","), available_figures())
         return String[]
     end
@@ -289,27 +394,51 @@ function run_batch(config::BatchConfig)
         string(max(1, length(config.simulations))),
     )
 
-    println("Moteur batch : Julia natif (Pluto non chargé)")
-    println("Source scientifique unique : ", MASTER_NOTEBOOK)
-    println("Simulations : ", join(config.simulations, ", "))
-    println("Figures : ", join(config.figures, ", "))
+    output_directory = abspath(config.output_directory)
+    println("\n", repeat("═", 72))
+    println("DYNAMO — BATCH COMPUTATION")
+    println(repeat("═", 72))
+    println("Engine              : Native Julia (Pluto not loaded)")
+    println("Scientific source   : ", MASTER_NOTEBOOK)
+    println("Data directory      : ", ENV["DYNAMO_DATA_REPOSITORY"])
+    println("Snapshot            : ", config.snapshot)
+    println("Line of sight       : ", config.line_of_sight)
+    println("Output format       : ", uppercase(config.output_format))
+    println("Output directory    : ", output_directory)
+    println("\nCompared simulations (", length(config.simulations), "):")
+    foreach(name -> println("  • ", name), config.simulations)
+    println("\nRequested figures (", length(config.figures), "):")
+    foreach(name -> println("  • ", name), config.figures)
     println(
-        "Cache I/O : ",
+        "\nI/O cache           : ",
         ENV["DYNAMO_RAW_CUBE_CACHE_ENTRIES"],
-        " cube(s), avec limite mémoire automatique",
+        " cube(s), with an automatic memory limit",
     )
     if Threads.nthreads() == 1
         println(
-            "Conseil : lancer Julia avec --threads=auto pour paralléliser ",
-            "les balayages temporels.",
+            "Tip: start Julia with --threads=auto to parallelize ",
+            "time-series sweeps.",
         )
     else
-        println("Threads Julia : ", Threads.nthreads())
+        println("Julia threads       : ", Threads.nthreads())
     end
 
+    println("\nStarting scientific computations")
     workspace, executed = execute_cells(config)
-    println("Cellules scientifiques exécutées : ", executed)
-    save_figures(workspace, config)
+    destinations = save_figures(workspace, config)
+    elapsed_seconds = (time_ns() - started_at) / 1.0e9
+
+    println("\n", repeat("═", 72))
+    println("COMPUTATION COMPLETE")
+    println(repeat("═", 72))
+    println("Executed cells      : ", executed)
+    println("Generated figures   : ", length(destinations))
+    println("Total runtime       : ", format_duration(elapsed_seconds))
+    println("Output directory    : ", output_directory)
+    println("\nCreated files:")
+    foreach(path -> println("  ✓ ", path), destinations)
+    println(repeat("═", 72))
+    destinations
 end
 
 end

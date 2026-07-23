@@ -8,12 +8,8 @@ The notebooks read HDF5 or FITS simulation snapshots, expose the main physical a
 
 | File | Purpose |
 |---|---|
-| `dynamo.jl` | General MHD diagnostics: maps, PDFs, phase diagrams, magnetic growth, energy ratios, vorticity, spectra, structure functions, comparative $B$--$n$ relations, HRO, and HOG. |
-| `dust.jl` | Synthetic thermal-dust Stokes emission, polarization diagnostics, and structure functions for every projected observable. |
-| `moose.jl` | MOOSE synchrotron emission, Faraday rotation, interferometric filtering, RM synthesis, and projected-observable structure functions. |
-| `shine.jl` | SHINE synthetic H I 21-cm emission, phase-separated columns, velocity moments, spectra, RGB composites, and structure functions for all scalar maps. |
-| `zeeman.jl` | Synthetic H I Stokes-I/V spectra, Zeeman magnetic-field recovery, and structure functions for all Zeeman maps. |
-| `starlightpol.jl` | Dichroic starlight polarization using cell-by-cell Mueller propagation, with structure functions for all projected Stokes and derived maps. |
+| `dynamo_diagnostics.jl` | Single scientific source containing the MHD diagnostics and all synthetic-observation calculations. |
+| `src/DynamoAnalysis.jl` | Shared batch engine that selects simulations and evaluates only the dependencies of requested figures. |
 
 The five synthetic-observation notebooks compute axis-averaged, periodic, two-dimensional structure functions for every scalar sky map. Their common controls are in **Shared observational beam**: enable or disable the figures, select the order $p$, and choose the number of sampled separations. Polarization-angle increments use the shortest difference modulo $180^\circ$.
 
@@ -23,9 +19,9 @@ The isotropic power-spectrum panels fit $E(k)=A k^\alpha$ over user-selected $k_
 
 All figures use LaTeX rendering consistently for x- and y-axis labels, numeric tick labels, and colorbar labels and ticks. Scientific-notation ticks are rendered as $a\times10^b$ rather than as plain-text Unicode.
 | `run_pluto.jl` | Interactive launcher that asks which notebook to open. |
+| `../run_figures.jl` | Batch script in the main `LesHouches2026` directory. It reads the selected simulations and writes the requested figures without opening an interface. |
 | `export_html.jl` | Executes one notebook from top to bottom and exports a self-contained HTML snapshot. |
-| `dynamo_diagnostics.jl` | Master notebook containing every analysis section. This is the source of truth for shared code. |
-| `split_notebooks.jl` | Regenerates the six focused notebooks from the master notebook and its dependency graph. |
+| `split_notebooks.jl` | Optional generator for recreating the six focused notebooks when they are specifically needed. |
 | `Project.toml`, `Manifest-v1.11.toml`, `Manifest-v1.12.toml` | Reproducible environments with dependency versions resolved separately for Julia 1.11 and 1.12. |
 
 ## Requirements
@@ -37,7 +33,8 @@ All figures use LaTeX rendering consistently for x- and y-axis labels, numeric t
 
 The Julia packages are declared in `Project.toml`; no manual package-by-package installation is required. Direct dependencies include Pluto, PlutoUI, CairoMakie, FFTW, FITSIO, HDF5, LaTeXStrings, StatsBase, and the required Julia standard libraries. `Manifest-v1.11.toml` and `Manifest-v1.12.toml` lock the complete dependency graph separately for the two supported Julia versions. Julia automatically selects the matching file.
 
-Each generated notebook also embeds the same `Project.toml` and `Manifest.toml`, so opening a focused notebook directly in Pluto uses the reproducible environment rather than an unrelated global Julia environment.
+The optional generated notebooks embed the same environment, but they are no
+longer kept as duplicate source files in the main directory.
 
 ## Quick start on a local computer
 
@@ -60,26 +57,8 @@ Start the interactive launcher:
 julia --project=. run_pluto.jl
 ```
 
-At startup, the launcher prints the Julia version and the selected manifest. For Julia 1.11 it must report `Manifest-v1.11.toml`; for Julia 1.12 it must report `Manifest-v1.12.toml`. It then displays a numbered menu and opens the selected notebook without repeating the package-installation step. For example:
-
-```text
-1. Dynamo
-2. Dust
-3. MOOSE
-4. SHINE
-5. ZEEMAN
-6. StarlightPol
-```
-
-Enter a number from 1 to 6. On macOS or Windows, the browser opens automatically.
-
-You may also bypass the menu:
-
-```bash
-julia --project=. run_pluto.jl dust
-```
-
-The argument may be `dynamo`, `dust`, `moose`, `shine`, `zeeman`, or `starlightpol`, with or without the `.jl` extension.
+The launcher opens the single source notebook `dynamo_diagnostics.jl`. On
+macOS or Windows, the browser opens automatically.
 
 ## Running on the PSMN or another remote server
 
@@ -119,34 +98,67 @@ Open that exact URL in the browser on your local computer. The SSH tunnel secure
 
 Press `Ctrl+C` in the server terminal when you want to stop Pluto.
 
+## Calculating figures without an interface
+
+Open `../run_figures.jl` in a text editor and modify only its configuration block:
+
+```julia
+const DATA_REPOSITORY =
+    joinpath(DYNAMO_DIRECTORY, "cooling", "VaryingMach")
+const ANALYSIS = "dynamo"
+const SIMULATIONS = [
+    "run_turb_cooling_mhd_lo_mach",
+    "run_turb_cooling_mhd_mi_mach",
+    "run_turb_cooling_mhd_hi_mach",
+]
+const SNAPSHOT = :last
+const LINE_OF_SIGHT = "z"
+const FIGURES = ["pdfs", "phase_diagram", "magnetic_density"]
+const OUTPUT_DIRECTORY = joinpath(@__DIR__, "figures")
+const OUTPUT_FORMAT = "png"
+```
+
+Then run the script from the main `LesHouches2026` directory, without
+arguments:
+
+```bash
+cd "/path/to/LesHouches2026"
+julia --project=Dynamo run_figures.jl
+```
+
+There is no menu, browser, or interactive notebook. Every requested figure is
+written to `OUTPUT_DIRECTORY`. Comparative figures contain the simulations
+listed in `SIMULATIONS`; the first entry is used as the active simulation for
+non-comparative maps. The script evaluates the union of the required
+dependencies once, so several requested figures can reuse the same loaded data.
+
 ## Selecting the data repository
 
-The notebooks search for data in this order:
+The notebook starts with an empty data path and does not inspect or open a cube.
+Enter any absolute path in **Data path**, then click **Load path**. The notebook
+can therefore be installed in one folder while the simulations live anywhere
+else on the local computer, an external disk, or a mounted server filesystem.
 
-1. The path stored in the `DYNAMO_DATA_REPOSITORY` environment variable.
-2. `/Xnfs/Houches2026/DynSim/cooling_freq_output`, when it exists.
-3. The bundled `cooling/VaryingMach` directory, when present beside the notebooks.
-
-To select a repository before starting Pluto:
+For an explicitly scripted startup, the path can instead be supplied through
+the environment:
 
 ```bash
 export DYNAMO_DATA_REPOSITORY=/path/to/your/simulations
 julia --project=. run_pluto.jl
 ```
 
-You can also change the path interactively in the notebook and click **Load path**.
+This environment variable is optional. When it is absent, the notebook leaves
+the field empty.
 
-The loader only considers snapshot files located inside a directory named
-`DataCubes`. The selected path may point to any of the following:
+The selected path may point to any of the following:
 
 - a repository containing several simulation families;
 - one family such as `VaryingMach`;
 - one simulation directory;
-- a `DataCubes` directory.
+- any directory containing HDF5/FITS snapshots directly.
 
-Directory names and nesting are discovered recursively, but directories that
-contain snapshots directly without a `DataCubes` level are ignored. A typical
-layout is:
+Directory names and nesting are discovered recursively. `DataCubes` remains a
+supported convention, but it is not required. A typical layout is:
 
 ```text
 simulation-root/
@@ -210,8 +222,8 @@ and retains only scalar summaries. The raw-cube cache contains at most one
 snapshot; moving the snapshot slider evicts the previous raw cube before reading
 the newly selected one.
 
-Each simulation is capped at 40 snapshots. When a `DataCubes` directory contains
-more than 40 files, the notebooks select 40 evenly spaced snapshots including
+Each simulation is capped at 40 snapshots. When a snapshot directory contains
+more than 40 files, the notebook selects 40 evenly spaced snapshots including
 the first and last, preserving the full simulated time interval without opening
 the omitted cubes.
 
@@ -219,16 +231,16 @@ For comparative diagnostics, select any number of simulations under **Simulation
 
 ## Exporting a complete notebook to HTML
 
-The HTML exporter evaluates every cell and stops if any cell fails. Select a notebook with `DYNAMO_NOTEBOOK`:
+The HTML exporter evaluates the single source notebook and stops if any cell
+fails:
 
 ```bash
-DYNAMO_NOTEBOOK=dust.jl julia --project=. export_html.jl
+julia --project=. export_html.jl
 ```
 
 This creates `dust.html` beside the notebook. To choose another output path:
 
 ```bash
-DYNAMO_NOTEBOOK=dust.jl \
 DYNAMO_HTML_PATH=/path/to/results/dust.html \
 julia --project=. export_html.jl
 ```
@@ -237,22 +249,23 @@ The exported HTML is a read-only snapshot. Interactive controls require a live P
 
 ## Regenerating the focused notebooks
 
-Shared logic should be edited in `dynamo_diagnostics.jl`. Then regenerate all focused notebooks with:
+The focused notebooks are optional generated artifacts. If they are needed for
+a workshop session, recreate them from `dynamo_diagnostics.jl` with:
 
 ```bash
 julia --project=. split_notebooks.jl
 ```
 
-The generator uses Pluto's dependency graph to include only the cells needed by each focused notebook.
-
-> **Important:** do not make long-lived edits only in `dynamo.jl`, `dust.jl`, `moose.jl`, `shine.jl`, `zeeman.jl`, or `starlightpol.jl`. Regeneration can overwrite those edits. Apply shared or scientific changes to `dynamo_diagnostics.jl` first.
+The generator uses Pluto's dependency graph to include only the cells needed by
+each focused notebook. These files are disposable: all scientific changes
+belong in `dynamo_diagnostics.jl`.
 
 ## Useful environment variables
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `DYNAMO_DATA_REPOSITORY` | Simulation-data root | PSMN path, then bundled data |
-| `DYNAMO_NOTEBOOK` | Notebook used by the launcher or HTML exporter | Interactive menu for launcher; `dynamo.jl` for exporter |
+| `DYNAMO_DATA_REPOSITORY` | Optional simulation-data root | Empty; selected manually in the notebook |
+| `DYNAMO_NOTEBOOK` | Optional notebook override for the HTML exporter | `dynamo_diagnostics.jl` |
 | `DYNAMO_HTML_PATH` | HTML export destination | `<notebook-name>.html` |
 | `PLUTO_HOST` | Pluto listening address | `127.0.0.1` |
 | `PLUTO_PORT` | Pluto web-interface port | `1234` locally; set an unused personal port explicitly on a shared server |
@@ -296,7 +309,9 @@ PLUTO_PORT=16543 julia --project=. run_pluto.jl
 
 ### No snapshots are found
 
-Check that the repository contains a non-empty directory named `DataCubes`, that its snapshots use a supported extension, and that you have permission to read it. The path may point directly to a `DataCubes` directory. Set `DYNAMO_DATA_REPOSITORY` explicitly if the default PSMN location is not appropriate.
+Check that the selected repository contains a non-empty directory with supported
+HDF5/FITS snapshots and that you have permission to read it. The path may point
+directly to that snapshot directory.
 
 ### An HDF5 field is missing or ambiguous
 
@@ -311,6 +326,11 @@ and comparative diagnostics retain derived profiles or maps instead of a full
 execution enabled, run only the needed result cells, and reduce the number of
 selected simulations, maps, or spectral channels when memory is limited.
 
+For network filesystems, startup cataloguing uses filenames without opening every
+snapshot. The selected snapshot is queried for its exact time, and each full
+HDF5 read scans the internal dataset tree once and reuses that catalogue for all
+physical fields.
+
 ## Reproducibility notes
 
 - Physical units and conversion factors are visible near the top of each notebook.
@@ -322,22 +342,19 @@ selected simulations, maps, or spectral channels when memory is limited.
 ## Repository structure
 
 ```text
-Houches2026/
-├── README.md
-├── Project.toml
-├── Manifest.toml
-├── Manifest-v1.11.toml
-├── Manifest-v1.12.toml
-├── run_pluto.jl
-├── export_html.jl
-├── split_notebooks.jl
-├── dynamo_diagnostics.jl
-├── dynamo.jl
-├── dust.jl
-├── moose.jl
-├── shine.jl
-├── zeeman.jl
-└── starlightpol.jl
+LesHouches2026/
+├── run_figures.jl
+├── figures/
+└── Dynamo/
+    ├── Project.toml
+    ├── Manifest-v1.11.toml
+    ├── Manifest-v1.12.toml
+    ├── dynamo_diagnostics.jl
+    ├── src/
+    │   └── DynamoAnalysis.jl
+    ├── run_pluto.jl
+    ├── export_html.jl
+    └── split_notebooks.jl
 ```
 
 ## Getting help

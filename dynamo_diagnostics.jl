@@ -854,14 +854,11 @@ PlutoUI.TableOfContents(title = "Notebook sections", indent = true, depth = 3, a
 
 # ╔═╡ 7bd6f2c9-ae49-4636-a251-f526ab347125
 begin
-    preferred_data_repository = get(
-        ENV,
-        "DYNAMO_DATA_REPOSITORY",
-        "/Xnfs/Houches2026/DynSim/cooling_freq_output",
-    )
-    bundled_data_repository = joinpath(@__DIR__, "cooling", "VaryingMach")
-    DEFAULT_DATA_REPOSITORY = isdir(preferred_data_repository) ?
-        preferred_data_repository : bundled_data_repository
+    # Keep the notebook independent from its installation directory. No data
+    # repository is selected unless the user explicitly provides one here or
+    # through DYNAMO_DATA_REPOSITORY (used by the non-interactive batch script).
+    DEFAULT_DATA_REPOSITORY =
+        strip(get(ENV, "DYNAMO_DATA_REPOSITORY", ""))
     SNAPSHOT_EXTENSIONS = (".h5", ".hdf5", ".fits", ".fit", ".fts")
     MAX_SNAPSHOTS_PER_RUN = 40
     nothing
@@ -875,13 +872,14 @@ md"""
 
 ### Data repository
 
-Only simulations stored in a directory named `DataCubes` are discovered. The
-selected path may be the common repository root or one specific `DataCubes`
-directory.
+The selected path may be any directory containing HDF5/FITS snapshots directly,
+or a parent directory containing one or more simulation folders. Directory
+names and nesting are unrestricted. No cube is opened when the notebook starts:
+enter a path and click **Load path** when you are ready.
 
 | Data source | Control |
 |:--|:--|
-| Data path | $(@bind data_repository PlutoUI.confirm(PlutoUI.TextField(90; default = DEFAULT_DATA_REPOSITORY, placeholder = "/path/to/data"); label = "Load path")) |
+| Data path | $(@bind data_repository PlutoUI.confirm(PlutoUI.TextField(90; default = DEFAULT_DATA_REPOSITORY, placeholder = "/absolute/path/to/repository-or-DataCubes"); label = "Load path")) |
 """
 
 # ╔═╡ 98360288-85ca-4551-bdde-c12c7a329302
@@ -951,9 +949,9 @@ begin
     end
 
     function hdf5_field_path(h, field; required = true, source = "HDF5 file",
-            overrides = Dict{Symbol,String}())
+            overrides = Dict{Symbol,String}(), available_paths = nothing)
         aliases = Set(normalize_field_name.(FIELD_ALIASES[field]))
-        paths = hdf5_dataset_paths(h)
+        paths = isnothing(available_paths) ? hdf5_dataset_paths(h) : available_paths
         matches = filter(paths) do path
             normalize_field_name(basename(path)) in aliases
         end
@@ -982,8 +980,9 @@ begin
     end
 
     function read_hdf5_field(h, field; required = true, source = "HDF5 file",
-            overrides = Dict{Symbol,String}())
-        path = hdf5_field_path(h, field; required, source, overrides)
+            overrides = Dict{Symbol,String}(), available_paths = nothing)
+        path = hdf5_field_path(h, field; required, source, overrides,
+            available_paths)
         isnothing(path) && return nothing
         dataset = h[path]
         try
@@ -1015,11 +1014,14 @@ begin
     end
 
     function centered_hdf5_magnetic_component(h, centered, left, right, source;
-            overrides = Dict{Symbol,String}())
-        direct = read_hdf5_field(h, centered; required = false, source, overrides)
+            overrides = Dict{Symbol,String}(), available_paths = nothing)
+        direct = read_hdf5_field(h, centered; required = false, source, overrides,
+            available_paths)
         isnothing(direct) || return direct
-        lower = read_hdf5_field(h, left; required = false, source, overrides)
-        upper = read_hdf5_field(h, right; required = false, source, overrides)
+        lower = read_hdf5_field(h, left; required = false, source, overrides,
+            available_paths)
+        upper = read_hdf5_field(h, right; required = false, source, overrides,
+            available_paths)
         (isnothing(lower) || isnothing(upper)) && error(
             "HDF5 magnetic component $(centered) in $(source) requires either " *
             "$(join(FIELD_ALIASES[centered], ", ")) or both face fields " *
@@ -1056,14 +1058,10 @@ begin
         startswith(path, "~/") ? joinpath(homedir(), path[3:end]) : path
     end
 
-    is_datacubes_directory(path) =
-        isdir(path) && lowercase(basename(normpath(path))) == "datacubes"
-
     function discover_cube_directories(path; depth = 0, max_depth = 32)
         isdir(path) || return String[]
-        if is_datacubes_directory(path)
-            return isempty(snapshot_sources(path)) ? String[] : [abspath(path)]
-        end
+        direct_snapshots = snapshot_sources(path)
+        isempty(direct_snapshots) || return [abspath(path)]
         depth >= max_depth && return String[]
         found = String[]
         for entry in sort(readdir(path))
@@ -1083,8 +1081,8 @@ begin
         requested = abspath(expand_home(strip(repository)))
         isdir(requested) || error("Data folder does not exist: $requested")
         is_dataset_root(requested) || error(
-            "No non-empty DataCubes directory containing HDF5 or FITS snapshots " *
-            "was found recursively under: $requested.",
+            "No directory containing HDF5 or FITS snapshots was found " *
+            "recursively under: $requested.",
         )
         requested
     end
@@ -1486,7 +1484,11 @@ begin
     run_files = Dict(label => limit_snapshot_files(
             available_run_files[label], MAX_SNAPSHOTS_PER_RUN)
         for label in run_labels)
-    run_times = Dict(label => snapshot_time.(run_files[label]) for label in run_labels)
+    # Do not open every HDF5 file at startup just to populate inactive temporal
+    # controls. Exact physical times are read with the selected cube or during
+    # an explicitly requested temporal sweep.
+    run_times = Dict(label => snapshot_time_from_filename.(run_files[label])
+        for label in run_labels)
     maximum_snapshot_count = maximum(length.(values(run_files)))
     run_summary = join([
         string(label, " = ", length(run_files[label]), "/",
@@ -1549,7 +1551,8 @@ begin
     analysis_series_labels = requested_open_labels
     comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
-    active_time_value = run_times[selected_run][selected_snapshot] * time_unit_Myr
+    active_time_value = snapshot_time(
+        run_files[selected_run][selected_snapshot]) * time_unit_Myr
     active_time_text = isfinite(active_time_value) ?
         string(round(active_time_value; sigdigits = 6)) : "not available"
     comparison_runs_text = join(comparison_run_labels, ", ")
@@ -1640,28 +1643,29 @@ begin
                 t = snapshot_time(path))
         end
         raw_fields, raw_length, raw_time = with_hdf5_file(path) do h
+            available_paths = hdf5_dataset_paths(h)
             raw_fields = (
                 rho = read_hdf5_field(h, :rho; source = path,
-                    overrides = HDF5_FIELD_OVERRIDES),
+                    overrides = HDF5_FIELD_OVERRIDES, available_paths),
                 P = read_hdf5_field(h, :P; source = path,
-                    overrides = HDF5_FIELD_OVERRIDES),
+                    overrides = HDF5_FIELD_OVERRIDES, available_paths),
                 vx = read_hdf5_field(h, :vx; source = path,
-                    overrides = HDF5_FIELD_OVERRIDES),
+                    overrides = HDF5_FIELD_OVERRIDES, available_paths),
                 vy = read_hdf5_field(h, :vy; source = path,
-                    overrides = HDF5_FIELD_OVERRIDES),
+                    overrides = HDF5_FIELD_OVERRIDES, available_paths),
                 vz = read_hdf5_field(h, :vz; source = path,
-                    overrides = HDF5_FIELD_OVERRIDES),
+                    overrides = HDF5_FIELD_OVERRIDES, available_paths),
                 bx = centered_hdf5_magnetic_component(h, :bx, :bx_l, :bx_r, path;
-                    overrides = HDF5_FIELD_OVERRIDES),
+                    overrides = HDF5_FIELD_OVERRIDES, available_paths),
                 by = centered_hdf5_magnetic_component(h, :by, :by_l, :by_r, path;
-                    overrides = HDF5_FIELD_OVERRIDES),
+                    overrides = HDF5_FIELD_OVERRIDES, available_paths),
                 bz = centered_hdf5_magnetic_component(h, :bz, :bz_l, :bz_r, path;
-                    overrides = HDF5_FIELD_OVERRIDES),
+                    overrides = HDF5_FIELD_OVERRIDES, available_paths),
             )
             raw_length = read_hdf5_field(h, :L; source = path,
-                overrides = HDF5_FIELD_OVERRIDES)
+                overrides = HDF5_FIELD_OVERRIDES, available_paths)
             raw_time = read_hdf5_field(h, :t; required = false, source = path,
-                overrides = HDF5_FIELD_OVERRIDES)
+                overrides = HDF5_FIELD_OVERRIDES, available_paths)
             (raw_fields, raw_length, raw_time)
         end
         # The HDF5 file and all dataset handles are closed before conversion or

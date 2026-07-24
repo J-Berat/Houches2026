@@ -1224,7 +1224,7 @@ begin
                 fits_directory_is_snapshot(canonical) && return [canonical]
                 sources = String[]
                 for path in discovery_readdir(canonical; join = true)
-                    if is_hdf5_file(path) || is_fits_file(path) ||
+                    if hdf5_file_is_snapshot(path) || is_fits_file(path) ||
                             fits_directory_is_snapshot(path)
                         push!(sources, path)
                     end

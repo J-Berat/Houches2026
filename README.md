@@ -92,24 +92,35 @@ Les extensions reconnues sont `.h5`, `.hdf5`, `.fits`, `.fit` et `.fts`.
 Ouvrir `run_figures.jl` et modifier uniquement le bloc `CONFIG` :
 
 ```julia
-const CONFIG = BatchConfig(
+const DYNAMO_CONFIG = BatchConfig(
     data_repository = "/Xnfs/Houches2026/DynSim",
-    simulations = [
-        "simulation_1",
-        "simulation_2",
-        "simulation_3",
-    ],
+    simulations = SIMULATIONS,
     snapshot = :last,
+    snapshot_window = :first,
+    snapshot_count = 20,
     line_of_sight = "z",
-    figures = figures_for_notebooks(["dynamo", "dust"]),
-    output_directory = joinpath(PROJECT_DIRECTORY, "figures", "dynamo_dust"),
+    figures = figures_for_notebooks(["dynamo"]),
+    output_directory = joinpath(PROJECT_DIRECTORY, "figures", "dynamo_first20"),
+    output_format = "png",
+)
+
+const DUST_CONFIG = BatchConfig(
+    data_repository = "/Xnfs/Houches2026/DynSim",
+    simulations = SIMULATIONS,
+    snapshot = :last,
+    snapshot_window = :last,
+    snapshot_count = 10,
+    line_of_sight = "z",
+    figures = figures_for_notebooks(["dust"]),
+    output_directory = joinpath(PROJECT_DIRECTORY, "figures", "dust_last10"),
     output_format = "png",
 )
 ```
 
 The notebook groups are `dynamo`, `dust`, `starlightpol`, `zeeman`, `moose`,
-and `shine`. Selecting `dynamo` and `dust` computes all 23 figures from those
-two notebooks.
+and `shine`. The configured jobs use the first 20 snapshots of each simulation
+for all 18 Dynamo figures and the last 10 snapshots for all 21 figures from
+Dust, StarlightPol, ZEEMAN, MOOSE, and SHINE.
 
 Puis lancer :
 
@@ -130,6 +141,42 @@ Le moteur batch :
 
 À la fin, le script affiche la durée totale, le dossier de sortie absolu et le
 chemin complet de chaque figure créée.
+
+### Downloading the figures to the laptop
+
+After the cluster computation finishes, run this command on the laptop from the
+local repository:
+
+```bash
+cd "/Users/jb270005/Desktop/LesHouchesGit"
+bash download_figures.sh
+```
+
+The script incrementally downloads:
+
+```text
+jberat@sr650node230:~/Houches2026/figures/
+```
+
+into:
+
+```text
+/Users/jb270005/Desktop/LesHouchesGit/figures/
+```
+
+Existing unchanged figures are not transferred again. Custom locations can be
+provided with `CLUSTER_HOST`, `REMOTE_FIGURE_DIRECTORY`, and
+`LOCAL_FIGURE_DIRECTORY`.
+
+For future runs, the complete cluster calculation and download can be started
+from the laptop with one command:
+
+```bash
+bash run_cluster_and_download.sh
+```
+
+This command waits for a successful cluster computation before starting the
+download.
 
 La première simulation sert aux cartes non comparatives. Les diagnostics
 comparatifs utilisent toutes les simulations listées.

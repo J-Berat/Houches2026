@@ -1024,7 +1024,21 @@ begin
     DEFAULT_DATA_REPOSITORY =
         strip(get(ENV, "DYNAMO_DATA_REPOSITORY", ""))
     SNAPSHOT_EXTENSIONS = (".h5", ".hdf5", ".fits", ".fit", ".fts")
-    MAX_SNAPSHOTS_PER_RUN = 40
+    SNAPSHOT_WINDOW_MODE =
+        lowercase(strip(get(ENV, "DYNAMO_SNAPSHOT_WINDOW_MODE", "even")))
+    SNAPSHOT_WINDOW_MODE in ("first", "last", "even") || error(
+        "DYNAMO_SNAPSHOT_WINDOW_MODE must be first, last, or even.",
+    )
+    MAX_SNAPSHOTS_PER_RUN = something(
+        tryparse(
+            Int,
+            strip(get(ENV, "DYNAMO_SNAPSHOT_WINDOW_COUNT", "40")),
+        ),
+        0,
+    )
+    MAX_SNAPSHOTS_PER_RUN > 0 || error(
+        "DYNAMO_SNAPSHOT_WINDOW_COUNT must be a positive integer.",
+    )
     nothing
 end
 
@@ -1636,8 +1650,16 @@ begin
         sources
     end
 
-    function limit_snapshot_files(sources, maximum_count)
+    function limit_snapshot_files(
+            sources,
+            maximum_count;
+            mode = SNAPSHOT_WINDOW_MODE,
+        )
         length(sources) <= maximum_count && return sources
+        mode == "first" && return sources[1:maximum_count]
+        mode == "last" &&
+            return sources[(length(sources) - maximum_count + 1):end]
+        mode == "even" || error("Unknown snapshot-window mode: $mode")
         indices = unique(round.(Int,
             range(1, length(sources); length = maximum_count)))
         sources[indices]
@@ -1691,7 +1713,7 @@ Markdown.parse("""
 |:--|:--|
 | Comparison parameter | $(comparison_parameter) |
 | Resolved data root | **$(ROOT)** |
-| Snapshot limit | **$(MAX_SNAPSHOTS_PER_RUN)** per simulation, evenly spaced |
+| Snapshot window | **$(SNAPSHOT_WINDOW_MODE) $(MAX_SNAPSHOTS_PER_RUN)** per simulation |
 | Discovered runs | $(run_summary) |
 """)
 

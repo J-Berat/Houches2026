@@ -28,6 +28,8 @@ Base.@kwdef struct BatchConfig
     data_repository::String
     simulations::Vector{String}
     snapshot::Union{Int,Symbol} = :last
+    snapshot_window::Symbol = :even
+    snapshot_count::Int = 40
     line_of_sight::String = "z"
     figures::Vector{String}
     output_directory::String
@@ -328,6 +330,11 @@ function validate(config::BatchConfig)
         error("The simulation list must not be empty.")
     config.line_of_sight in ("x", "y", "z") ||
         error("The line of sight must be x, y, or z.")
+    config.snapshot_window in (:first, :last, :even) || error(
+        "The snapshot window must be :first, :last, or :even.",
+    )
+    config.snapshot_count > 0 ||
+        error("The snapshot count must be a positive integer.")
     lowercase(config.output_format) in ("png", "pdf") ||
         error("The output format must be \"png\" or \"pdf\".")
     unknown = setdiff(config.figures, available_figures())
@@ -389,6 +396,8 @@ function run_batch(config::BatchConfig)
     end
 
     ENV["DYNAMO_DATA_REPOSITORY"] = abspath(config.data_repository)
+    ENV["DYNAMO_SNAPSHOT_WINDOW_MODE"] = string(config.snapshot_window)
+    ENV["DYNAMO_SNAPSHOT_WINDOW_COUNT"] = string(config.snapshot_count)
     get!(
         ENV,
         "DYNAMO_RAW_CUBE_CACHE_ENTRIES",
@@ -403,6 +412,13 @@ function run_batch(config::BatchConfig)
     println("Scientific source   : ", MASTER_NOTEBOOK)
     println("Data directory      : ", ENV["DYNAMO_DATA_REPOSITORY"])
     println("Snapshot            : ", config.snapshot)
+    println(
+        "Snapshot window     : ",
+        config.snapshot_window,
+        " ",
+        config.snapshot_count,
+        " per simulation",
+    )
     println("Line of sight       : ", config.line_of_sight)
     println("Output format       : ", uppercase(config.output_format))
     println("Output directory    : ", output_directory)

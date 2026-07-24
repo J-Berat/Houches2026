@@ -19,6 +19,7 @@ const EARLY_DEFINITION_CELL_IDS = Base.UUID[
     # available before their narrative cell position; sequential Julia needs
     # that ordering to be explicit.
     Base.UUID("a8ef96ab-0ddd-4eb2-a216-b7d96c2a9a08"),
+    Base.UUID("904ba663-d536-4b27-a379-4af927b0affb"),
 ]
 
 include(joinpath(@__DIR__, "FigureRegistry.jl"))

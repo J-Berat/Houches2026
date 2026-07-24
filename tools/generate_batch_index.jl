@@ -15,6 +15,13 @@ const REQUIRED_SETUP_CELL_IDS = Set([
     Base.UUID("34d6b5f4-9c2d-42d5-9034-543aeb8ae151"),
     Base.UUID("8f1f1d9a-e6df-4dd1-b5b3-2d2c52c86686"),
 ])
+const EXPLICIT_FIGURE_DEPENDENCY_IDS = Dict(
+    # Pluto does not detect the short-circuited Mach-only call to
+    # bulk_metrics_from_cube in the enstrophy-density cell.
+    "enstrophy_density" => Set([
+        Base.UUID("904ba663-d536-4b27-a379-4af927b0affb"),
+    ]),
+)
 
 function source_checksum(path)
     checksum = UInt64(0xcbf29ce484222325)
@@ -60,6 +67,13 @@ for (name, symbol) in FIGURE_REGISTRY
     seeds = collect(Pluto.where_assigned(source.topology, Set([symbol])))
     isempty(seeds) && error("No cell assigns $symbol for figure $name.")
     selected = dependency_closure(source.topology, seeds)
+    explicit_ids = get(EXPLICIT_FIGURE_DEPENDENCY_IDS, name, Set{Base.UUID}())
+    explicit_seeds = [
+        cell for cell in source.cells if cell.cell_id in explicit_ids
+    ]
+    length(explicit_seeds) == length(explicit_ids) ||
+        error("An explicit dependency cell is missing for figure $name.")
+    union!(selected, dependency_closure(source.topology, explicit_seeds))
     for cell in source.cells
         cell.cell_id in REQUIRED_SETUP_CELL_IDS && push!(selected, cell)
     end

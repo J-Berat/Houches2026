@@ -3029,7 +3029,10 @@ begin
         end
         (bulk = identity.(bulk), phase = with_phase ? identity.(phase) : nothing)
     end
+end
 
+# ╔═╡ 5a0d1b1b-fa59-4e7c-8c51-a98592c0c62e
+begin
     temporal_series_requested = display_global_evolution ||
         display_gamma_relations || display_normalized_B_relations ||
         display_growth_fit || display_phase_B_time || display_energy_time ||
@@ -7020,6 +7023,7 @@ version = "4.1.0+0"
 # ╟─9da572fe-21f2-43df-9320-b8742fd64773
 # ╠═41b4eb12-889d-43b3-87c2-fc7cccf8679f
 # ╟─904ba663-d536-4b27-a379-4af927b0affb
+# ╟─5a0d1b1b-fa59-4e7c-8c51-a98592c0c62e
 # ╠═36aef377-3de7-435a-af83-3a90421e3159
 # ╟─89c33295-34e7-49ec-8d04-52b2aac29cff
 # ╟─8120f7e9-74ed-4a48-b2f4-dbc75ebf0132

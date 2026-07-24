@@ -155,7 +155,7 @@ bash download_figures.sh
 The script incrementally downloads:
 
 ```text
-jberat@sr650node230:~/Houches2026/figures/
+PSMN_sr650node230:~/Houches2026/figures/
 ```
 
 into:

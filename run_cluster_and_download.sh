@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CLUSTER_HOST="${CLUSTER_HOST:-jberat@sr650node230}"
+CLUSTER_HOST="${CLUSTER_HOST:-PSMN_sr650node230}"
 
 printf '\nDYNAMO — REMOTE COMPUTATION\n'
 printf 'Cluster: %s\n\n' "${CLUSTER_HOST}"

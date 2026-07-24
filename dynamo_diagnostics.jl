@@ -5412,6 +5412,8 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 
 **Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
 
+**Display every selected magnetic spectrum through time:** $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true))
+
 | Power-spectrum panel | Display |
 |:--|:--:|
 | Number-density spectrum | $(@bind show_spectrum_density PlutoUI.CheckBox(default = true)) |
@@ -5608,6 +5610,171 @@ begin
         end
     end
     display_power_spectra ? fig_spectra : nothing
+end
+
+# ╔═╡ c4000001-6f8c-4d0c-9a10-000000000001
+begin
+    magnetic_spectrum_time_records = Dict{String, Vector{Any}}()
+    for label in comparison_run_labels
+        records = Any[]
+        for (path, product) in zip(
+                comparison_snapshot_paths[label],
+                spectrum_ensemble[label],
+            )
+            physical_time = cached_scientific_product((
+                :snapshot_physical_time,
+                cube_signature(path),
+                Float64(time_unit_Myr),
+            )) do
+                Float64(time_unit_Myr) * snapshot_time(path)
+            end
+            push!(records, (
+                path,
+                time = physical_time,
+                k = Float64.(product.kb),
+                power = Float64.(product.Pb),
+                box_length_pc = Float64(product.box_length_pc),
+                nyquist = Float64(product.nyquist),
+            ))
+        end
+        sort!(records; by = record ->
+            isfinite(record.time) ? record.time : Inf)
+        magnetic_spectrum_time_records[label] = records
+    end
+
+    magnetic_spectrum_times = Float64[
+        record.time
+        for label in comparison_run_labels
+        for record in magnetic_spectrum_time_records[label]
+        if isfinite(record.time)
+    ]
+    magnetic_spectrum_time_limits =
+        isempty(magnetic_spectrum_times) ? (0.0, 1.0) :
+        extrema(magnetic_spectrum_times)
+    magnetic_spectrum_time_limits[1] ==
+        magnetic_spectrum_time_limits[2] &&
+        (magnetic_spectrum_time_limits = (
+            magnetic_spectrum_time_limits[1] - 0.5,
+            magnetic_spectrum_time_limits[2] + 0.5,
+        ))
+    magnetic_time_colormap = Makie.to_colormap(:viridis)
+    function magnetic_time_color(time)
+        fraction = clamp(
+            (Float64(time) - magnetic_spectrum_time_limits[1]) /
+                (magnetic_spectrum_time_limits[2] -
+                    magnetic_spectrum_time_limits[1]),
+            0.0,
+            1.0,
+        )
+        index = clamp(
+            round(Int, 1 + fraction * (length(magnetic_time_colormap) - 1)),
+            1,
+            length(magnetic_time_colormap),
+        )
+        magnetic_time_colormap[index], fraction
+    end
+
+    magnetic_all_k = Float64[
+        value
+        for label in comparison_run_labels
+        for record in magnetic_spectrum_time_records[label]
+        for value in record.k
+        if isfinite(value) && value > 0
+    ]
+    magnetic_all_power = Float64[
+        value
+        for label in comparison_run_labels
+        for record in magnetic_spectrum_time_records[label]
+        for value in record.power
+        if isfinite(value) && value > 0
+    ]
+    magnetic_k_limits = enclosing_decade_limits(magnetic_all_k)
+    magnetic_power_limits = enclosing_decade_limits(magnetic_all_power)
+
+    magnetic_panel_columns = min(3, length(comparison_run_labels))
+    magnetic_panel_rows =
+        cld(length(comparison_run_labels), magnetic_panel_columns)
+    fig_magnetic_spectra_time = Figure(
+        size = (520magnetic_panel_columns,
+            470magnetic_panel_rows + 100),
+    )
+    Label(
+        fig_magnetic_spectra_time[0, 1:magnetic_panel_columns],
+        L"\mathrm{Magnetic\ power\ spectra\ through\ time}";
+        fontsize = 23,
+        font = :bold,
+    )
+    for (panel_index, label) in enumerate(comparison_run_labels)
+        row = cld(panel_index, magnetic_panel_columns)
+        column = mod1(panel_index, magnetic_panel_columns)
+        records = magnetic_spectrum_time_records[label]
+        plottable_count = count(records) do record
+            any(isfinite.(record.k) .& isfinite.(record.power) .&
+                (record.k .> 0) .& (record.power .> 0))
+        end
+        panel_title = latexstring(
+            run_label_latex_source(plain_legend_run_label(label)),
+            raw";\;N_{\mathrm{nonzero}}=",
+            plottable_count,
+            raw"/",
+            length(records),
+        )
+        axis = latex_axis(
+            fig_magnetic_spectra_time[row, column];
+            xlabel = L"k\;[\mathrm{pc}^{-1}]",
+            ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
+            title = panel_title,
+            xscale = log10,
+            yscale = log10,
+            xticks = DECADE_TICKS,
+            yticks = DECADE_TICKS,
+            xminorticks = IntervalsBetween(9),
+            yminorticks = IntervalsBetween(9),
+            xminorticksvisible = true,
+            yminorticksvisible = true,
+        )
+        for record in records
+            valid = isfinite.(record.k) .& isfinite.(record.power) .&
+                (record.k .> 0) .& (record.power .> 0)
+            any(valid) || continue
+            color, time_fraction = magnetic_time_color(record.time)
+            lines!(
+                axis,
+                record.k[valid],
+                record.power[valid];
+                color = (color, 0.35 + 0.65time_fraction),
+                linewidth = 1.2 + 1.8time_fraction,
+            )
+        end
+        representative = findfirst(record -> !isempty(record.k), records)
+        if !isnothing(representative)
+            product = records[representative]
+            forcing_k = 2 * 2pi / product.box_length_pc
+            vlines!(axis, [forcing_k];
+                color = (:black, 0.60), linestyle = :dash,
+                linewidth = 1.2)
+            vlines!(axis, [product.nyquist];
+                color = (:gray35, 0.60), linestyle = :dot,
+                linewidth = 1.2)
+        end
+        isnothing(magnetic_k_limits) ||
+            xlims!(axis, magnetic_k_limits...)
+        isnothing(magnetic_power_limits) ||
+            ylims!(axis, magnetic_power_limits...)
+    end
+    Colorbar(
+        fig_magnetic_spectra_time[
+            1:magnetic_panel_rows,
+            magnetic_panel_columns + 1,
+        ];
+        limits = magnetic_spectrum_time_limits,
+        colormap = :viridis,
+        label = L"t\;[\mathrm{Myr}]",
+        tickformat = latex_ticklabels,
+        width = 18,
+    )
+    colgap!(fig_magnetic_spectra_time.layout, 35)
+    display_magnetic_spectra_time ? fig_magnetic_spectra_time : nothing
 end
 
 # ╔═╡ c1000001-6f8c-4d0c-9a10-000000000001
@@ -6072,6 +6239,144 @@ begin
                     space = :relative, align = (:center, :center))
             end
         end
+        figure
+    end
+
+    """
+    Isotropically averaged two-dimensional power spectrum of a projected map.
+
+    The spatial mean is removed before the FFT. Shell power is normalized so
+    that integrating E(k) over k recovers the variance of the finite map. The
+    returned interval is a one-standard-error estimate from the azimuthal
+    scatter of Fourier-mode powers within each shell.
+    """
+    function isotropic_map_power_spectrum(image, c, plane_dims)
+        ndims(image) == 2 ||
+            error("Projected power spectra require a two-dimensional map.")
+        data = Float64.(image)
+        replacement = finite_mean(data; default = 0.0)
+        @. data = ifelse(isfinite(data), data, replacement)
+        data .-= mean(data)
+        nx, ny = size(data)
+        lengths = Float64.(c.L[collect(plane_dims)])
+        pixel_sizes = lengths ./ Float64[nx, ny]
+        fundamental = 2pi ./ lengths
+        dk = minimum(fundamental)
+        kx = 2pi .* Float64.(FFTW.fftfreq(nx, 1 / pixel_sizes[1]))
+        ky = 2pi .* Float64.(FFTW.fftfreq(ny, 1 / pixel_sizes[2]))
+        transformed_power = abs2.(fft(data)) ./ (nx * ny)^2
+        maximum_k = hypot(maximum(abs, kx), maximum(abs, ky))
+        shell_values = [Float64[] for _ in 0:ceil(Int, maximum_k / dk)]
+        for j in eachindex(ky), i in eachindex(kx)
+            wavenumber = hypot(kx[i], ky[j])
+            wavenumber > 0 || continue
+            shell = round(Int, wavenumber / dk) + 1
+            shell <= length(shell_values) || continue
+            push!(shell_values[shell], transformed_power[i, j])
+        end
+        k = Float64[]
+        power = Float64[]
+        lower = Float64[]
+        upper = Float64[]
+        mode_count = Int[]
+        for shell in eachindex(shell_values)
+            values = shell_values[shell]
+            isempty(values) && continue
+            shell_power = sum(values) / dk
+            shell_error = length(values) >= 2 ?
+                std(values) * sqrt(length(values)) / dk : 0.0
+            shell_power > 0 || continue
+            push!(k, (shell - 1) * dk)
+            push!(power, shell_power)
+            push!(lower, max(shell_power - shell_error,
+                shell_power * eps(Float64)))
+            push!(upper, shell_power + shell_error)
+            push!(mode_count, length(values))
+        end
+        (
+            k,
+            power,
+            lower,
+            upper,
+            mode_count,
+            dk,
+            nyquist = pi / minimum(pixel_sizes),
+        )
+    end
+
+    function observational_power_spectrum_figure(
+            specs,
+            c,
+            plane_dims;
+            heading = "Projected observable power spectra",
+        )
+        isempty(specs) && return Figure(size = (900, 140))
+        products = [
+            isotropic_map_power_spectrum(spec.data, c, plane_dims)
+            for spec in specs
+        ]
+        ncols = min(2, length(specs))
+        nrows = cld(length(specs), ncols)
+        figure = Figure(size = (620ncols, 500nrows + 70))
+        Label(figure[0, 1:ncols], heading;
+            fontsize = 22, font = :bold)
+        for (index, (spec, product)) in enumerate(zip(specs, products))
+            row, column = cld(index, ncols), mod1(index, ncols)
+            axis = latex_axis(
+                figure[row, column];
+                xlabel = L"k\;[\mathrm{pc}^{-1}]",
+                ylabel = spec.ylabel,
+                title = as_latex(spec.title),
+                xscale = log10,
+                yscale = log10,
+                xticks = DECADE_TICKS,
+                yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9),
+                yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true,
+                yminorticksvisible = true,
+            )
+            isempty(product.k) && begin
+                text!(axis, 0.5, 0.5; text = "constant or invalid map",
+                    space = :relative, align = (:center, :center))
+                continue
+            end
+            fit_minimum = 3product.dk
+            fit_maximum = max(fit_minimum,
+                min(0.5product.nyquist, maximum(product.k)))
+            fit_result = power_law_slope(
+                product.k,
+                product.power,
+                fit_minimum,
+                fit_maximum,
+            )
+            vspan!(axis, fit_minimum, fit_maximum;
+                color = (:gray55, 0.10))
+            vlines!(axis, [2product.dk];
+                color = (:black, 0.70), linestyle = :dash,
+                linewidth = 1.3, label = L"k_{\mathrm{force}}")
+            vlines!(axis, [product.nyquist];
+                color = (:gray35, 0.70), linestyle = :dot,
+                linewidth = 1.3, label = L"k_{\mathrm{Nyq}}")
+            band!(axis, product.k, product.lower, product.upper;
+                color = (spec.color, 0.18))
+            slope_label = isfinite(fit_result.slope) ?
+                latexstring(
+                    raw"E(k),\;\alpha=",
+                    @sprintf("%.2f", fit_result.slope),
+                    raw",\;R^2=",
+                    @sprintf("%.2f", fit_result.r2),
+                ) : L"E(k)"
+            lines!(axis, product.k, product.power;
+                color = spec.color, linewidth = 2.6,
+                label = slope_label)
+            scatter!(axis, product.k, product.power;
+                color = spec.color, markersize = 4)
+            axislegend(axis; position = :lb,
+                framevisible = false, labelsize = 13)
+        end
+        rowgap!(figure.layout, 50)
+        colgap!(figure.layout, 55)
         figure
     end
 
@@ -7064,6 +7369,7 @@ Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis
 |:--|:--:|
 | Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = true)) |
 | Faraday tomography | $(@bind display_moose_tomography PlutoUI.CheckBox(default = true)) |
+| Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = true)) |
 | Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = true)) |
 
 | MOOSE setting | Control |
@@ -7308,6 +7614,45 @@ begin
     display_observational_structure_functions ? fig_moose_structure : nothing
 end
 
+# ╔═╡ c2000001-6f8c-4d0c-9a10-000000000001
+begin
+    moose_power_spectrum_specs = [
+        (
+            data = moose_phi_map,
+            title = L"\mathrm{Faraday\ depth}\;\phi",
+            ylabel =
+                L"E_\phi(k)\;[(\mathrm{rad\,m}^{-2})^2\,\mathrm{pc}]",
+            color = MHD_COLORS[1],
+        ),
+        (
+            data = moose_I_K,
+            title = L"\mathrm{Synchrotron}\;I_\nu",
+            ylabel = L"E_I(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
+            color = MHD_COLORS[2],
+        ),
+        (
+            data = moose_P_K,
+            title = L"\mathrm{Polarized\ intensity}\;P_\nu",
+            ylabel = L"E_P(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
+            color = MHD_COLORS[3],
+        ),
+        (
+            data = moose_pmax_K,
+            title = L"\max_\phi|F(\phi)|",
+            ylabel = L"E_{p_{\max}}(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
+            color = MHD_COLORS[4],
+        ),
+    ]
+    fig_moose_power_spectra = display_moose_power_spectra ?
+        observational_power_spectrum_figure(
+            moose_power_spectrum_specs,
+            cube,
+            sky_dims;
+            heading = "MOOSE spatial power spectra",
+        ) : Figure(size = (900, 120))
+    display_moose_power_spectra ? fig_moose_power_spectra : nothing
+end
+
 # ╔═╡ ab1a7df4-ae91-47db-cb4e-cf6d42fb0143
 md"""
 ---
@@ -7423,6 +7768,7 @@ Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 
 **Display SHINE H I maps:** $(@bind display_shine PlutoUI.CheckBox(default = true))  
 **Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))  
+**Display the spatial power spectra:** $(@bind display_shine_power_spectra PlutoUI.CheckBox(default = true))
 **Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
 
 | SHINE setting | Control |
@@ -7731,6 +8077,48 @@ begin
             observational_structure_order, observational_structure_samples;
             heading = "SHINE observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_shine_structure : nothing
+end
+
+# ╔═╡ c3000001-6f8c-4d0c-9a10-000000000001
+begin
+    shine_power_spectrum_specs = [
+        (
+            data = shine_NHI,
+            title = L"\mathrm{H\,I\ column\ density}",
+            ylabel =
+                L"E_{N_{\mathrm{HI}}}(k)\;[\mathrm{cm}^{-4}\,\mathrm{pc}]",
+            color = MHD_COLORS[1],
+        ),
+        (
+            data = shine_mom0,
+            title = L"\mathrm{Brightness\ moment}\;M_0",
+            ylabel =
+                L"E_{M_0}(k)\;[(\mathrm{K\,km\,s}^{-1})^2\,\mathrm{pc}]",
+            color = MHD_COLORS[2],
+        ),
+        (
+            data = shine_mom1,
+            title = L"\mathrm{Velocity\ centroid}\;M_1",
+            ylabel =
+                L"E_{M_1}(k)\;[(\mathrm{km\,s}^{-1})^2\,\mathrm{pc}]",
+            color = MHD_COLORS[3],
+        ),
+        (
+            data = shine_mom2,
+            title = L"\mathrm{Velocity\ dispersion}\;M_2",
+            ylabel =
+                L"E_{M_2}(k)\;[(\mathrm{km\,s}^{-1})^2\,\mathrm{pc}]",
+            color = MHD_COLORS[4],
+        ),
+    ]
+    fig_shine_power_spectra = display_shine_power_spectra ?
+        observational_power_spectrum_figure(
+            shine_power_spectrum_specs,
+            cube,
+            sky_dims;
+            heading = "SHINE spatial power spectra",
+        ) : Figure(size = (900, 120))
+    display_shine_power_spectra ? fig_shine_power_spectra : nothing
 end
 
 # ╔═╡ 14e7606a-3a13-4c8e-b860-e40dc63a6fa2
@@ -8053,6 +8441,7 @@ begin
         "vorticity" => "Vorticity map",
         "enstrophy_density" => "Enstrophy by density and family parameter",
         "power_spectra" => "Power spectra",
+        "magnetic_spectra_time" => "Magnetic power spectra through time",
         "structure_functions" => "Structure functions",
         "dust_polarization" => "Dust-polarization maps",
         "dust_structure" => "Dust observable structure functions",
@@ -8069,11 +8458,13 @@ begin
         "zeeman_p_column" => "Zeeman circular-polarization fraction versus NHI",
         "moose" => "MOOSE post-processing",
         "moose_structure" => "MOOSE observable structure functions",
+        "moose_power_spectra" => "MOOSE spatial power spectra",
         "moose_tomography" => "MOOSE F(phi) and pmax",
         "moose_p_column" => "Faraday polarization fraction versus NH",
         "polarization_intensity" => "Polarization fraction versus intensity 2D histograms",
         "shine" => "SHINE H I maps",
         "shine_structure" => "SHINE observable structure functions",
+        "shine_power_spectra" => "SHINE spatial power spectra",
         "shine_rgb" => "SHINE H I velocity RGB composite",
         "shine_spectrum" => "SHINE H I spectrum",
         "polarization_time" => "Polarization fractions versus time",
@@ -8097,6 +8488,7 @@ begin
         "vorticity" => fig_vorticity,
         "enstrophy_density" => fig_enstrophy_density,
         "power_spectra" => fig_spectra,
+        "magnetic_spectra_time" => fig_magnetic_spectra_time,
         "structure_functions" => fig_structure,
         "summary" => fig_summary,
         "dust_polarization" => fig_dust,
@@ -8114,11 +8506,13 @@ begin
         "zeeman_p_column" => fig_zeeman_p_column,
         "moose" => fig_moose,
         "moose_structure" => fig_moose_structure,
+        "moose_power_spectra" => fig_moose_power_spectra,
         "moose_tomography" => fig_moose_tomography,
         "moose_p_column" => fig_moose_p_column,
         "polarization_intensity" => fig_polarization_intensity,
         "shine" => fig_shine,
         "shine_structure" => fig_shine_structure,
+        "shine_power_spectra" => fig_shine_power_spectra,
         "shine_rgb" => fig_shine_rgb,
         "shine_spectrum" => fig_shine_spectrum,
         "polarization_time" => fig_polarization_time,
@@ -10245,6 +10639,7 @@ version = "4.1.0+0"
 # ╟─873f7ef2-719b-4ae6-b015-1a23c6c27836
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
 # ╟─3a731972-3404-478c-a572-00a05ab652b1
+# ╠═c4000001-6f8c-4d0c-9a10-000000000001
 # ╠═c1000001-6f8c-4d0c-9a10-000000000001
 # ╠═24e60849-1c70-4df3-bd17-57d29949b7a6
 # ╠═4b16d83f-4a1d-49e7-9270-8f573fd46835
@@ -10275,6 +10670,7 @@ version = "4.1.0+0"
 # ╟─c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
 # ╟─e9c46999-b6cb-4bf4-93ff-e23d727698e1
 # ╠═a0040004-6f8c-4d0c-9a10-000000000004
+# ╠═c2000001-6f8c-4d0c-9a10-000000000001
 # ╟─ab1a7df4-ae91-47db-cb4e-cf6d42fb0143
 # ╟─bc2b8e05-bfa2-48ec-dc5f-d07e530c1254
 # ╟─478ec2f3-e057-4720-809c-17ca0a3dac21
@@ -10282,6 +10678,7 @@ version = "4.1.0+0"
 # ╠═5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
 # ╟─27e51ba5-4592-4766-9dde-0de383a889a0
 # ╠═a0050005-6f8c-4d0c-9a10-000000000005
+# ╠═c3000001-6f8c-4d0c-9a10-000000000001
 # ╟─14e7606a-3a13-4c8e-b860-e40dc63a6fa2
 # ╟─b37d82bc-7819-47f9-b0ab-4de2f124f3cc
 # ╠═b47871f8-13c9-41b8-9f42-f74e90bac653

@@ -102,9 +102,9 @@ The run lists and folders are configured near the top of `run_figures.jl`.
 `SELECTED_COMPARISONS` can contain `mach`, `resolution`, and/or `ratio`.
 For each selected comparison, the script creates two jobs:
 
-- the first 20 snapshots for all 20 Dynamo figures, including separate 3D and
+- the first 20 snapshots for all 21 Dynamo figures, including separate 3D and
   projected 2D HRO outputs and a seven-panel summary figure;
-- the last 10 snapshots for all 21 figures from Dust, StarlightPol, ZEEMAN,
+- the last 10 snapshots for all 23 figures from Dust, StarlightPol, ZEEMAN,
   MOOSE, and SHINE.
 
 In batch mode, the comparative density PDFs, magnetic-field--density relation,
@@ -116,6 +116,18 @@ spectra include compensated panels, the fitted interval, slope uncertainty,
 the forcing wavenumber, and the Nyquist limit. A simulation keeps the same
 color throughout a comparison group. The summary also includes the magnetic
 field evolution separated into CNM, LNM, and WNM thermal phases.
+
+The additional `magnetic_spectra_time` figure overlays every selected
+\(E_B(k)\) snapshot in one panel per simulation. A shared physical-time
+colorbar, together with increasing opacity and line width, shows the temporal
+ordering while common axes preserve direct comparison between simulations.
+
+MOOSE and SHINE each export an additional four-panel spatial power-spectrum
+figure. MOOSE covers Faraday depth, synchrotron intensity, polarized intensity,
+and peak Faraday-spectrum amplitude. SHINE covers H I column density and the
+zeroth, first, and second brightness-temperature moments. The spectra show
+azimuthal-mode uncertainty, the fitted interval and slope, a forcing-scale
+guide, and the projected Nyquist limit.
 
 Check all six planned jobs without computing:
 

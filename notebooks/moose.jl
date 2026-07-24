@@ -2862,6 +2862,335 @@ begin
     normalized_B_pdfs = pdf_products.normalized_B
 end
 
+# ╔═╡ 3190e127-1d53-49f1-bfab-b9645910c2c6
+begin
+    function isotropic_power_spectrum(components, box_length_pc; prefactor = 1.0)
+        n = size(first(components))
+        input_buffer = Array{Float64}(undef, n)
+        plan_key = (:rfft, n, Float64, FFTW.get_num_threads())
+        transform_plan = lock(CACHE_LOCK) do
+            get!(RFFT_PLAN_CACHE, plan_key) do
+                plan_rfft(input_buffer; flags = FFTW.ESTIMATE)
+            end
+        end
+        transformed = nothing
+        Fpower = nothing
+        for (component_index, component) in enumerate(components)
+            replacement = finite_mean(component; default = 0.0)
+            @. input_buffer = ifelse(
+                isfinite(component),
+                Float64(component),
+                replacement,
+            )
+            if component_index == 1
+                transformed = transform_plan * input_buffer
+                Fpower = abs2.(transformed)
+            else
+                mul!(transformed, transform_plan, input_buffer)
+                @. Fpower += abs2(transformed)
+            end
+        end
+        ntot = prod(n)
+        kmax = floor(Int, sqrt(sum((ni ÷ 2)^2 for ni in n)))
+        shell_power = zeros(kmax + 1)
+        shell_count = zeros(Int, kmax + 1)
+        fft_mode(i, ni) = (i - 1 <= ni ÷ 2) ? i - 1 : i - 1 - ni
+        for I in CartesianIndices(Fpower)
+            k1 = I[1] - 1
+            kmag = sqrt(k1^2 + sum(
+                fft_mode(I[d], n[d])^2 for d in 2:3))
+            shell = round(Int, kmag) + 1
+            shell <= length(shell_power) || continue
+            hermitian_weight =
+                k1 == 0 || (iseven(n[1]) && k1 == n[1] ÷ 2) ? 1 : 2
+            shell_power[shell] +=
+                hermitian_weight * prefactor * Fpower[I] / ntot^2
+            shell_count[shell] += hermitian_weight
+        end
+        modes = collect(0:kmax)
+        valid = (modes .> 0) .& (shell_count .> 0) .& (shell_power .> 0)
+        dk = 2pi / box_length_pc
+        modes[valid] .* dk, shell_power[valid] ./ dk
+    end
+
+    function all_spectrum_products(local_cube)
+        local_density = number_density(local_cube.rho)
+        local_turbulence = turbulent_velocity(local_cube)
+        local_vorticity = vorticity(local_cube)
+        local_box_length_pc = cbrt(prod(local_cube.L))
+        local_krho, local_Prho = isotropic_power_spectrum(
+            (local_density,), local_box_length_pc)
+        local_kv, local_Pv = isotropic_power_spectrum(
+            (local_turbulence.dvx, local_turbulence.dvy,
+                local_turbulence.dvz), local_box_length_pc;
+            prefactor = 0.5)
+        local_komega, local_Pomega = isotropic_power_spectrum(
+            (local_vorticity.wx, local_vorticity.wy,
+                local_vorticity.wz), local_box_length_pc)
+        local_kb, local_Pb = isotropic_power_spectrum(
+            (local_cube.bx, local_cube.by, local_cube.bz),
+            local_box_length_pc;
+            prefactor = 0.5GAUSS_TO_MICROGAUSS^2)
+        (
+            box_length_pc = local_box_length_pc,
+            krho = local_krho,
+            Prho = local_Prho,
+            kv = local_kv,
+            Pv = local_Pv,
+            komega = local_komega,
+            Pomega = local_Pomega,
+            kb = local_kb,
+            Pb = local_Pb,
+            nyquist = pi / minimum(local_cube.L ./ size(local_cube.rho)),
+        )
+    end
+
+    spectrum_products = cached_scientific_product((
+        :isotropic_power_spectra,
+        cube_signature(selected_path),
+        Float64(mean_molecular_weight),
+    )) do
+        all_spectrum_products(cube)
+    end
+    spectrum_box_length_pc = spectrum_products.box_length_pc
+    krho, Prho = spectrum_products.krho, spectrum_products.Prho
+    kv, Pv = spectrum_products.kv, spectrum_products.Pv
+    komega, Pomega = spectrum_products.komega, spectrum_products.Pomega
+    kb, Pb = spectrum_products.kb, spectrum_products.Pb
+    spectrum_dk = 2pi / spectrum_box_length_pc
+    spectrum_low_k_limit = 3spectrum_dk
+    spectrum_maximum_k = maximum(vcat(krho, kv, komega, kb))
+    spectrum_k_choices = spectrum_dk:spectrum_dk:spectrum_maximum_k
+    spectrum_default_k_min = min(spectrum_low_k_limit, spectrum_maximum_k)
+    spectrum_default_k_max = max(spectrum_default_k_min,
+        spectrum_dk * floor(Int, spectrum_maximum_k / (2spectrum_dk)))
+end
+
+# ╔═╡ a8558c31-7dcf-433e-9950-a59e9acf158b
+md"""
+---
+
+## 10. Isotropic power spectra
+
+The panels show number-density, turbulent-velocity, vorticity, and magnetic spectra on base-10 logarithmic axes in both $k$ and spectral power. Fourier power is summed in spherical shells and normalized consistently with Parseval's theorem. Dividing shell power by $\Delta k=2\pi/L$ gives spectral densities satisfying $\int E_f(k)\,\mathrm{d}k=\langle|f|^2\rangle$, with the stated velocity prefactor. Velocity and vorticity include all three vector components, and $k$ is expressed in $\mathrm{pc}^{-1}$.
+
+The first shells contain few Fourier modes and are correspondingly noisy. The shaded region $k<3\,\Delta k$ marks these box-scale modes; it should be excluded when estimating an inertial-range slope. The threshold is a visual reliability guide, not a claim that an inertial range necessarily begins at $3\,\Delta k$.
+
+The fitted model is $E(k)=A k^\alpha$ over the selected interval. Each optional reference slope is normalized to the fitted spectrum at the geometric center of that interval.
+
+The magnetic panel shows $E_B(k)=\tfrac12\langle|\mathbf B|^2\rangle_k$ in $\mu\mathrm G^2\,\mathrm{pc}$, so it is an energy spectrum up to the constant $1/4\pi$.
+
+Two different references are offered, because they describe different fields:
+
+- **Kolmogorov**, $\alpha=-5/3$, for the density, velocity, and vorticity panels;
+- **Kazantsev** (1968), $\alpha=+3/2$, for the magnetic panel.
+
+The Kazantsev slope is the prediction of the *kinematic* small-scale dynamo: while the field is still too weak to react back on the flow, magnetic energy piles up at small scales and $E_B(k)\propto k^{3/2}$ between the forcing scale and the resistive scale. Its **positive** exponent is the signature of that regime — magnetic energy peaks at the *smallest* resolved scales, not the largest.
+
+This reference is therefore only meaningful while the dynamo is still kinematic. Once the field saturates, back-reaction flattens and then bends the spectrum, and a $k^{3/2}$ fit stops being informative. Use the exponential-growth window fitted in section 5 to decide whether the selected snapshot is still in the kinematic phase.
+
+**Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
+
+**Display every selected magnetic spectrum through time:** $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true))
+
+| Power-spectrum panel | Display |
+|:--|:--:|
+| Number-density spectrum | $(@bind show_spectrum_density PlutoUI.CheckBox(default = true)) |
+| Velocity spectrum | $(@bind show_spectrum_velocity PlutoUI.CheckBox(default = true)) |
+| Vorticity spectrum | $(@bind show_spectrum_vorticity PlutoUI.CheckBox(default = true)) |
+| Magnetic spectrum | $(@bind show_spectrum_magnetic PlutoUI.CheckBox(default = true)) |
+| Display fitted slopes | $(@bind show_spectrum_slopes PlutoUI.CheckBox(default = true)) |
+| Minimum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_min PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_min)) |
+| Maximum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_max PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_max)) |
+| Display the Kolmogorov $k^{-5/3}$ reference | $(@bind show_kolmogorov_spectrum PlutoUI.CheckBox(default = true)) |
+| Display the Kazantsev $k^{3/2}$ reference | $(@bind show_kazantsev_spectrum PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 3a731972-3404-478c-a572-00a05ab652b1
+begin
+    function power_law_slope(k, power, minimum_k, maximum_k)
+        lower, upper = minmax(Float64(minimum_k), Float64(maximum_k))
+        valid = isfinite.(k) .& isfinite.(power) .& (k .> 0) .& (power .> 0) .&
+            (k .>= lower) .& (k .<= upper)
+        x, y = log10.(Float64.(k[valid])), log10.(Float64.(power[valid]))
+        length(x) >= 2 || return (slope = NaN, intercept = NaN, r2 = NaN,
+            count = length(x), lower = lower, upper = upper)
+        xmean, ymean = mean(x), mean(y)
+        denominator = sum(abs2, x .- xmean)
+        denominator > 0 || return (slope = NaN, intercept = NaN, r2 = NaN,
+            count = length(x), lower = lower, upper = upper)
+        slope = sum((x .- xmean) .* (y .- ymean)) / denominator
+        intercept = ymean - slope * xmean
+        prediction = intercept .+ slope .* x
+        residual = sum(abs2, y .- prediction)
+        total = sum(abs2, y .- ymean)
+        r2 = total > 0 ? 1 - residual / total : NaN
+        (; slope, intercept, r2, count = length(x), lower, upper)
+    end
+
+    # Turbulent cascade panels quote Kolmogorov; the magnetic panel quotes
+    # Kazantsev, whose exponent is positive because kinematic small-scale dynamo
+    # action piles magnetic energy up at the smallest scales.
+    kolmogorov_reference = show_kolmogorov_spectrum ?
+        (exponent = -5 / 3, label = L"k^{-5/3}") : nothing
+    kazantsev_reference = show_kazantsev_spectrum ?
+        (exponent = 3 / 2, label = L"k^{3/2}") : nothing
+
+    spectrum_ensemble = Dict{String, Vector{Any}}()
+    for label in comparison_run_labels
+        spectrum_ensemble[label] = [
+            cached_scientific_product((
+                :isotropic_power_spectra_snapshot,
+                cube_signature(path),
+                Float64(mean_molecular_weight),
+            )) do
+                local_cube = path ==
+                    run_files[label][comparison_snapshot_indices[label]] ?
+                    comparison_cube(label) : load_cube(path)
+                all_spectrum_products(local_cube)
+            end
+            for path in comparison_snapshot_paths[label]
+        ]
+    end
+
+    spectrum_specs = NamedTuple[]
+    show_spectrum_density && push!(spectrum_specs,
+        (kfield = :krho, pfield = :Prho,
+            ylabel = L"E_n(k)\;[\mathrm{cm}^{-6}\,\mathrm{pc}]",
+            compensated_ylabel = L"k^{5/3}E_n(k)",
+            compensation = 5 / 3, reference = kolmogorov_reference))
+    show_spectrum_velocity && push!(spectrum_specs,
+        (kfield = :kv, pfield = :Pv,
+            ylabel = L"E_v(k)\;[(\mathrm{km\,s}^{-1})^2\,\mathrm{pc}]",
+            compensated_ylabel = L"k^{5/3}E_v(k)",
+            compensation = 5 / 3, reference = kolmogorov_reference))
+    show_spectrum_vorticity && push!(spectrum_specs,
+        (kfield = :komega, pfield = :Pomega,
+            ylabel = L"E_\omega(k)\;[\mathrm{Myr}^{-2}\,\mathrm{pc}]",
+            compensated_ylabel = L"k^{5/3}E_\omega(k)",
+            compensation = 5 / 3, reference = kolmogorov_reference))
+    show_spectrum_magnetic && push!(spectrum_specs,
+        (kfield = :kb, pfield = :Pb,
+            ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
+            compensated_ylabel = L"k^{-3/2}E_B(k)",
+            compensation = -3 / 2, reference = kazantsev_reference))
+    if isempty(spectrum_specs)
+        fig_spectra = Figure(size = (900, 180))
+        Label(fig_spectra[1, 1], L"\mathrm{Select\ at\ least\ one\ power\ spectrum.}", fontsize = 20)
+    else
+        fig_spectra = Figure(size = (440length(spectrum_specs), 760))
+        for (index, spec) in enumerate(spectrum_specs)
+            axis = latex_axis(fig_spectra[1, index], xlabel = L"k\;[\mathrm{pc}^{-1}]",
+                ylabel = spec.ylabel, xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true,
+                xminorticksize = 4, yminorticksize = 4)
+            compensated_axis = latex_axis(fig_spectra[2, index],
+                xlabel = L"k\;[\mathrm{pc}^{-1}]",
+                ylabel = spec.compensated_ylabel,
+                xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9),
+                yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
+            vspan!(axis, spectrum_fit_k_min, spectrum_fit_k_max;
+                color = (:gray55, 0.10))
+            vspan!(compensated_axis, spectrum_fit_k_min, spectrum_fit_k_max;
+                color = (:gray55, 0.10))
+            spectrum_legend_elements = Any[]
+            spectrum_legend_labels = LaTeXString[]
+            for label in comparison_run_labels
+                products = filter(
+                    product -> !isempty(getfield(product, spec.kfield)) &&
+                        !isempty(getfield(product, spec.pfield)),
+                    spectrum_ensemble[label],
+                )
+                isempty(products) && continue
+                common_length = minimum(length(
+                    getfield(product, spec.kfield)) for product in products)
+                common_length > 0 || continue
+                k = snapshot_curve_band([
+                    Float64.(getfield(product, spec.kfield)[1:common_length])
+                    for product in products
+                ]).median
+                power_band = snapshot_curve_band([
+                    Float64.(getfield(product, spec.pfield)[1:common_length])
+                    for product in products
+                ])
+                valid = isfinite.(k) .& isfinite.(power_band.median) .&
+                    (k .> 0) .& (power_band.median .> 0)
+                band!(axis, k[valid], power_band.lower[valid],
+                    power_band.upper[valid];
+                    color = (run_colors[label], 0.16))
+                slopes = Float64[]
+                for product in products
+                    result = power_law_slope(
+                        getfield(product, spec.kfield),
+                        getfield(product, spec.pfield),
+                        spectrum_fit_k_min,
+                        spectrum_fit_k_max,
+                    )
+                    isfinite(result.slope) && push!(slopes, result.slope)
+                end
+                slope_median, slope_lower, slope_upper =
+                    isempty(slopes) ? (NaN, NaN, NaN) :
+                    quantile(slopes, (0.50, 0.16, 0.84))
+                slope_text = isempty(slopes) ? "" : string(
+                    raw";\;\alpha=", @sprintf("%.2f", slope_median),
+                    raw"^{+", @sprintf("%.2f", slope_upper - slope_median),
+                    raw"}_{-", @sprintf("%.2f", slope_median - slope_lower),
+                    raw"}")
+                lines!(axis, k[valid], power_band.median[valid];
+                    color = run_colors[label], linewidth = 2.5,
+                    label = latexstring(
+                        run_label_latex_source(
+                            plain_legend_run_label(label)),
+                        slope_text))
+                if any(valid)
+                    push!(spectrum_legend_elements,
+                        LineElement(color = run_colors[label],
+                            linewidth = 2.5))
+                    push!(spectrum_legend_labels, latexstring(
+                        run_label_latex_source(
+                            plain_legend_run_label(label)),
+                        slope_text))
+                end
+                compensated = k .^ spec.compensation .* power_band.median
+                compensated_lower =
+                    k .^ spec.compensation .* power_band.lower
+                compensated_upper =
+                    k .^ spec.compensation .* power_band.upper
+                band!(compensated_axis, k[valid],
+                    compensated_lower[valid], compensated_upper[valid];
+                    color = (run_colors[label], 0.16))
+                lines!(compensated_axis, k[valid], compensated[valid];
+                    color = run_colors[label], linewidth = 2.5)
+                forcing_k = 2.0 * 2pi / first(products).box_length_pc
+                nyquist_k = minimum(product.nyquist for product in products)
+                for local_axis in (axis, compensated_axis)
+                    vlines!(local_axis, [forcing_k];
+                        color = (:black, 0.65), linestyle = :dash,
+                        linewidth = 1.2)
+                    vlines!(local_axis, [nyquist_k];
+                        color = (:gray35, 0.65), linestyle = :dot,
+                        linewidth = 1.2)
+                end
+            end
+            isempty(spectrum_legend_elements) || Legend(
+                fig_spectra[3, index],
+                spectrum_legend_elements,
+                spectrum_legend_labels;
+                orientation = :vertical,
+                tellheight = true,
+                framevisible = false,
+                labelsize = 12,
+            )
+        end
+    end
+    display_power_spectra ? fig_spectra : nothing
+end
+
 # ╔═╡ 62440e86-b560-44ad-bb0a-43ae62e73fc3
 md"""
 ---
@@ -3011,6 +3340,144 @@ begin
         figure
     end
 
+    """
+    Isotropically averaged two-dimensional power spectrum of a projected map.
+
+    The spatial mean is removed before the FFT. Shell power is normalized so
+    that integrating E(k) over k recovers the variance of the finite map. The
+    returned interval is a one-standard-error estimate from the azimuthal
+    scatter of Fourier-mode powers within each shell.
+    """
+    function isotropic_map_power_spectrum(image, c, plane_dims)
+        ndims(image) == 2 ||
+            error("Projected power spectra require a two-dimensional map.")
+        data = Float64.(image)
+        replacement = finite_mean(data; default = 0.0)
+        @. data = ifelse(isfinite(data), data, replacement)
+        data .-= mean(data)
+        nx, ny = size(data)
+        lengths = Float64.(c.L[collect(plane_dims)])
+        pixel_sizes = lengths ./ Float64[nx, ny]
+        fundamental = 2pi ./ lengths
+        dk = minimum(fundamental)
+        kx = 2pi .* Float64.(FFTW.fftfreq(nx, 1 / pixel_sizes[1]))
+        ky = 2pi .* Float64.(FFTW.fftfreq(ny, 1 / pixel_sizes[2]))
+        transformed_power = abs2.(fft(data)) ./ (nx * ny)^2
+        maximum_k = hypot(maximum(abs, kx), maximum(abs, ky))
+        shell_values = [Float64[] for _ in 0:ceil(Int, maximum_k / dk)]
+        for j in eachindex(ky), i in eachindex(kx)
+            wavenumber = hypot(kx[i], ky[j])
+            wavenumber > 0 || continue
+            shell = round(Int, wavenumber / dk) + 1
+            shell <= length(shell_values) || continue
+            push!(shell_values[shell], transformed_power[i, j])
+        end
+        k = Float64[]
+        power = Float64[]
+        lower = Float64[]
+        upper = Float64[]
+        mode_count = Int[]
+        for shell in eachindex(shell_values)
+            values = shell_values[shell]
+            isempty(values) && continue
+            shell_power = sum(values) / dk
+            shell_error = length(values) >= 2 ?
+                std(values) * sqrt(length(values)) / dk : 0.0
+            shell_power > 0 || continue
+            push!(k, (shell - 1) * dk)
+            push!(power, shell_power)
+            push!(lower, max(shell_power - shell_error,
+                shell_power * eps(Float64)))
+            push!(upper, shell_power + shell_error)
+            push!(mode_count, length(values))
+        end
+        (
+            k,
+            power,
+            lower,
+            upper,
+            mode_count,
+            dk,
+            nyquist = pi / minimum(pixel_sizes),
+        )
+    end
+
+    function observational_power_spectrum_figure(
+            specs,
+            c,
+            plane_dims;
+            heading = "Projected observable power spectra",
+        )
+        isempty(specs) && return Figure(size = (900, 140))
+        products = [
+            isotropic_map_power_spectrum(spec.data, c, plane_dims)
+            for spec in specs
+        ]
+        ncols = min(2, length(specs))
+        nrows = cld(length(specs), ncols)
+        figure = Figure(size = (620ncols, 500nrows + 70))
+        Label(figure[0, 1:ncols], heading;
+            fontsize = 22, font = :bold)
+        for (index, (spec, product)) in enumerate(zip(specs, products))
+            row, column = cld(index, ncols), mod1(index, ncols)
+            axis = latex_axis(
+                figure[row, column];
+                xlabel = L"k\;[\mathrm{pc}^{-1}]",
+                ylabel = spec.ylabel,
+                title = as_latex(spec.title),
+                xscale = log10,
+                yscale = log10,
+                xticks = DECADE_TICKS,
+                yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9),
+                yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true,
+                yminorticksvisible = true,
+            )
+            isempty(product.k) && begin
+                text!(axis, 0.5, 0.5; text = "constant or invalid map",
+                    space = :relative, align = (:center, :center))
+                continue
+            end
+            fit_minimum = 3product.dk
+            fit_maximum = max(fit_minimum,
+                min(0.5product.nyquist, maximum(product.k)))
+            fit_result = power_law_slope(
+                product.k,
+                product.power,
+                fit_minimum,
+                fit_maximum,
+            )
+            vspan!(axis, fit_minimum, fit_maximum;
+                color = (:gray55, 0.10))
+            vlines!(axis, [2product.dk];
+                color = (:black, 0.70), linestyle = :dash,
+                linewidth = 1.3, label = L"k_{\mathrm{force}}")
+            vlines!(axis, [product.nyquist];
+                color = (:gray35, 0.70), linestyle = :dot,
+                linewidth = 1.3, label = L"k_{\mathrm{Nyq}}")
+            band!(axis, product.k, product.lower, product.upper;
+                color = (spec.color, 0.18))
+            slope_label = isfinite(fit_result.slope) ?
+                latexstring(
+                    raw"E(k),\;\alpha=",
+                    @sprintf("%.2f", fit_result.slope),
+                    raw",\;R^2=",
+                    @sprintf("%.2f", fit_result.r2),
+                ) : L"E(k)"
+            lines!(axis, product.k, product.power;
+                color = spec.color, linewidth = 2.6,
+                label = slope_label)
+            scatter!(axis, product.k, product.power;
+                color = spec.color, markersize = 4)
+            axislegend(axis; position = :lb,
+                framevisible = false, labelsize = 13)
+        end
+        rowgap!(figure.layout, 50)
+        colgap!(figure.layout, 55)
+        figure
+    end
+
     function moose_instrument_transfer(map_size, largest_scale_pix, smallest_scale_pix)
         nx, ny = map_size
         largest = max(Float64(largest_scale_pix), eps(Float64))
@@ -3076,6 +3543,7 @@ Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis
 |:--|:--:|
 | Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = true)) |
 | Faraday tomography | $(@bind display_moose_tomography PlutoUI.CheckBox(default = true)) |
+| Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = true)) |
 | Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = true)) |
 
 | MOOSE setting | Control |
@@ -3318,6 +3786,45 @@ begin
             observational_structure_order, observational_structure_samples;
             heading = "MOOSE observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_moose_structure : nothing
+end
+
+# ╔═╡ c2000001-6f8c-4d0c-9a10-000000000001
+begin
+    moose_power_spectrum_specs = [
+        (
+            data = moose_phi_map,
+            title = L"\mathrm{Faraday\ depth}\;\phi",
+            ylabel =
+                L"E_\phi(k)\;[(\mathrm{rad\,m}^{-2})^2\,\mathrm{pc}]",
+            color = MHD_COLORS[1],
+        ),
+        (
+            data = moose_I_K,
+            title = L"\mathrm{Synchrotron}\;I_\nu",
+            ylabel = L"E_I(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
+            color = MHD_COLORS[2],
+        ),
+        (
+            data = moose_P_K,
+            title = L"\mathrm{Polarized\ intensity}\;P_\nu",
+            ylabel = L"E_P(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
+            color = MHD_COLORS[3],
+        ),
+        (
+            data = moose_pmax_K,
+            title = L"\max_\phi|F(\phi)|",
+            ylabel = L"E_{p_{\max}}(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
+            color = MHD_COLORS[4],
+        ),
+    ]
+    fig_moose_power_spectra = display_moose_power_spectra ?
+        observational_power_spectrum_figure(
+            moose_power_spectrum_specs,
+            cube,
+            sky_dims;
+            heading = "MOOSE spatial power spectra",
+        ) : Figure(size = (900, 120))
+    display_moose_power_spectra ? fig_moose_power_spectra : nothing
 end
 
 # ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
@@ -5402,6 +5909,9 @@ version = "4.1.0+0"
 # ╟─94a0a0dc-baf6-4e62-a51e-dc6124d98fd4
 # ╟─c12d1f54-40b8-4865-9562-8dcb519f924a
 # ╟─496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
+# ╟─3190e127-1d53-49f1-bfab-b9645910c2c6
+# ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
+# ╟─3a731972-3404-478c-a572-00a05ab652b1
 # ╟─62440e86-b560-44ad-bb0a-43ae62e73fc3
 # ╠═47b786d6-c7b5-44f4-946a-b8c485ad6380
 # ╟─62b61ef2-8e5d-4fe9-a435-e18fb5be9461
@@ -5410,6 +5920,7 @@ version = "4.1.0+0"
 # ╟─c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
 # ╟─e9c46999-b6cb-4bf4-93ff-e23d727698e1
 # ╠═a0040004-6f8c-4d0c-9a10-000000000004
+# ╠═c2000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000002-6f8c-4d0c-9a10-000000000002
 # ╠═e1000003-6f8c-4d0c-9a10-000000000003

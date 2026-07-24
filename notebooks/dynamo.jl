@@ -5418,6 +5418,8 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 
 **Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
 
+**Display every selected magnetic spectrum through time:** $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true))
+
 | Power-spectrum panel | Display |
 |:--|:--:|
 | Number-density spectrum | $(@bind show_spectrum_density PlutoUI.CheckBox(default = true)) |
@@ -5614,6 +5616,171 @@ begin
         end
     end
     display_power_spectra ? fig_spectra : nothing
+end
+
+# ╔═╡ c4000001-6f8c-4d0c-9a10-000000000001
+begin
+    magnetic_spectrum_time_records = Dict{String, Vector{Any}}()
+    for label in comparison_run_labels
+        records = Any[]
+        for (path, product) in zip(
+                comparison_snapshot_paths[label],
+                spectrum_ensemble[label],
+            )
+            physical_time = cached_scientific_product((
+                :snapshot_physical_time,
+                cube_signature(path),
+                Float64(time_unit_Myr),
+            )) do
+                Float64(time_unit_Myr) * snapshot_time(path)
+            end
+            push!(records, (
+                path,
+                time = physical_time,
+                k = Float64.(product.kb),
+                power = Float64.(product.Pb),
+                box_length_pc = Float64(product.box_length_pc),
+                nyquist = Float64(product.nyquist),
+            ))
+        end
+        sort!(records; by = record ->
+            isfinite(record.time) ? record.time : Inf)
+        magnetic_spectrum_time_records[label] = records
+    end
+
+    magnetic_spectrum_times = Float64[
+        record.time
+        for label in comparison_run_labels
+        for record in magnetic_spectrum_time_records[label]
+        if isfinite(record.time)
+    ]
+    magnetic_spectrum_time_limits =
+        isempty(magnetic_spectrum_times) ? (0.0, 1.0) :
+        extrema(magnetic_spectrum_times)
+    magnetic_spectrum_time_limits[1] ==
+        magnetic_spectrum_time_limits[2] &&
+        (magnetic_spectrum_time_limits = (
+            magnetic_spectrum_time_limits[1] - 0.5,
+            magnetic_spectrum_time_limits[2] + 0.5,
+        ))
+    magnetic_time_colormap = Makie.to_colormap(:viridis)
+    function magnetic_time_color(time)
+        fraction = clamp(
+            (Float64(time) - magnetic_spectrum_time_limits[1]) /
+                (magnetic_spectrum_time_limits[2] -
+                    magnetic_spectrum_time_limits[1]),
+            0.0,
+            1.0,
+        )
+        index = clamp(
+            round(Int, 1 + fraction * (length(magnetic_time_colormap) - 1)),
+            1,
+            length(magnetic_time_colormap),
+        )
+        magnetic_time_colormap[index], fraction
+    end
+
+    magnetic_all_k = Float64[
+        value
+        for label in comparison_run_labels
+        for record in magnetic_spectrum_time_records[label]
+        for value in record.k
+        if isfinite(value) && value > 0
+    ]
+    magnetic_all_power = Float64[
+        value
+        for label in comparison_run_labels
+        for record in magnetic_spectrum_time_records[label]
+        for value in record.power
+        if isfinite(value) && value > 0
+    ]
+    magnetic_k_limits = enclosing_decade_limits(magnetic_all_k)
+    magnetic_power_limits = enclosing_decade_limits(magnetic_all_power)
+
+    magnetic_panel_columns = min(3, length(comparison_run_labels))
+    magnetic_panel_rows =
+        cld(length(comparison_run_labels), magnetic_panel_columns)
+    fig_magnetic_spectra_time = Figure(
+        size = (520magnetic_panel_columns,
+            470magnetic_panel_rows + 100),
+    )
+    Label(
+        fig_magnetic_spectra_time[0, 1:magnetic_panel_columns],
+        L"\mathrm{Magnetic\ power\ spectra\ through\ time}";
+        fontsize = 23,
+        font = :bold,
+    )
+    for (panel_index, label) in enumerate(comparison_run_labels)
+        row = cld(panel_index, magnetic_panel_columns)
+        column = mod1(panel_index, magnetic_panel_columns)
+        records = magnetic_spectrum_time_records[label]
+        plottable_count = count(records) do record
+            any(isfinite.(record.k) .& isfinite.(record.power) .&
+                (record.k .> 0) .& (record.power .> 0))
+        end
+        panel_title = latexstring(
+            run_label_latex_source(plain_legend_run_label(label)),
+            raw";\;N_{\mathrm{nonzero}}=",
+            plottable_count,
+            raw"/",
+            length(records),
+        )
+        axis = latex_axis(
+            fig_magnetic_spectra_time[row, column];
+            xlabel = L"k\;[\mathrm{pc}^{-1}]",
+            ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
+            title = panel_title,
+            xscale = log10,
+            yscale = log10,
+            xticks = DECADE_TICKS,
+            yticks = DECADE_TICKS,
+            xminorticks = IntervalsBetween(9),
+            yminorticks = IntervalsBetween(9),
+            xminorticksvisible = true,
+            yminorticksvisible = true,
+        )
+        for record in records
+            valid = isfinite.(record.k) .& isfinite.(record.power) .&
+                (record.k .> 0) .& (record.power .> 0)
+            any(valid) || continue
+            color, time_fraction = magnetic_time_color(record.time)
+            lines!(
+                axis,
+                record.k[valid],
+                record.power[valid];
+                color = (color, 0.35 + 0.65time_fraction),
+                linewidth = 1.2 + 1.8time_fraction,
+            )
+        end
+        representative = findfirst(record -> !isempty(record.k), records)
+        if !isnothing(representative)
+            product = records[representative]
+            forcing_k = 2 * 2pi / product.box_length_pc
+            vlines!(axis, [forcing_k];
+                color = (:black, 0.60), linestyle = :dash,
+                linewidth = 1.2)
+            vlines!(axis, [product.nyquist];
+                color = (:gray35, 0.60), linestyle = :dot,
+                linewidth = 1.2)
+        end
+        isnothing(magnetic_k_limits) ||
+            xlims!(axis, magnetic_k_limits...)
+        isnothing(magnetic_power_limits) ||
+            ylims!(axis, magnetic_power_limits...)
+    end
+    Colorbar(
+        fig_magnetic_spectra_time[
+            1:magnetic_panel_rows,
+            magnetic_panel_columns + 1,
+        ];
+        limits = magnetic_spectrum_time_limits,
+        colormap = :viridis,
+        label = L"t\;[\mathrm{Myr}]",
+        tickformat = latex_ticklabels,
+        width = 18,
+    )
+    colgap!(fig_magnetic_spectra_time.layout, 35)
+    display_magnetic_spectra_time ? fig_magnetic_spectra_time : nothing
 end
 
 # ╔═╡ c1000001-6f8c-4d0c-9a10-000000000001
@@ -8127,6 +8294,7 @@ version = "4.1.0+0"
 # ╟─873f7ef2-719b-4ae6-b015-1a23c6c27836
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
 # ╟─3a731972-3404-478c-a572-00a05ab652b1
+# ╠═c4000001-6f8c-4d0c-9a10-000000000001
 # ╠═c1000001-6f8c-4d0c-9a10-000000000001
 # ╠═24e60849-1c70-4df3-bd17-57d29949b7a6
 # ╠═4b16d83f-4a1d-49e7-9270-8f573fd46835

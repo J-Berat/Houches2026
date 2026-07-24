@@ -89,44 +89,51 @@ Les extensions reconnues sont `.h5`, `.hdf5`, `.fits`, `.fit` et `.fts`.
 
 ## Calcul des figures sans Pluto
 
-Ouvrir `run_figures.jl` et modifier uniquement le bloc `CONFIG` :
+`run_figures.jl` launches the three comparison folders below:
 
-```julia
-const DYNAMO_CONFIG = BatchConfig(
-    data_repository = "/Xnfs/Houches2026/DynSim",
-    simulations = SIMULATIONS,
-    snapshot = :last,
-    snapshot_window = :first,
-    snapshot_count = 20,
-    line_of_sight = "z",
-    figures = figures_for_notebooks(["dynamo"]),
-    output_directory = joinpath(PROJECT_DIRECTORY, "figures", "dynamo_first20"),
-    output_format = "png",
-)
-
-const DUST_CONFIG = BatchConfig(
-    data_repository = "/Xnfs/Houches2026/DynSim",
-    simulations = SIMULATIONS,
-    snapshot = :last,
-    snapshot_window = :last,
-    snapshot_count = 10,
-    line_of_sight = "z",
-    figures = figures_for_notebooks(["dust"]),
-    output_directory = joinpath(PROJECT_DIRECTORY, "figures", "dust_last10"),
-    output_format = "png",
-)
+```text
+/Xnfs/Houches2026/DynSim/cooling_freq_output/
+├── VaryingMach/
+├── VaryingRes/
+└── VaryingRatio/
 ```
 
-The notebook groups are `dynamo`, `dust`, `starlightpol`, `zeeman`, `moose`,
-and `shine`. The configured jobs use the first 20 snapshots of each simulation
-for all 18 Dynamo figures and the last 10 snapshots for all 21 figures from
-Dust, StarlightPol, ZEEMAN, MOOSE, and SHINE.
+The run lists and folders are configured near the top of `run_figures.jl`.
+`SELECTED_COMPARISONS` can contain `mach`, `resolution`, and/or `ratio`.
+For each selected comparison, the script creates two jobs:
+
+- the first 20 snapshots for all 19 Dynamo figures, including separate 3D and
+  projected 2D HRO outputs;
+- the last 10 snapshots for all 21 figures from Dust, StarlightPol, ZEEMAN,
+  MOOSE, and SHINE.
+
+Check all six planned jobs without computing:
+
+```bash
+DYNAMO_DRY_RUN=true \
+julia --threads=auto --startup-file=no --project=. run_figures.jl
+```
 
 Puis lancer :
 
 ```bash
 cd "/Users/jb270005/Desktop/LesHouchesGit"
 julia --threads=auto --startup-file=no --project=. run_figures.jl
+```
+
+The generated files are separated by comparison and snapshot window:
+
+```text
+figures/
+├── varying_mach/
+│   ├── dynamo_first20/
+│   └── observables_last10/
+├── varying_resolution/
+│   ├── dynamo_first20/
+│   └── observables_last10/
+└── varying_ratio/
+    ├── dynamo_first20/
+    └── observables_last10/
 ```
 
 Le moteur batch :
@@ -220,6 +227,8 @@ Variables utiles :
 
 | Variable | Rôle | Défaut |
 |---|---|---|
+| `DYNAMO_COMPARISON_REPOSITORY` | Parent de `VaryingMach`, `VaryingRes` et `VaryingRatio` | `/Xnfs/Houches2026/DynSim/cooling_freq_output` |
+| `DYNAMO_DRY_RUN` | Affiche les jobs sans calculer | `false` |
 | `DYNAMO_DATA_REPOSITORY` | Dossier des simulations | vide dans Pluto |
 | `DYNAMO_LOCAL_HDF5_CACHE` | Cache local HDF5 : `auto`, `true`, `false` | `auto` |
 | `DYNAMO_LOCAL_CACHE_DIRECTORY` | Parent du cache local | dossier temporaire |

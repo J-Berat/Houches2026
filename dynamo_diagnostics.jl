@@ -1466,6 +1466,9 @@ begin
         if comparison_kind == :resolution
             return "N = $(resolution_value(root, directory, overrides))³"
         elseif comparison_kind == :ratio
+            forcing_ratio = directory_parameter(name, ["r"])
+            !isnothing(forcing_ratio) &&
+                return "R = $(parameter_text(forcing_ratio))"
             chi = chi_value(root, directory)
             !isnothing(chi) && return "χ = $(parameter_text(chi))"
             occursin(r"_lo_(ratio|chi)$", lowercase(name)) && return "Low χ"
@@ -1476,6 +1479,9 @@ begin
             occursin(r"_lo_mach$", lowercase(name)) && return "Low Mach"
             occursin(r"_mi_mach$", lowercase(name)) && return "Intermediate Mach"
             occursin(r"_hi_mach$", lowercase(name)) && return "High Mach"
+            rms_value = directory_parameter(name, ["rms"])
+            !isnothing(rms_value) &&
+                return "RMS = $(parameter_text(rms_value))"
         end
         comparison_kind == :folder ? relative_run_name(root, directory) :
             titlecase(replace(name, r"^run_turb_" => "", '_' => ' '))
@@ -1486,6 +1492,12 @@ begin
         if comparison_kind == :resolution
             return (1, Float64(resolution_value(root, directory, overrides)), directory)
         elseif comparison_kind == :ratio
+            forcing_ratio = directory_parameter(
+                run_directory_name(directory),
+                ["r"],
+            )
+            !isnothing(forcing_ratio) &&
+                return (1, forcing_ratio, directory)
             chi = chi_value(root, directory)
             !isnothing(chi) && return (1, chi, directory)
             rank = occursin(r"_lo_(ratio|chi)$", lowercase(directory)) ? 1.0 :
@@ -1496,6 +1508,8 @@ begin
             return (1, 1.0, relative_run_name(root, directory))
         end
         name = lowercase(run_directory_name(directory))
+        rms_value = directory_parameter(name, ["rms"])
+        !isnothing(rms_value) && return (1, rms_value, directory)
         rank = occursin(r"_lo_mach$", name) ? 1.0 :
             occursin(r"_mi_mach$", name) ? 2.0 :
             occursin(r"_hi_mach$", name) ? 3.0 : 4.0
@@ -1608,8 +1622,8 @@ begin
     run_colors = Dict(label => MHD_COLORS[mod1(index, length(MHD_COLORS))]
         for (index, label) in enumerate(run_labels))
     comparison_parameter = comparison_kind == :resolution ? "grid resolution N³" :
-        comparison_kind == :ratio ? "χ = Ecomp/Esol" :
-        comparison_kind == :mach ? "Mach number" : "simulation folder"
+        comparison_kind == :ratio ? "forcing ratio R" :
+        comparison_kind == :mach ? "turbulent RMS" : "simulation folder"
 
     function latex_text_source(text)
         escaped = replace(
@@ -1632,6 +1646,12 @@ begin
         if startswith(text, "N = ")
             value = replace(replace(text, "N = " => ""; count = 1), "³" => "")
             return "N=" * value * "^3"
+        elseif startswith(text, "R = ")
+            value = replace(text, "R = " => ""; count = 1)
+            return "R=" * value
+        elseif startswith(text, "RMS = ")
+            value = replace(text, "RMS = " => ""; count = 1)
+            return "\\mathrm{RMS}=" * value
         elseif startswith(text, "χ = ")
             value = replace(replace(text, "χ = " => ""; count = 1), "∞" => "\\infty")
             return "\\chi=" * value
@@ -1655,7 +1675,10 @@ begin
     """
     function base_legend_run_label(label)
         text = String(label)
-        any(prefix -> startswith(text, prefix), ("N = ", "χ = ", "χ: ")) &&
+        any(
+            prefix -> startswith(text, prefix),
+            ("N = ", "R = ", "RMS = ", "χ = ", "χ: "),
+        ) &&
             return text
         endswith(text, " χ") && return text
 
@@ -3662,13 +3685,23 @@ md"""
 | Display the comparative $B$--$n$ relation | $(@bind display_bn_relation PlutoUI.CheckBox(default = true)) |
 | Minimum density used by the $B\propto n^\kappa$ fit [$\mathrm{cm}^{-3}$; $0$ uses all bins] | $(@bind bn_fit_min_density PlutoUI.NumberField(default = 0.0)) |
 | Display the 3D HRO | $(@bind display_hro PlutoUI.CheckBox(default = true)) |
-| Number of HRO density intervals | $(@bind hro_density_bin_count PlutoUI.Slider(4:1:20; default = 10, show_value = true)) |
+| Number of 3D HRO density intervals | $(@bind hro_density_bin_count PlutoUI.Slider(4:1:20; default = 10, show_value = true)) |
+| Display the projected 2D HRO | $(@bind display_hro_2d PlutoUI.CheckBox(default = true)) |
+| Number of 2D HRO column-density intervals | $(@bind hro_2d_density_bin_count PlutoUI.Slider(4:1:20; default = 10, show_value = true)) |
+| 2D HRO Gaussian smoothing FWHM [pixels] | $(@bind hro_2d_smoothing_fwhm_pix PlutoUI.NumberField(0.0:0.5:20.0; default = 2.0)) |
+| 2D HRO gradient rejection percentile | $(@bind hro_2d_gradient_percentile PlutoUI.Slider(0.0:5.0:90.0; default = 20.0, show_value = true)) |
+| Apply the 2D HRO to $\log_{10}N_{\rm H}$ | $(@bind hro_2d_logarithmic_column PlutoUI.CheckBox(default = true)) |
 | Display the projected HOG | $(@bind display_hog PlutoUI.CheckBox(default = true)) |
 | HOG Gaussian smoothing FWHM [pixels] | $(@bind hog_smoothing_fwhm_pix PlutoUI.NumberField(0.0:0.5:20.0; default = 2.0)) |
 | HOG gradient rejection percentile | $(@bind hog_gradient_percentile PlutoUI.Slider(0.0:5.0:90.0; default = 20.0, show_value = true)) |
 | Apply HOG to $\log_{10}$ maps | $(@bind hog_logarithmic_maps PlutoUI.CheckBox(default = true)) |
 
-HRO compares $\mathbf B$ with three-dimensional iso-density structures. HOG compares the gradients of projected $N_{\rm H}$ and density-weighted $|B|$. All selected simulations use the active snapshot index and line of sight.
+The 3D HRO compares $\mathbf B$ with three-dimensional iso-density
+structures. The 2D HRO compares the density-weighted plane-of-sky magnetic
+field $\mathbf B_\perp$ with structures in the projected column-density map
+$N_{\rm H}$. HOG compares the gradients of projected $N_{\rm H}$ and
+density-weighted $|B|$. All selected simulations use the active snapshot index
+and line of sight.
 """
 
 # ╔═╡ b1000002-6f8c-4d0c-9a10-000000000002
@@ -3796,29 +3829,31 @@ begin
     stable_pluto_figure(display_bn_relation, fig_bn)
 end
 
-# ╔═╡ b1000004-6f8c-4d0c-9a10-000000000004
+# ╔═╡ b1000006-6f8c-4d0c-9a10-000000000006
 begin
-    function hro_products(c, density_bin_count; angle_bin_count = 18)
-        local_n = number_density(c.rho)
-        log_density = safe_log10.(local_n)
-        spacing = c.L ./ size(c.rho)
-        gx = periodic_derivative(log_density, 1, spacing[1])
-        gy = periodic_derivative(log_density, 2, spacing[2])
-        gz = periodic_derivative(log_density, 3, spacing[3])
-        gradient_norm = sqrt.(gx .^ 2 .+ gy .^ 2 .+ gz .^ 2)
-        field_norm = magnetic_fields(c).B
-        valid = isfinite.(log_density) .& isfinite.(gradient_norm) .&
-            isfinite.(field_norm) .& (gradient_norm .> 0) .& (field_norm .> 0)
-        cosine_gradient = abs.(c.bx .* gx .+ c.by .* gy .+ c.bz .* gz) ./
-            max.(field_norm .* gradient_norm, eps(Float64))
-        # 0°: B follows an isodensity structure; 90°: B crosses it.
-        angles = asind.(clamp.(cosine_gradient[valid], 0.0, 1.0))
-        densities = log_density[valid]
+    function hro_binned_summary(
+            density_coordinates,
+            relative_angles,
+            density_bin_count;
+            angle_bin_count = 18,
+        )
+        valid = isfinite.(density_coordinates) .& isfinite.(relative_angles)
+        densities = Float64.(density_coordinates[valid])
+        angles = Float64.(relative_angles[valid])
+        angle_edges = collect(range(0.0, 90.0; length = angle_bin_count + 1))
+        angle_centers = (angle_edges[1:end-1] .+ angle_edges[2:end]) ./ 2
+        if isempty(densities)
+            return (
+                angle_centers = angle_centers,
+                histograms = zeros(Float64, angle_bin_count, density_bin_count),
+                density_centers = fill(NaN, density_bin_count),
+                shape = fill(NaN, density_bin_count),
+                counts = zeros(Int, density_bin_count),
+            )
+        end
         probability_edges = collect(range(0.0, 1.0; length = density_bin_count + 1))
         density_edges = unique(quantile(densities, probability_edges))
         length(density_edges) >= 2 || (density_edges = [minimum(densities), maximum(densities) + eps()])
-        angle_edges = collect(range(0.0, 90.0; length = angle_bin_count + 1))
-        angle_centers = (angle_edges[1:end-1] .+ angle_edges[2:end]) ./ 2
         bin_count = length(density_edges) - 1
         histograms = zeros(Float64, length(angle_centers), bin_count)
         shape = fill(NaN, bin_count)
@@ -3839,6 +3874,57 @@ begin
             shape[bin] = (central - edge) / max(central + edge, 1)
         end
         (; angle_centers, histograms, density_centers, shape, counts)
+    end
+
+    function periodic_gaussian_smooth_2d(image, fwhm_pixels)
+        fwhm_pixels <= 0 && return Float64.(image)
+        nx, ny = size(image)
+        sigma = Float64(fwhm_pixels) / (2sqrt(2log(2)))
+        kx = reshape([i <= nx ÷ 2 ? i : i - nx for i in 0:nx-1] ./ nx, nx, 1)
+        ky = reshape([j <= ny ÷ 2 ? j : j - ny for j in 0:ny-1] ./ ny, 1, ny)
+        transfer = @. exp(-2pi^2 * sigma^2 * (kx^2 + ky^2))
+        valid = isfinite.(image)
+        filled = ifelse.(valid, Float64.(image), 0.0)
+        smoothed = real.(ifft(fft(filled) .* transfer))
+        normalization = real.(ifft(fft(Float64.(valid)) .* transfer))
+        map((value, weight) -> weight > sqrt(eps(Float64)) ? value / weight : NaN,
+            smoothed, normalization)
+    end
+
+    function hro_latex_scientific_source(value)
+        numeric_value = Float64(value)
+        if !isfinite(numeric_value) || numeric_value == 0
+            return string(numeric_value)
+        end
+        exponent = floor(Int, log10(abs(numeric_value)))
+        mantissa = numeric_value / 10.0^exponent
+        string(@sprintf("%.3g", mantissa), raw"\times10^{", exponent, "}")
+    end
+end
+
+# ╔═╡ b1000004-6f8c-4d0c-9a10-000000000004
+begin
+    function hro_products(c, density_bin_count; angle_bin_count = 18)
+        local_n = number_density(c.rho)
+        log_density = safe_log10.(local_n)
+        spacing = c.L ./ size(c.rho)
+        gx = periodic_derivative(log_density, 1, spacing[1])
+        gy = periodic_derivative(log_density, 2, spacing[2])
+        gz = periodic_derivative(log_density, 3, spacing[3])
+        gradient_norm = sqrt.(gx .^ 2 .+ gy .^ 2 .+ gz .^ 2)
+        field_norm = magnetic_fields(c).B
+        valid = isfinite.(log_density) .& isfinite.(gradient_norm) .&
+            isfinite.(field_norm) .& (gradient_norm .> 0) .& (field_norm .> 0)
+        cosine_gradient = abs.(c.bx .* gx .+ c.by .* gy .+ c.bz .* gz) ./
+            max.(field_norm .* gradient_norm, eps(Float64))
+        # 0°: B follows an isodensity structure; 90°: B crosses it.
+        angles = asind.(clamp.(cosine_gradient[valid], 0.0, 1.0))
+        hro_binned_summary(
+            log_density[valid],
+            angles,
+            density_bin_count;
+            angle_bin_count,
+        )
     end
 
     hro_by_run = Dict(label => hro_products(
@@ -3882,23 +3968,191 @@ begin
     stable_pluto_figure(display_hro, fig_hro)
 end
 
-# ╔═╡ b1000005-6f8c-4d0c-9a10-000000000005
+# ╔═╡ b1000007-6f8c-4d0c-9a10-000000000007
 begin
-    function periodic_gaussian_smooth_2d(image, fwhm_pixels)
-        fwhm_pixels <= 0 && return Float64.(image)
-        nx, ny = size(image)
-        sigma = Float64(fwhm_pixels) / (2sqrt(2log(2)))
-        kx = reshape([i <= nx ÷ 2 ? i : i - nx for i in 0:nx-1] ./ nx, nx, 1)
-        ky = reshape([j <= ny ÷ 2 ? j : j - ny for j in 0:ny-1] ./ ny, 1, ny)
-        transfer = @. exp(-2pi^2 * sigma^2 * (kx^2 + ky^2))
-        valid = isfinite.(image)
-        filled = ifelse.(valid, Float64.(image), 0.0)
-        smoothed = real.(ifft(fft(filled) .* transfer))
-        normalization = real.(ifft(fft(Float64.(valid)) .* transfer))
-        map((value, weight) -> weight > sqrt(eps(Float64)) ? value / weight : NaN,
-            smoothed, normalization)
+    function hro_2d_products(
+            c,
+            line_of_sight,
+            plane_dimensions,
+            density_bin_count;
+            smoothing_fwhm = 2.0,
+            gradient_percentile = 20.0,
+            logarithmic_column = true,
+            angle_bin_count = 18,
+        )
+        local_n = number_density(c.rho)
+        dx_los_cm = c.L[line_of_sight] / size(c.rho, line_of_sight) * PC_CM
+        column_density_2d =
+            finite_sum_dims(local_n, line_of_sight) .* dx_los_cm
+        log_column_density = safe_log10.(column_density_2d)
+
+        magnetic_components = (c.bx, c.by, c.bz)
+        projected_B1 = weighted_project(
+            magnetic_components[plane_dimensions[1]],
+            c.rho,
+            line_of_sight,
+        )
+        projected_B2 = weighted_project(
+            magnetic_components[plane_dimensions[2]],
+            c.rho,
+            line_of_sight,
+        )
+
+        structure_image = logarithmic_column ?
+            log_column_density : Float64.(column_density_2d)
+        structure_image =
+            periodic_gaussian_smooth_2d(structure_image, smoothing_fwhm)
+        projected_B1 =
+            periodic_gaussian_smooth_2d(projected_B1, smoothing_fwhm)
+        projected_B2 =
+            periodic_gaussian_smooth_2d(projected_B2, smoothing_fwhm)
+
+        spacing1 =
+            c.L[plane_dimensions[1]] / size(c.rho, plane_dimensions[1])
+        spacing2 =
+            c.L[plane_dimensions[2]] / size(c.rho, plane_dimensions[2])
+        gradient1 = periodic_derivative(structure_image, 1, spacing1)
+        gradient2 = periodic_derivative(structure_image, 2, spacing2)
+        gradient_norm = hypot.(gradient1, gradient2)
+        projected_field_norm = hypot.(projected_B1, projected_B2)
+        positive_gradients =
+            filter(value -> isfinite(value) && value > 0, vec(gradient_norm))
+        gradient_threshold = isempty(positive_gradients) ? 0.0 :
+            quantile(positive_gradients, gradient_percentile / 100)
+
+        valid = isfinite.(log_column_density) .&
+            isfinite.(gradient1) .& isfinite.(gradient2) .&
+            isfinite.(projected_B1) .& isfinite.(projected_B2) .&
+            (gradient_norm .> gradient_threshold) .&
+            (projected_field_norm .> 0)
+        cosine_gradient = abs.(
+            projected_B1 .* gradient1 .+ projected_B2 .* gradient2,
+        ) ./ max.(projected_field_norm .* gradient_norm, eps(Float64))
+        # 0°: B_perp follows a column-density structure;
+        # 90°: B_perp crosses it.
+        angles = asind.(clamp.(cosine_gradient[valid], 0.0, 1.0))
+        summary = hro_binned_summary(
+            log_column_density[valid],
+            angles,
+            density_bin_count;
+            angle_bin_count,
+        )
+        merge(summary, (
+            column_density = column_density_2d,
+            projected_B1,
+            projected_B2,
+            ngood = count(valid),
+        ))
     end
 
+    hro_2d_by_run = Dict(
+        label => hro_2d_products(
+            comparison_cube(label),
+            los_dim,
+            sky_dims,
+            Int(hro_2d_density_bin_count);
+            smoothing_fwhm = Float64(hro_2d_smoothing_fwhm_pix),
+            gradient_percentile = Float64(hro_2d_gradient_percentile),
+            logarithmic_column = hro_2d_logarithmic_column,
+        )
+        for label in comparison_run_labels
+    )
+    active_hro_2d = haskey(hro_2d_by_run, selected_run) ?
+        hro_2d_by_run[selected_run] :
+        hro_2d_products(
+            cube,
+            los_dim,
+            sky_dims,
+            Int(hro_2d_density_bin_count);
+            smoothing_fwhm = Float64(hro_2d_smoothing_fwhm_pix),
+            gradient_percentile = Float64(hro_2d_gradient_percentile),
+            logarithmic_column = hro_2d_logarithmic_column,
+        )
+
+    fig_hro_2d = Figure(size = (1100, 500))
+    hro_2d_hist_axis = latex_axis(
+        fig_hro_2d[1, 1];
+        xlabel =
+            L"\phi_{\mathbf{B}_\perp,\,\mathrm{structure}(N_{\mathrm H})}\;[{}^\circ]",
+        ylabel = L"\mathrm{PDF}(\phi)",
+        title = L"\mathrm{Projected\ 2D\ HRO}",
+    )
+    representative_2d_bins = unique([
+        1,
+        cld(size(active_hro_2d.histograms, 2), 2),
+        size(active_hro_2d.histograms, 2),
+    ])
+    for (style_index, bin) in enumerate(representative_2d_bins)
+        isfinite(active_hro_2d.density_centers[bin]) || continue
+        lines!(
+            hro_2d_hist_axis,
+            active_hro_2d.angle_centers,
+            active_hro_2d.histograms[:, bin];
+            color = MHD_COLORS[style_index],
+            linewidth = 2.8,
+            label = latexstring(
+                raw"N_{\mathrm{H,med}}=",
+                hro_latex_scientific_source(
+                    10.0^active_hro_2d.density_centers[bin],
+                ),
+                raw"\;\mathrm{cm}^{-2}",
+            ),
+        )
+    end
+    axislegend(
+        hro_2d_hist_axis;
+        position = :ct,
+        framevisible = false,
+        labelsize = 14,
+    )
+
+    hro_2d_shape_axis = latex_axis(
+        fig_hro_2d[1, 2];
+        xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
+        ylabel = L"\zeta_{\mathrm{HRO}}^{\mathrm{2D}}",
+        xscale = log10,
+        xticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9),
+        xminorticksvisible = true,
+        title = L"\mathrm{Orientation\ shape\ parameter}",
+    )
+    hlines!(
+        hro_2d_shape_axis,
+        [0.0];
+        color = (:gray45, 0.65),
+        linestyle = :dash,
+    )
+    for label in comparison_run_labels
+        product = hro_2d_by_run[label]
+        valid =
+            isfinite.(product.density_centers) .& isfinite.(product.shape)
+        lines!(
+            hro_2d_shape_axis,
+            10.0 .^ product.density_centers[valid],
+            product.shape[valid];
+            color = run_colors[label],
+            linewidth = 2.8,
+            label = legend_run_label(label),
+        )
+        scatter!(
+            hro_2d_shape_axis,
+            10.0 .^ product.density_centers[valid],
+            product.shape[valid];
+            color = run_colors[label],
+            markersize = 6,
+        )
+    end
+    axislegend(
+        hro_2d_shape_axis;
+        position = :lb,
+        framevisible = false,
+        labelsize = 14,
+    )
+    stable_pluto_figure(display_hro_2d, fig_hro_2d)
+end
+
+# ╔═╡ b1000005-6f8c-4d0c-9a10-000000000005
+begin
     function hog_products(c, line_of_sight, plane_dimensions;
             smoothing_fwhm = 2.0, gradient_percentile = 20.0,
             logarithmic_maps = true, angle_bin_count = 18)
@@ -8899,7 +9153,9 @@ version = "4.1.0+0"
 # ╟─b1000001-6f8c-4d0c-9a10-000000000001
 # ╠═b1000002-6f8c-4d0c-9a10-000000000002
 # ╠═b1000003-6f8c-4d0c-9a10-000000000003
+# ╠═b1000006-6f8c-4d0c-9a10-000000000006
 # ╠═b1000004-6f8c-4d0c-9a10-000000000004
+# ╠═b1000007-6f8c-4d0c-9a10-000000000007
 # ╠═b1000005-6f8c-4d0c-9a10-000000000005
 # ╟─298bd579-bb28-48b7-8c55-ea74804b9837
 # ╟─e4a64ef5-9e6e-4ae2-8daf-42e4fc1724ba

@@ -10,7 +10,46 @@ using .DynamoAnalysis
 # CONFIGURATION TO EDIT
 # =============================================================================
 
-const DEFAULT_DATA_REPOSITORY = "/Xnfs/Houches2026/DynSim"
+const DEFAULT_COMPARISON_REPOSITORY =
+    "/Xnfs/Houches2026/DynSim/cooling_freq_output"
+
+# Select any subset of: "mach", "resolution", and "ratio".
+const SELECTED_COMPARISONS = [
+    "mach",
+    "resolution",
+    "ratio",
+]
+
+const COMPARISONS = [
+    (
+        key = "mach",
+        folder = "VaryingMach",
+        output_name = "varying_mach",
+        simulations = [
+            "turb_rms_10_N128",
+            "turb_rms_50_N128",
+            "turb_rms_100_N128",
+        ],
+    ),
+    (
+        key = "resolution",
+        folder = "VaryingRes",
+        output_name = "varying_resolution",
+        simulations = [
+            "turb_rms_50_N128",
+            "turb_rms_50_N256",
+        ],
+    ),
+    (
+        key = "ratio",
+        folder = "VaryingRatio",
+        output_name = "varying_ratio",
+        simulations = [
+            "turb_rms_50_N128_R0",
+            "turb_rms_50_N128_R1",
+        ],
+    ),
+]
 
 # Every figure from the selected notebooks will be computed. Available groups:
 # "dynamo", "dust", "starlightpol", "zeeman", "moose", and "shine".
@@ -23,23 +62,34 @@ const SELECTED_NOTEBOOKS = [
     "shine",
 ]
 
-const SIMULATIONS = [
-    "run_turb_cooling_mhd_lo_mach",
-    "run_turb_cooling_mhd_mi_mach",
-    "run_turb_cooling_mhd_hi_mach",
-]
+const COMPARISON_REPOSITORY = get(
+    ENV,
+    "DYNAMO_COMPARISON_REPOSITORY",
+    DEFAULT_COMPARISON_REPOSITORY,
+)
 
-function batch_config(notebooks, snapshot_window, snapshot_count)
-    group_name = join(notebooks, "_")
+const UNKNOWN_COMPARISONS = setdiff(
+    SELECTED_COMPARISONS,
+    getproperty.(COMPARISONS, :key),
+)
+isempty(UNKNOWN_COMPARISONS) || error(
+    "Unknown comparisons: $(join(UNKNOWN_COMPARISONS, ", ")). " *
+    "Available comparisons: " * join(getproperty.(COMPARISONS, :key), ", "),
+)
+
+function batch_config(
+        comparison,
+        notebooks,
+        snapshot_window,
+        snapshot_count,
+        output_group,
+    )
     BatchConfig(
-        # Shared data root used by the notebooks on the server. The engine
-        # recursively discovers simulations and their DataCubes directories.
-        data_repository = get(
-            ENV,
-            "DYNAMO_DATA_REPOSITORY",
-            DEFAULT_DATA_REPOSITORY,
+        data_repository = joinpath(
+            COMPARISON_REPOSITORY,
+            comparison.folder,
         ),
-        simulations = SIMULATIONS,
+        simulations = comparison.simulations,
         snapshot = :last,
         snapshot_window = snapshot_window,
         snapshot_count = snapshot_count,
@@ -48,7 +98,8 @@ function batch_config(notebooks, snapshot_window, snapshot_count)
         output_directory = joinpath(
             PROJECT_DIRECTORY,
             "figures",
-            "$(group_name)_$(snapshot_window)$(snapshot_count)",
+            comparison.output_name,
+            "$(output_group)_$(snapshot_window)$(snapshot_count)",
         ),
         output_format = "png",
     )
@@ -56,15 +107,30 @@ end
 
 const BATCH_CONFIGS = let
     configurations = BatchConfig[]
-    "dynamo" in SELECTED_NOTEBOOKS && push!(
-        configurations,
-        batch_config(["dynamo"], :first, 20),
-    )
     other_notebooks = filter(!=("dynamo"), SELECTED_NOTEBOOKS)
-    isempty(other_notebooks) || push!(
-        configurations,
-        batch_config(other_notebooks, :last, 10),
-    )
+    for comparison in COMPARISONS
+        comparison.key in SELECTED_COMPARISONS || continue
+        "dynamo" in SELECTED_NOTEBOOKS && push!(
+            configurations,
+            batch_config(
+                comparison,
+                ["dynamo"],
+                :first,
+                20,
+                "dynamo",
+            ),
+        )
+        isempty(other_notebooks) || push!(
+            configurations,
+            batch_config(
+                comparison,
+                other_notebooks,
+                :last,
+                10,
+                "observables",
+            ),
+        )
+    end
     configurations
 end
 
@@ -72,21 +138,55 @@ end
 # EXECUTION — DO NOT EDIT BELOW THIS LINE
 # =============================================================================
 
-try
-    destinations = String[]
-    for config in BATCH_CONFIGS
-        append!(destinations, run_batch(config))
-    end
-    if !isempty(destinations)
-        println("\nDOWNLOAD TO THE LAPTOP")
-        println("Run this command from the local Git repository:")
-        println("  bash download_figures.sh")
+function print_batch_plan()
+    println("\n", repeat("═", 72))
+    println("DYNAMO — COMPARISON PLAN")
+    println(repeat("═", 72))
+    println("Comparison root     : ", abspath(COMPARISON_REPOSITORY))
+    println("Planned jobs        : ", length(BATCH_CONFIGS))
+    for (index, config) in enumerate(BATCH_CONFIGS)
         println(
-            "For future runs, compute and download in one local command:",
+            "  ",
+            index,
+            ". ",
+            basename(config.data_repository),
+            " — ",
+            config.snapshot_window,
+            " ",
+            config.snapshot_count,
+            " snapshots — ",
+            length(config.figures),
+            " figures",
         )
-        println("  bash run_cluster_and_download.sh")
     end
-catch error_value
-    println(stderr, "\nError: ", sprint(showerror, error_value))
-    exit(1)
+    println(repeat("═", 72))
+end
+
+function main()
+    print_batch_plan()
+    lowercase(get(ENV, "DYNAMO_DRY_RUN", "false")) in ("1", "true", "yes") &&
+        return
+
+    try
+        destinations = String[]
+        for config in BATCH_CONFIGS
+            append!(destinations, run_batch(config))
+        end
+        if !isempty(destinations)
+            println("\nDOWNLOAD TO THE LAPTOP")
+            println("Run this command from the local Git repository:")
+            println("  bash download_figures.sh")
+            println(
+                "For future runs, compute and download in one local command:",
+            )
+            println("  bash run_cluster_and_download.sh")
+        end
+    catch error_value
+        println(stderr, "\nError: ", sprint(showerror, error_value))
+        exit(1)
+    end
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
 end

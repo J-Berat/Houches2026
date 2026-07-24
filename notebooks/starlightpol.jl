@@ -1472,6 +1472,9 @@ begin
         if comparison_kind == :resolution
             return "N = $(resolution_value(root, directory, overrides))³"
         elseif comparison_kind == :ratio
+            forcing_ratio = directory_parameter(name, ["r"])
+            !isnothing(forcing_ratio) &&
+                return "R = $(parameter_text(forcing_ratio))"
             chi = chi_value(root, directory)
             !isnothing(chi) && return "χ = $(parameter_text(chi))"
             occursin(r"_lo_(ratio|chi)$", lowercase(name)) && return "Low χ"
@@ -1482,6 +1485,9 @@ begin
             occursin(r"_lo_mach$", lowercase(name)) && return "Low Mach"
             occursin(r"_mi_mach$", lowercase(name)) && return "Intermediate Mach"
             occursin(r"_hi_mach$", lowercase(name)) && return "High Mach"
+            rms_value = directory_parameter(name, ["rms"])
+            !isnothing(rms_value) &&
+                return "RMS = $(parameter_text(rms_value))"
         end
         comparison_kind == :folder ? relative_run_name(root, directory) :
             titlecase(replace(name, r"^run_turb_" => "", '_' => ' '))
@@ -1492,6 +1498,12 @@ begin
         if comparison_kind == :resolution
             return (1, Float64(resolution_value(root, directory, overrides)), directory)
         elseif comparison_kind == :ratio
+            forcing_ratio = directory_parameter(
+                run_directory_name(directory),
+                ["r"],
+            )
+            !isnothing(forcing_ratio) &&
+                return (1, forcing_ratio, directory)
             chi = chi_value(root, directory)
             !isnothing(chi) && return (1, chi, directory)
             rank = occursin(r"_lo_(ratio|chi)$", lowercase(directory)) ? 1.0 :
@@ -1502,6 +1514,8 @@ begin
             return (1, 1.0, relative_run_name(root, directory))
         end
         name = lowercase(run_directory_name(directory))
+        rms_value = directory_parameter(name, ["rms"])
+        !isnothing(rms_value) && return (1, rms_value, directory)
         rank = occursin(r"_lo_mach$", name) ? 1.0 :
             occursin(r"_mi_mach$", name) ? 2.0 :
             occursin(r"_hi_mach$", name) ? 3.0 : 4.0
@@ -1614,8 +1628,8 @@ begin
     run_colors = Dict(label => MHD_COLORS[mod1(index, length(MHD_COLORS))]
         for (index, label) in enumerate(run_labels))
     comparison_parameter = comparison_kind == :resolution ? "grid resolution N³" :
-        comparison_kind == :ratio ? "χ = Ecomp/Esol" :
-        comparison_kind == :mach ? "Mach number" : "simulation folder"
+        comparison_kind == :ratio ? "forcing ratio R" :
+        comparison_kind == :mach ? "turbulent RMS" : "simulation folder"
 
     function latex_text_source(text)
         escaped = replace(
@@ -1638,6 +1652,12 @@ begin
         if startswith(text, "N = ")
             value = replace(replace(text, "N = " => ""; count = 1), "³" => "")
             return "N=" * value * "^3"
+        elseif startswith(text, "R = ")
+            value = replace(text, "R = " => ""; count = 1)
+            return "R=" * value
+        elseif startswith(text, "RMS = ")
+            value = replace(text, "RMS = " => ""; count = 1)
+            return "\\mathrm{RMS}=" * value
         elseif startswith(text, "χ = ")
             value = replace(replace(text, "χ = " => ""; count = 1), "∞" => "\\infty")
             return "\\chi=" * value
@@ -1661,7 +1681,10 @@ begin
     """
     function base_legend_run_label(label)
         text = String(label)
-        any(prefix -> startswith(text, prefix), ("N = ", "χ = ", "χ: ")) &&
+        any(
+            prefix -> startswith(text, prefix),
+            ("N = ", "R = ", "RMS = ", "χ = ", "χ: "),
+        ) &&
             return text
         endswith(text, " χ") && return text
 

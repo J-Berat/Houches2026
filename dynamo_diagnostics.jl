@@ -41,6 +41,7 @@ begin
     MYR_S = 3.15576e13               # s
     KM_CM = 1.0e5                    # cm
     GAUSS_TO_MICROGAUSS = 1.0e6
+    PHYSICAL_BOX_LENGTH_PC = 100.0
 
     # Persistent caches. This cell has no reactive dependency, so Pluto runs it
     # once per session and the caches survive every widget change. RAW_CUBE_CACHE
@@ -66,7 +67,7 @@ begin
     const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
     const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
     const PERSISTENT_CACHE_DIRTY = Ref(false)
-    const PERSISTENT_CACHE_VERSION = 1
+    const PERSISTENT_CACHE_VERSION = 2
     const PERSISTENT_CACHE_FILE =
         strip(get(ENV, "DYNAMO_PERSISTENT_CACHE_FILE", ""))
 
@@ -485,6 +486,22 @@ begin
         Axis(parent;
             xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
             xtickformat, ytickformat, options...)
+    end
+
+    """
+    Create an axis for a projected map of the fixed 100 pc simulation domain.
+    Every spatial map therefore uses identical physical limits and tick labels,
+    independently of the numerical resolution or line of sight.
+    """
+    function physical_map_axis(parent; xlabel = L"", ylabel = L"", kwargs...)
+        ticks = collect(0.0:20.0:PHYSICAL_BOX_LENGTH_PC)
+        latex_axis(parent;
+            xlabel, ylabel,
+            xticks = ticks,
+            yticks = ticks,
+            limits = ((0.0, PHYSICAL_BOX_LENGTH_PC),
+                (0.0, PHYSICAL_BOX_LENGTH_PC)),
+            kwargs...)
     end
 
     function latex_colorbar(parent, plot; label = L"",
@@ -2047,7 +2064,7 @@ md"""
 | Pressure unit [$\mathrm{erg\,cm^{-3}}$ per stored unit] | $(@bind pressure_unit_ergcm3 PlutoUI.NumberField(default = 1.0)) |
 | Velocity unit [$\mathrm{km\,s^{-1}}$ per stored unit] | $(@bind velocity_unit_kms PlutoUI.NumberField(default = 1.0)) |
 | Magnetic-field unit [$\mathrm{G}$ per stored unit] | $(@bind magnetic_unit_G PlutoUI.NumberField(default = 1.0)) |
-| Length unit [$\mathrm{pc}$ per stored unit] | $(@bind length_unit_pc PlutoUI.NumberField(default = 1.0)) |
+| Physical box [$\mathrm{pc}^3$] | $(@sprintf("%.0f × %.0f × %.0f (fixed)", fill(PHYSICAL_BOX_LENGTH_PC, 3)...)) |
 | Time unit [$\mathrm{Myr}$ per stored unit] | $(@bind time_unit_Myr PlutoUI.NumberField(default = 1.0)) |
 | PDF weighting | $(@bind pdf_weighting PlutoUI.Select(["volume", "mass"]; default = "volume")) |
 | Number of bins | $(@bind nbins PlutoUI.Slider(20:5:100; default = 50, show_value = true)) |
@@ -2239,7 +2256,7 @@ begin
             bx = scale_field(raw.bx, magnetic_scale),
             by = scale_field(raw.by, magnetic_scale),
             bz = scale_field(raw.bz, magnetic_scale),
-            L = Float64(length_unit_pc) .* raw.L,
+            L = fill(Float64(PHYSICAL_BOX_LENGTH_PC), 3),
             t = Float64(time_unit_Myr) * raw.t,
         )
     end
@@ -2285,7 +2302,7 @@ begin
     "Every widget value that changes the physical content of a loaded cube."
     unit_signature() = (Float64(density_unit_gcm3), Float64(pressure_unit_ergcm3),
         Float64(velocity_unit_kms), Float64(magnetic_unit_G),
-        Float64(length_unit_pc), Float64(time_unit_Myr))
+        Float64(PHYSICAL_BOX_LENGTH_PC), Float64(time_unit_Myr))
 
     "Cache key identifying a snapshot together with the units it is loaded in."
     cube_signature(path) = (raw_cube_key(path), unit_signature())
@@ -2492,10 +2509,6 @@ begin
 
     function latex_decade_number(value)
         exponent = round(Int, log10(value))
-        if -3 <= exponent <= 6
-            exponent >= 0 && return latexstring(@sprintf("%.0f", value))
-            return latexstring(@sprintf("%.*f", -exponent, value))
-        end
         latexstring("10^{", exponent, "}")
     end
 
@@ -2857,7 +2870,7 @@ begin
         for (index, spec) in enumerate(heatmap_specs)
             row, col = cld(index, ncols), mod1(index, ncols)
             panel = fig_maps[row, col] = GridLayout()
-            ax = latex_axis(panel[1, 1],
+            ax = physical_map_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
@@ -3351,6 +3364,7 @@ begin
         mean_B2 = B2_count > 0 ? B2_sum / B2_count : NaN
         (
             t = c.t,
+            vrms = vrms,
             mach = vrms / max(cs_rms, eps()),
             mach_alfven = vrms / max(va_rms, eps()),
             Bmean = GAUSS_TO_MICROGAUSS * mean_B,
@@ -3487,7 +3501,7 @@ begin
     function metadata_only_series(label)
         [(
             t = Float64(time_unit_Myr) * Float64(time),
-            mach = NaN, mach_alfven = NaN, Bmean = NaN, Brms = NaN,
+            vrms = NaN, mach = NaN, mach_alfven = NaN, Bmean = NaN, Brms = NaN,
             energy_ratio = NaN, kin_mag = NaN, therm_mag = NaN,
             kin_therm = NaN,
         ) for time in run_times[label]]
@@ -3519,22 +3533,25 @@ md"""
 
 ## 5. Magnetic amplification and growth-rate fit
 
-The fitted physical model is $B(t)=A\exp[\Gamma_B(t-t_0)]$, where $t_0$ is the first valid snapshot time and both $A$ and $\Gamma_B$ are inferred from the snapshots in the **Fit window**. Equivalently, the regression is $\ln B=a+\Gamma_B(t-t_0)$ with a free intercept. The shaded interval marks the selected fit range. This avoids treating the first magnetic-field measurement as exact or giving it special leverage in the regression.
+The fitted physical model is $B(t)=A\exp[\Gamma_B(t-t_0)]$, where $t_0$ is the first valid snapshot time and both $A$ and $\Gamma_B$ are inferred from the snapshots in the **Fit window**. Equivalently, the regression is $\ln B=a+\Gamma_B(t-t_0)$ with a free intercept. In automatic mode, contiguous windows containing 4--8 snapshots are compared using their $R^2$, measured logarithmic amplification, and position in the growing part of the series. The shaded interval marks the retained range. Manual mode remains available for a physically prescribed interval.
 
-The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measured field used only as a plotting normalization. The reported $R^2$ uses the usual mean-centred total sum of squares appropriate to this intercept fit. The theoretical comparison curves remain anchored at the first valid measured snapshot. Because $E_{\mathrm B}\propto B^2$, magnetic energy grows at rate $2\Gamma_B$.
+The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measured field used only as a plotting normalization. The reported $R^2$ uses the usual mean-centred total sum of squares appropriate to this intercept fit. The central fit and its $\Gamma_B\pm\sigma_{\Gamma_B}$ slope envelope are drawn only inside the fitted interval, so no straight line is extrapolated into the saturated regime. Because $E_{\mathrm B}\propto B^2$, magnetic energy grows at rate $2\Gamma_B$.
+
+The optional Kazantsev reference uses the high-magnetic-Prandtl-number prediction
+$\Gamma_{\mathrm K}=[(163-304\vartheta)/60](v_{\mathrm rms}/L_{\mathrm f})\,Re_{\mathrm eff}^{(1-\vartheta)/(1+\vartheta)}$. Here $L_{\mathrm f}=50\,\mathrm{pc}$ (forcing mode 2), $v_{\mathrm rms}$ is the median value inside the fitted interval, and—because these implicit-LES cubes contain no explicit viscosity—$Re_{\mathrm eff}$ is a resolution estimate obtained by identifying the dissipation scale with $2\Delta x$. The predicted line is anchored to the fitted curve at the centre of the retained interval: its normalization is therefore not fitted, and only its slope is being compared.
 
 **Display the magnetic growth-rate fit:** $(@bind display_growth_fit PlutoUI.CheckBox(default = false))
 
 | Setting | Control |
 |:--|:--|
 | Fitted field | $(@bind growth_fit_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
-| Fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(run_files[selected_run]); default = min(2, length(run_files[selected_run])):min(4, length(run_files[selected_run])), show_value = true)) |
-| Theoretical $\Gamma_{B,1}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_1 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.01)) |
-| Theoretical $\Gamma_{B,2}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_2 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.03)) |
-| Theoretical $\Gamma_{B,3}$ [$\mathrm{Myr}^{-1}$] | $(@bind theory_gamma_3 PlutoUI.NumberField(-0.50:0.001:0.50; default = 0.05)) |
+| Fit-window selection | $(@bind growth_fit_mode PlutoUI.Select(["Automatic", "Manual"]; default = "Automatic")) |
+| Manual fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(run_files[selected_run]); default = min(2, length(run_files[selected_run])):min(8, length(run_files[selected_run])), show_value = true)) |
 | Data and fitted exponential panel | $(@bind show_growth_fit_panel PlutoUI.CheckBox(default = true)) |
-| Theoretical-growth comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
+| Kazantsev and fit-uncertainty comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
 | Display fitted curve | $(@bind show_growth_fit PlutoUI.CheckBox(default = true)) |
+| Display Kazantsev prediction | $(@bind show_kazantsev_prediction PlutoUI.CheckBox(default = true)) |
+| Kazantsev turbulence model | $(@bind kazantsev_turbulence_model PlutoUI.Select(["Kolmogorov (θ = 1/3)", "Burgers (θ = 1/2)"]; default = "Kolmogorov (θ = 1/3)")) |
 | Logarithmic $B(t)$ axis in section 6 | $(@bind log_B_time PlutoUI.CheckBox(default = true)) |
 """
 
@@ -3542,6 +3559,7 @@ The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measure
 begin
     growth_series = all_series[selected_run]
     growth_times = Float64.(getfield.(growth_series, :t))
+    growth_vrms = Float64.(getfield.(growth_series, :vrms))
     growth_B = growth_fit_field == "Mean field ⟨B⟩" ?
         Float64.(getfield.(growth_series, :Bmean)) :
         Float64.(getfield.(growth_series, :Brms))
@@ -3553,21 +3571,19 @@ begin
         isfinite(value) && value > 0 ? log(value) : NaN
     end
     growth_elapsed_time = growth_times .- growth_t0
-    growth_indices = collect(growth_fit_window)
-    growth_indices = filter(i -> 1 <= i <= length(growth_times) &&
-        isfinite(growth_times[i]) && isfinite(growth_elapsed_time[i]) &&
-        isfinite(growth_log_B[i]), growth_indices)
 
     function exponential_growth_fit(elapsed_time, log_field, indices)
         if length(indices) < 2
-            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN, r2 = NaN)
+            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN,
+                r2 = NaN, ssres = Inf)
         end
         xfit, yfit = elapsed_time[indices], log_field[indices]
         xmean, ymean = mean(xfit), mean(yfit)
         centered_x = xfit .- xmean
         sxx = sum(abs2, centered_x)
         if sxx <= 0
-            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN, r2 = NaN)
+            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN,
+                r2 = NaN, ssres = Inf)
         end
         gamma_fit = sum(centered_x .* (yfit .- ymean)) / sxx
         log_amplitude = ymean - gamma_fit * xmean
@@ -3577,14 +3593,97 @@ begin
         r2 = sstot > 0 ? 1 - ssres / sstot : NaN
         gamma_error = length(indices) > 2 ?
             sqrt((ssres / (length(indices) - 2)) / sxx) : NaN
-        (; log_amplitude, gamma = gamma_fit, gamma_error, r2)
+        (; log_amplitude, gamma = gamma_fit, gamma_error, r2, ssres)
     end
 
+    """
+    Select a contiguous kinematic-growth interval without extrapolating through
+    the saturated tail. Candidate windows contain 4--8 valid snapshots. The
+    score rewards linearity and resolved amplification while mildly preferring
+    earlier windows when otherwise equivalent.
+    """
+    function automatic_growth_fit_window(elapsed_time, log_field)
+        valid = filter(eachindex(elapsed_time)) do index
+            isfinite(elapsed_time[index]) && isfinite(log_field[index])
+        end
+        length(valid) < 4 && return valid
+        best_indices = valid[1:min(4, length(valid))]
+        best_score = -Inf
+        maximum_points = min(8, length(valid))
+        for point_count in 4:maximum_points
+            for first_position in 1:(length(valid) - point_count + 1)
+                indices = valid[first_position:(first_position + point_count - 1)]
+                all(diff(elapsed_time[indices]) .> 0) || continue
+                fit = exponential_growth_fit(elapsed_time, log_field, indices)
+                isfinite(fit.gamma) && fit.gamma > 0 && isfinite(fit.r2) || continue
+                amplification = fit.gamma *
+                    (elapsed_time[last(indices)] - elapsed_time[first(indices)])
+                amplification > 0.15 || continue
+                score = fit.r2 + 0.10min(amplification, 2.0) +
+                    0.015point_count - 0.012(first_position - 1)
+                if score > best_score
+                    best_score = score
+                    best_indices = indices
+                end
+            end
+        end
+        best_indices
+    end
+
+    manual_growth_indices = filter(i -> 1 <= i <= length(growth_times) &&
+        isfinite(growth_times[i]) && isfinite(growth_elapsed_time[i]) &&
+        isfinite(growth_log_B[i]), collect(growth_fit_window))
+    growth_indices = growth_fit_mode == "Automatic" ?
+        automatic_growth_fit_window(growth_elapsed_time, growth_log_B) :
+        manual_growth_indices
     growth_fit = exponential_growth_fit(growth_elapsed_time, growth_log_B, growth_indices)
-    theory_gammas = Float64[theory_gamma_1, theory_gamma_2, theory_gamma_3]
-    theory_B_curves = [growth_B0 .* exp.(Γ .* (growth_times .- growth_t0)) for Γ in theory_gammas]
+    growth_gamma_uncertainty = isfinite(growth_fit.gamma_error) ?
+        growth_fit.gamma_error : 0.0
+    theory_gammas = growth_fit.gamma .+
+        growth_gamma_uncertainty .* [-1.0, 1.0]
     fitted_B_curve = exp.(growth_fit.log_amplitude .+ growth_fit.gamma .* growth_elapsed_time)
     fitted_ratio_curve = fitted_B_curve ./ growth_B0
+    growth_fit_center_time = isempty(growth_indices) ? NaN :
+        mean(growth_elapsed_time[growth_indices])
+    growth_fit_center_log_B = growth_fit.log_amplitude +
+        growth_fit.gamma * growth_fit_center_time
+    theory_B_curves = [
+        exp.(growth_fit_center_log_B .+
+            Γ .* (growth_elapsed_time .- growth_fit_center_time))
+        for Γ in theory_gammas
+    ]
+
+    # High-Pm Kazantsev prediction (Schober et al. 2012). These simulations are
+    # implicit LES, so Re_eff is a resolution estimate rather than a measured
+    # physical Reynolds number. With l_d = 2dx and v(l) proportional to l^theta,
+    # Re_eff = (L_f/l_d)^(1+theta).
+    kazantsev_theta = kazantsev_turbulence_model == "Burgers (θ = 1/2)" ? 0.5 : 1 / 3
+    kazantsev_model_name = kazantsev_theta == 0.5 ? "Burgers" : "Kolmogorov"
+    kazantsev_forcing_scale_pc = PHYSICAL_BOX_LENGTH_PC / 2
+    kazantsev_dissipation_cells = 2.0
+    kazantsev_dx_pc = PHYSICAL_BOX_LENGTH_PC / minimum(size(cube.rho))
+    kazantsev_dissipation_scale_pc = kazantsev_dissipation_cells * kazantsev_dx_pc
+    kazantsev_effective_reynolds =
+        (kazantsev_forcing_scale_pc / kazantsev_dissipation_scale_pc) ^
+        (1 + kazantsev_theta)
+    kazantsev_velocity_indices = filter(growth_indices) do index
+        1 <= index <= length(growth_vrms) && isfinite(growth_vrms[index]) &&
+            growth_vrms[index] > 0
+    end
+    kazantsev_vrms_kms = isempty(kazantsev_velocity_indices) ? NaN :
+        median(growth_vrms[kazantsev_velocity_indices])
+    kazantsev_vrms_pc_myr = kazantsev_vrms_kms * KM_CM * MYR_S / PC_CM
+    kazantsev_prefactor = (163 - 304kazantsev_theta) / 60
+    kazantsev_gamma = kazantsev_prefactor *
+        (kazantsev_vrms_pc_myr / kazantsev_forcing_scale_pc) *
+        kazantsev_effective_reynolds ^
+        ((1 - kazantsev_theta) / (1 + kazantsev_theta))
+    kazantsev_log_ratio_curve = growth_fit_center_log_B - log(growth_B0) .+
+        kazantsev_gamma .* (growth_elapsed_time .- growth_fit_center_time)
+    kazantsev_is_valid = !isempty(growth_indices) && isfinite(kazantsev_gamma) &&
+        kazantsev_gamma > 0 && all(isfinite, (
+            kazantsev_effective_reynolds, kazantsev_vrms_kms,
+            growth_fit_center_log_B, growth_B0))
     growth_has_interval = !isempty(growth_indices)
     growth_first_index = growth_has_interval ? first(growth_indices) : missing
     growth_last_index = growth_has_interval ? last(growth_indices) : missing
@@ -3593,6 +3692,10 @@ begin
     growth_r2_text = string(round(growth_fit.r2; sigdigits = 4))
     growth_amplitude_text = string(round(exp(growth_fit.log_amplitude); sigdigits = 5))
     growth_energy_gamma_text = string(round(2 * growth_fit.gamma; sigdigits = 5))
+    kazantsev_gamma_text = string(round(kazantsev_gamma; sigdigits = 5))
+    kazantsev_reynolds_text = string(round(kazantsev_effective_reynolds; sigdigits = 4))
+    kazantsev_velocity_text = string(round(kazantsev_vrms_kms; sigdigits = 4))
+    kazantsev_ratio_text = string(round(growth_fit.gamma / kazantsev_gamma; sigdigits = 4))
 end
 
 # ╔═╡ 8120f7e9-74ed-4a48-b2f4-dbc75ebf0132
@@ -3602,17 +3705,23 @@ Markdown.parse("""
 | Quantity | Value |
 |:--|:--|
 | Run and field | **$(selected_run)** — $(growth_fit_field) |
+| Window selection | **$(growth_fit_mode)** |
 | Fitted snapshot interval | **$(growth_first_index)–$(growth_last_index)** |
 | Fitted amplitude ``A`` at ``t_0`` | **$(growth_amplitude_text)** ``\\mu\\mathrm{G}`` |
 | Magnetic growth rate ``\\Gamma_B`` | **$(growth_gamma_text)** ``\\mathrm{Myr}^{-1}`` |
 | Standard error ``\\sigma_{\\Gamma_B}`` | **$(growth_error_text)** ``\\mathrm{Myr}^{-1}`` |
 | Coefficient of determination ``R^2`` | **$(growth_r2_text)** |
 | Magnetic-energy growth rate ``2\\Gamma_B`` | **$(growth_energy_gamma_text)** ``\\mathrm{Myr}^{-1}`` |
+| Kazantsev model | **$(kazantsev_model_name)**, high ``Pm`` |
+| Median ``v_{\\mathrm rms}`` in fitted interval | **$(kazantsev_velocity_text)** ``\\mathrm{km\\,s}^{-1}`` |
+| Resolution estimate ``Re_{\\mathrm eff}`` | **$(kazantsev_reynolds_text)** (``L_{\\mathrm f}=50\\,\\mathrm{pc}``, ``\\ell_{\\mathrm d}=2\\Delta x``) |
+| Kazantsev prediction ``\\Gamma_{\\mathrm K}`` | **$(kazantsev_gamma_text)** ``\\mathrm{Myr}^{-1}`` |
+| Measured-to-Kazantsev ratio ``\\Gamma_B/\\Gamma_{\\mathrm K}`` | **$(kazantsev_ratio_text)** |
 """)
 
 # ╔═╡ 3bed2efb-f849-4ddc-9f49-ed5e3d683370
 begin
-    theory_colors = MHD_COLORS[4:6]
+    theory_colors = MHD_COLORS[[4, 6]]
     time_panel_keys = Symbol[]
     show_time_mach && push!(time_panel_keys, :mach)
     show_time_alfven && push!(time_panel_keys, :alfven)
@@ -3666,18 +3775,18 @@ begin
                     color = run_colors[label], linewidth = 2)
         end
         if haskey(time_axes, :magnetic)
+            global_fit_times = growth_times[growth_indices]
             for (Γ, curve, color) in zip(theory_gammas, theory_B_curves, theory_colors)
-                lines!(time_axes[:magnetic], growth_times, curve;
+                lines!(time_axes[:magnetic], global_fit_times, curve[growth_indices];
                     color, linewidth = 2, linestyle = :dot)
             end
             if show_growth_fit && isfinite(growth_fit.gamma)
-                lines!(time_axes[:magnetic], growth_times, fitted_B_curve;
+                lines!(time_axes[:magnetic], global_fit_times, fitted_B_curve[growth_indices];
                     color = :black, linewidth = 2.5, linestyle = :dashdot)
             end
             growth_has_interval && vspan!(time_axes[:magnetic],
                 growth_times[growth_first_index], growth_times[growth_last_index];
                 color = (:gray50, 0.10))
-            ylims!(time_axes[:magnetic], high = 15.0)
         end
 
         time_legend_layout = GridLayout(fig_time[time_nrows + 1, 1:time_ncols])
@@ -3838,12 +3947,22 @@ end
 begin
     normalized_B = growth_B ./ growth_B0
     ln_normalized_B = log.(max.(normalized_B, floatmin(Float64)))
+    finite_growth_log_values = filter(isfinite, ln_normalized_B)
+    growth_log_minimum = isempty(finite_growth_log_values) ? 0.0 :
+        minimum(finite_growth_log_values)
+    growth_log_maximum = isempty(finite_growth_log_values) ? 1.0 :
+        maximum(finite_growth_log_values)
+    growth_log_span = max(growth_log_maximum - growth_log_minimum, 0.25)
+    growth_y_limits = (
+        min(0.0, growth_log_minimum - 0.08growth_log_span),
+        growth_log_maximum + 0.12growth_log_span,
+    )
     growth_panel_count = count(identity, (show_growth_fit_panel, show_growth_theory_panel))
     if growth_panel_count == 0
         fig_growth = Figure(size = (900, 180))
         Label(fig_growth[1, 1], L"\mathrm{Select\ at\ least\ one\ magnetic-growth\ panel.}", fontsize = 20)
     else
-        fig_growth = Figure(size = (550growth_panel_count, 520))
+        fig_growth = Figure(size = (550growth_panel_count, 650))
         growth_column = 0
         if show_growth_fit_panel
             growth_column += 1
@@ -3867,13 +3986,31 @@ begin
                 push!(fit_legend_labels, latexstring(
                     "\\mathrm{Fit}:\\;\\Gamma_B=",
                     @sprintf("%.4g", growth_fit.gamma),
+                    "\\pm", @sprintf("%.2g", growth_fit.gamma_error),
+                    "\\;\\mathrm{Myr}^{-1},\\;R^2=",
+                    @sprintf("%.3f", growth_fit.r2),
+                ))
+            end
+            if show_kazantsev_prediction && kazantsev_is_valid
+                lines!(ag1, growth_times[growth_indices],
+                    kazantsev_log_ratio_curve[growth_indices];
+                    color = MHD_COLORS[2], linewidth = 2.8,
+                    linestyle = :dashdot)
+                push!(fit_legend_elements,
+                    LineElement(color = MHD_COLORS[2], linewidth = 2.8,
+                        linestyle = :dashdot))
+                push!(fit_legend_labels, latexstring(
+                    "\\mathrm{Kazantsev\\ (", kazantsev_model_name,
+                    ")} :\\;\\Gamma_{\\mathrm K}=",
+                    @sprintf("%.4g", kazantsev_gamma),
                     "\\;\\mathrm{Myr}^{-1}"))
             end
             growth_has_interval && vspan!(ag1,
                 growth_times[growth_first_index], growth_times[growth_last_index];
                 color = (:gray50, 0.10))
+            ylims!(ag1, growth_y_limits...)
             Legend(fig_growth[2, growth_column], fit_legend_elements,
-                fit_legend_labels; orientation = :horizontal, nbanks = 1,
+                fit_legend_labels; orientation = :vertical, nbanks = 1,
                 tellheight = true, framevisible = false, labelsize = 14)
         end
         if show_growth_theory_panel
@@ -3887,17 +4024,38 @@ begin
                 LineElement(color = run_colors[selected_run], linewidth = 2.5),
             ]
             theory_legend_labels = LaTeXString[L"\mathrm{Data}"]
-            for (Γ, curve, color) in zip(theory_gammas, theory_B_curves, theory_colors)
-                lines!(ag2, growth_times, log.(curve ./ growth_B0); color, linewidth = 2,
+            panel_fit_times = growth_times[growth_indices]
+            for (offset, Γ, curve, color) in zip(
+                    (-1, 1), theory_gammas, theory_B_curves, theory_colors)
+                lines!(ag2, panel_fit_times,
+                    log.(curve[growth_indices] ./ growth_B0); color, linewidth = 2,
                     linestyle = :dot)
                 push!(theory_legend_elements,
                     LineElement(color = color, linewidth = 2, linestyle = :dot))
                 push!(theory_legend_labels, latexstring(
-                    "\\Gamma_B=", @sprintf("%.3g", Γ),
+                    "\\Gamma_B^{\\mathrm{fit}}",
+                    offset < 0 ? "-" : "+",
+                    "\\sigma_{\\Gamma_B}=",
+                    @sprintf("%.3g", Γ),
+                    "\\;\\mathrm{Myr}^{-1}"))
+            end
+            if show_kazantsev_prediction && kazantsev_is_valid
+                lines!(ag2, panel_fit_times,
+                    kazantsev_log_ratio_curve[growth_indices];
+                    color = MHD_COLORS[2], linewidth = 2.8,
+                    linestyle = :dashdot)
+                push!(theory_legend_elements,
+                    LineElement(color = MHD_COLORS[2], linewidth = 2.8,
+                        linestyle = :dashdot))
+                push!(theory_legend_labels, latexstring(
+                    "\\mathrm{Kazantsev\\ (", kazantsev_model_name,
+                    ")} :\\;\\Gamma_{\\mathrm K}=",
+                    @sprintf("%.4g", kazantsev_gamma),
                     "\\;\\mathrm{Myr}^{-1}"))
             end
             if show_growth_fit && isfinite(growth_fit.gamma)
-                lines!(ag2, growth_times, log.(fitted_ratio_curve); color = :black,
+                lines!(ag2, panel_fit_times, log.(fitted_ratio_curve[growth_indices]);
+                    color = :black,
                     linewidth = 2.5, linestyle = :dashdot)
                 push!(theory_legend_elements,
                     LineElement(color = :black, linewidth = 2.5, linestyle = :dashdot))
@@ -3909,8 +4067,9 @@ begin
             growth_has_interval && vspan!(ag2,
                 growth_times[growth_first_index], growth_times[growth_last_index];
                 color = (:gray50, 0.10))
+            ylims!(ag2, growth_y_limits...)
             Legend(fig_growth[2, growth_column], theory_legend_elements,
-                theory_legend_labels; orientation = :horizontal, nbanks = 2,
+                theory_legend_labels; orientation = :vertical, nbanks = 1,
                 tellheight = true, framevisible = false, labelsize = 13)
         end
         rowgap!(fig_growth.layout, 8)
@@ -4001,7 +4160,7 @@ begin
         if show_logB_map
             logB_column += 1
             map_panel = fig_logB[1, logB_column] = GridLayout()
-            axmap = latex_axis(map_panel[1, 1],
+            axmap = physical_map_axis(map_panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             limB = max(maximum(abs, filter(isfinite, vec(logB_map)); init = 0.0),
@@ -5281,7 +5440,7 @@ begin
         fig_vorticity = Figure(size = (620length(vorticity_map_specs), 520))
         for (index, spec) in enumerate(vorticity_map_specs)
             panel = fig_vorticity[1, index] = GridLayout()
-            axis = latex_axis(panel[1, 1],
+            axis = physical_map_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             heat = heatmap!(axis, sky_coordinates[1], sky_coordinates[2], spec.data;
@@ -6551,7 +6710,7 @@ begin
         for (index, spec) in enumerate(dust_map_specs)
             row, col = cld(index, dust_ncols), mod1(index, dust_ncols)
             panel = fig_dust[row, col] = GridLayout()
-            ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+            ax = physical_map_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             dust_range = isnothing(spec.fixed_range) ?
                 robust_colorrange(spec.data, color_percentile; diverging = spec.diverging) : spec.fixed_range
@@ -7008,7 +7167,7 @@ begin
         for (index, spec) in enumerate(starlight_map_specs)
             row, col = cld(index, starlight_map_ncols), mod1(index, starlight_map_ncols)
             panel = fig_starlight_maps[row, col] = GridLayout()
-            axis = latex_axis(panel[1, 1],
+            axis = physical_map_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             colorrange = isnothing(spec.fixed_range) ?
@@ -7227,7 +7386,7 @@ begin
         fig_zeeman_maps = Figure(size = (540length(zeeman_map_specs), 410))
         for (index, spec) in enumerate(zeeman_map_specs)
             panel = fig_zeeman_maps[1, index] = GridLayout()
-            ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+            ax = physical_map_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
                 colormap = spec.colormap,
@@ -7476,7 +7635,7 @@ begin
         for (index, spec) in enumerate(moose_specs)
             row, col = cld(index, moose_ncols), mod1(index, moose_ncols)
             panel = fig_moose[row, col] = GridLayout()
-            ax = latex_axis(panel[1, 1],
+            ax = physical_map_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             moose_colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
@@ -7565,7 +7724,7 @@ begin
         for (index, product) in enumerate(moose_tomography_specs)
             if product == :pmax
                 panel = fig_moose_tomography[1, index] = GridLayout()
-                ax = latex_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+                ax = physical_map_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                     ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
                 hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], moose_pmax_K;
                     colormap = :viridis,
@@ -7770,6 +7929,7 @@ Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 **Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))  
 **Display the spatial power spectra:** $(@bind display_shine_power_spectra PlutoUI.CheckBox(default = true))
 **Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
+**Display the H I--Faraday HOG comparison:** $(@bind display_hi_faraday_hog PlutoUI.CheckBox(default = true))
 
 | SHINE setting | Control |
 |:--|:--|
@@ -7927,7 +8087,7 @@ begin
         for (index, spec) in enumerate(shine_specs)
             row, col = cld(index, shine_ncols), mod1(index, shine_ncols)
             panel = fig_shine[row, col] = GridLayout()
-            ax = latex_axis(panel[1, 1],
+            ax = physical_map_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
@@ -7995,7 +8155,7 @@ begin
     shine_rgb_image = RGBf.(shine_rgb_red, shine_rgb_green, shine_rgb_blue)
 
     fig_shine_rgb = Figure(size = (820, 670))
-    shine_rgb_axis = latex_axis(fig_shine_rgb[1, 1],
+    shine_rgb_axis = physical_map_axis(fig_shine_rgb[1, 1],
         xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
         ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"),
         title = L"\mathrm{H\,I\ velocity\ composite}")
@@ -8053,6 +8213,427 @@ begin
         end
     end
     display_shine_spectrum ? fig_shine_spectrum : nothing
+end
+
+# ╔═╡ d5000001-6f8c-4d0c-9a10-000000000001
+begin
+    """
+    Build the H I brightness-temperature PPV cube and Faraday-depth cube needed
+    for a channel-by-channel HOG comparison. This follows the same SHINE and
+    MOOSE prescriptions as their dedicated figures.
+    """
+    function hi_faraday_observable_cubes(c)
+        local_temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        local_dx_pc = c.L[los_dim] / size(c.rho, los_dim)
+        local_dx_cm = local_dx_pc * PC_CM
+
+        permutation = (sky_dims[1], sky_dims[2], los_dim)
+        local_nhi = permutedims(
+            Float64(shine_neutral_fraction) .* c.rho ./
+                (max(Float64(shine_mu_H), eps(Float64)) * M_H_CGS),
+            permutation,
+        )
+        local_hi_temperature =
+            permutedims(max.(local_temperature, eps(Float64)), permutation)
+        local_velocity = permutedims(
+            (c.vx, c.vy, c.vz)[los_dim],
+            permutation,
+        )
+        hi_cube = zeros(
+            Float64,
+            size(local_nhi, 1),
+            size(local_nhi, 2),
+            length(shine_velocity_axis),
+        )
+        thermal_mu = max(Float64(shine_thermal_mu), eps(Float64))
+        fixed_width = max(Float64(shine_fixed_width_kms), 0.0)
+        Threads.@threads for i in axes(local_nhi, 1)
+            for j in axes(local_nhi, 2)
+                brightness, _ = shine_hi_spectrum(
+                    @view(local_nhi[i, j, :]),
+                    @view(local_velocity[i, j, :]),
+                    @view(local_hi_temperature[i, j, :]),
+                    shine_velocity_axis,
+                    local_dx_cm,
+                    thermal_mu,
+                    fixed_width,
+                )
+                hi_cube[i, j, :] .= brightness
+            end
+        end
+        hi_cube = apply_observational_beam_cube(hi_cube, c, sky_dims)
+
+        local_number_density = number_density(c.rho)
+        local_ne = if moose_electron_model == "Constant ionization fraction"
+            Float64(moose_constant_xe) .* local_number_density
+        else
+            local_xe = ifelse.(
+                local_temperature .< Float64(moose_transition_T),
+                Float64(moose_cnm_xe),
+                Float64(moose_wnm_xe),
+            )
+            local_xe .* local_number_density
+        end
+        components = (c.bx, c.by, c.bz)
+        local_blos = GAUSS_TO_MICROGAUSS .* components[los_dim]
+        local_bsky1 = GAUSS_TO_MICROGAUSS .* components[sky_dims[1]]
+        local_bsky2 = GAUSS_TO_MICROGAUSS .* components[sky_dims[2]]
+        local_bperp = hypot.(local_bsky1, local_bsky2)
+        phi_increment = 0.812 .* local_ne .* local_blos .* local_dx_pc
+        phi_to_cell =
+            cumsum(phi_increment; dims = los_dim) .- 0.5 .* phi_increment
+        cosmic_ray_index = Float64(moose_cr_index)
+        magnetic_exponent = (cosmic_ray_index + 1) / 2
+        temperature_spectral_index = -(cosmic_ray_index + 3) / 2
+        emissivity_base = Float64(moose_synchrotron_norm) .*
+            local_bperp .^ magnetic_exponent
+        intrinsic_angle = atan.(local_bsky2, local_bsky1) .+ pi / 2
+
+        map_shape = size(selectdim(c.rho, los_dim, 1))
+        nfrequency = length(moose_band_frequency_MHz)
+        q_band = Array{Float64}(undef, map_shape..., nfrequency)
+        u_band = similar(q_band)
+        for channel in eachindex(moose_band_frequency_MHz)
+            frequency_scale =
+                (moose_band_frequency_MHz[channel] / 150.0)^
+                temperature_spectral_index
+            phase = 2 .* (
+                intrinsic_angle .+
+                phi_to_cell .* moose_band_lambda2_m2[channel]
+            )
+            q_band[:, :, channel] .= finite_sum_dims(
+                emissivity_base .* frequency_scale .* cos.(phase),
+                los_dim,
+            ) .* local_dx_pc
+            u_band[:, :, channel] .= finite_sum_dims(
+                emissivity_base .* frequency_scale .* sin.(phase),
+                los_dim,
+            ) .* local_dx_pc
+        end
+        if apply_moose_interferometer
+            transfer = moose_instrument_transfer(
+                map_shape,
+                moose_largest_scale_pix,
+                moose_smallest_scale_pix,
+            )
+            q_band = apply_moose_interferometer_cube(q_band, transfer)
+            u_band = apply_moose_interferometer_cube(u_band, transfer)
+        end
+        q_band = apply_observational_beam_cube(q_band, c, sky_dims)
+        u_band = apply_observational_beam_cube(u_band, c, sky_dims)
+        add_moose_noise && add_moose_qu_noise!(
+            q_band,
+            u_band,
+            moose_instrument_snr,
+            MersenneTwister(Int(moose_instrument_seed)),
+        )
+        polarized_matrix = reshape(complex.(q_band, u_band), :, nfrequency)
+        faraday_matrix =
+            polarized_matrix * moose_rm_phase_matrix / nfrequency
+        faraday_cube = abs.(reshape(
+            faraday_matrix,
+            map_shape...,
+            length(moose_phi_axis),
+        ))
+        hi_cube, faraday_cube
+    end
+
+    function hif_hog_channel_indices(channel_count, maximum_count)
+        channel_count <= maximum_count && return collect(1:channel_count)
+        unique(round.(Int, range(1, channel_count; length = maximum_count)))
+    end
+
+    function hif_hog_log_map(image)
+        positive = filter(value -> isfinite(value) && value > 0, vec(image))
+        isempty(positive) && return zeros(Float64, size(image))
+        floor_value = max(quantile(positive, 0.01), floatmin(Float64))
+        log10.(max.(Float64.(image), floor_value))
+    end
+
+    function hif_hog_gradient_channels(
+            cube3d,
+            channel_indices,
+            spatial_indices_1,
+            spatial_indices_2;
+            smoothing_fwhm = 2.0,
+            gradient_percentile = 20.0,
+        )
+        shape = (
+            length(spatial_indices_1),
+            length(spatial_indices_2),
+            length(channel_indices),
+        )
+        gx = Array{Float64}(undef, shape)
+        gy = similar(gx)
+        norm = similar(gx)
+        thresholds = zeros(Float64, length(channel_indices))
+        for (output_channel, source_channel) in enumerate(channel_indices)
+            image = hif_hog_log_map(
+                view(
+                    cube3d,
+                    spatial_indices_1,
+                    spatial_indices_2,
+                    source_channel,
+                ),
+            )
+            image = periodic_gaussian_smooth_2d(image, smoothing_fwhm)
+            gx[:, :, output_channel] .= periodic_derivative(image, 1, 1.0)
+            gy[:, :, output_channel] .= periodic_derivative(image, 2, 1.0)
+            norm[:, :, output_channel] .= hypot.(
+                @view(gx[:, :, output_channel]),
+                @view(gy[:, :, output_channel]),
+            )
+            positive_norm = filter(
+                value -> isfinite(value) && value > 0,
+                vec(@view norm[:, :, output_channel]),
+            )
+            thresholds[output_channel] = isempty(positive_norm) ? Inf :
+                quantile(positive_norm, gradient_percentile / 100)
+        end
+        (; gx, gy, norm, thresholds)
+    end
+
+    """
+    Positive normalized projected-Rayleigh HOG statistic between every H I
+    velocity channel and every Faraday-depth channel. Negative values describe
+    preferentially perpendicular gradients and are clipped to zero in the
+    requested positive-correlation representation.
+    """
+    function hi_faraday_hog_product(
+            hi_cube,
+            velocity_axis,
+            faraday_cube,
+            phi_axis;
+            maximum_velocity_channels = 41,
+            maximum_phi_channels = 81,
+            maximum_spatial_pixels = 64,
+            smoothing_fwhm = 2.0,
+            gradient_percentile = 20.0,
+            profile_percentile = 0.98,
+        )
+        velocity_indices = hif_hog_channel_indices(
+            length(velocity_axis),
+            maximum_velocity_channels,
+        )
+        phi_indices = hif_hog_channel_indices(
+            length(phi_axis),
+            maximum_phi_channels,
+        )
+        spatial_indices_1 = hif_hog_channel_indices(
+            size(hi_cube, 1),
+            maximum_spatial_pixels,
+        )
+        spatial_indices_2 = hif_hog_channel_indices(
+            size(hi_cube, 2),
+            maximum_spatial_pixels,
+        )
+        hi_gradients = hif_hog_gradient_channels(
+            hi_cube,
+            velocity_indices,
+            spatial_indices_1,
+            spatial_indices_2;
+            smoothing_fwhm,
+            gradient_percentile,
+        )
+        faraday_gradients = hif_hog_gradient_channels(
+            faraday_cube,
+            phi_indices,
+            spatial_indices_1,
+            spatial_indices_2;
+            smoothing_fwhm,
+            gradient_percentile,
+        )
+        statistic = zeros(Float64, length(velocity_indices), length(phi_indices))
+        counts = zeros(Int, size(statistic))
+        for velocity_channel in eachindex(velocity_indices)
+            hix = @view hi_gradients.gx[:, :, velocity_channel]
+            hiy = @view hi_gradients.gy[:, :, velocity_channel]
+            hinorm = @view hi_gradients.norm[:, :, velocity_channel]
+            for phi_channel in eachindex(phi_indices)
+                faradayx = @view faraday_gradients.gx[:, :, phi_channel]
+                faradayy = @view faraday_gradients.gy[:, :, phi_channel]
+                faradaynorm = @view faraday_gradients.norm[:, :, phi_channel]
+                valid = isfinite.(hix) .& isfinite.(hiy) .&
+                    isfinite.(faradayx) .& isfinite.(faradayy) .&
+                    (hinorm .> hi_gradients.thresholds[velocity_channel]) .&
+                    (faradaynorm .>
+                        faraday_gradients.thresholds[phi_channel])
+                counts[velocity_channel, phi_channel] = count(valid)
+                count(valid) >= 16 || continue
+                cosine = (
+                    hix[valid] .* faradayx[valid] .+
+                    hiy[valid] .* faradayy[valid]
+                ) ./ max.(
+                    hinorm[valid] .* faradaynorm[valid],
+                    eps(Float64),
+                )
+                projected_rayleigh = mean(
+                    2 .* clamp.(cosine, -1.0, 1.0) .^ 2 .- 1
+                )
+                statistic[velocity_channel, phi_channel] =
+                    max(projected_rayleigh, 0.0)
+            end
+        end
+        profile = [
+            quantile(
+                @view(statistic[velocity_channel, :]),
+                profile_percentile,
+            )
+            for velocity_channel in axes(statistic, 1)
+        ]
+        (
+            velocity = Float64.(velocity_axis[velocity_indices]),
+            phi = Float64.(phi_axis[phi_indices]),
+            statistic,
+            profile,
+            counts,
+        )
+    end
+
+    function hi_faraday_hog_for_cube(c)
+        hi_cube, faraday_cube = hi_faraday_observable_cubes(c)
+        hi_faraday_hog_product(
+            hi_cube,
+            shine_velocity_axis,
+            faraday_cube,
+            moose_phi_axis,
+        )
+    end
+
+    hif_hog_parameter_signature = (
+        Float64(mean_molecular_weight),
+        los_dim,
+        Float64(shine_neutral_fraction),
+        Float64(shine_mu_H),
+        Float64(shine_thermal_mu),
+        Float64(shine_fixed_width_kms),
+        first(shine_velocity_axis),
+        last(shine_velocity_axis),
+        length(shine_velocity_axis),
+        String(moose_electron_model),
+        Float64(moose_constant_xe),
+        Float64(moose_cnm_xe),
+        Float64(moose_wnm_xe),
+        Float64(moose_transition_T),
+        Float64(moose_cr_index),
+        Float64(moose_synchrotron_norm),
+        first(moose_band_frequency_MHz),
+        last(moose_band_frequency_MHz),
+        length(moose_band_frequency_MHz),
+        first(moose_phi_axis),
+        last(moose_phi_axis),
+        length(moose_phi_axis),
+        Bool(apply_moose_interferometer),
+        Float64(moose_largest_scale_pix),
+        Float64(moose_smallest_scale_pix),
+        Bool(add_moose_noise),
+        Float64(moose_instrument_snr),
+        Int(moose_instrument_seed),
+    )
+    hi_faraday_hog_by_run = Dict{String, Any}()
+    for label in comparison_run_labels
+        snapshot_path =
+            run_files[label][comparison_snapshot_indices[label]]
+        hi_faraday_hog_by_run[label] = cached_scientific_product((
+            :hi_faraday_hog_v1,
+            cube_signature(snapshot_path),
+            hif_hog_parameter_signature,
+        )) do
+            if label == selected_run &&
+                    snapshot_path == selected_path
+                hi_faraday_hog_product(
+                    shine_Tb,
+                    shine_velocity_axis,
+                    moose_F_abs,
+                    moose_phi_axis,
+                )
+            else
+                hi_faraday_hog_for_cube(comparison_cube(label))
+            end
+        end
+    end
+
+    hif_hog_positive_values = vcat([
+        filter(
+            value -> isfinite(value) && value > 0,
+            vec(hi_faraday_hog_by_run[label].statistic),
+        )
+        for label in comparison_run_labels
+    ]...)
+    hif_hog_color_maximum = isempty(hif_hog_positive_values) ? 1.0 :
+        max(quantile(hif_hog_positive_values, 0.995), eps(Float64))
+    hif_hog_profile_maximum = maximum(
+        vcat([
+            hi_faraday_hog_by_run[label].profile
+            for label in comparison_run_labels
+        ]...);
+        init = hif_hog_color_maximum,
+    )
+
+    hif_hog_columns = length(comparison_run_labels)
+    fig_hi_faraday_hog = Figure(
+        size = (400hif_hog_columns + 100, 690),
+    )
+    Label(
+        fig_hi_faraday_hog[0, 1:hif_hog_columns],
+        L"\mathrm{H\,I\!-\!Faraday\ HOG}";
+        fontsize = 23,
+    )
+    hif_hog_heatmaps = Any[]
+    for (column, label) in enumerate(comparison_run_labels)
+        product = hi_faraday_hog_by_run[label]
+        heatmap_axis = latex_axis(
+            fig_hi_faraday_hog[1, column];
+            xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
+            ylabel = L"\phi\;[\mathrm{rad\,m}^{-2}]",
+            title = legend_run_label(label),
+        )
+        heatmap_plot = heatmap!(
+            heatmap_axis,
+            product.velocity,
+            product.phi,
+            product.statistic;
+            colormap = :inferno,
+            colorrange = (0.0, hif_hog_color_maximum),
+        )
+        push!(hif_hog_heatmaps, heatmap_plot)
+
+        profile_axis = latex_axis(
+            fig_hi_faraday_hog[2, column];
+            xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
+            ylabel = L"\tilde{V}_{98}",
+        )
+        lines!(
+            profile_axis,
+            product.velocity,
+            product.profile;
+            color = run_colors[label],
+            linewidth = 2.5,
+        )
+        scatter!(
+            profile_axis,
+            product.velocity,
+            product.profile;
+            color = run_colors[label],
+            markersize = 5,
+        )
+        ylims!(
+            profile_axis,
+            0.0,
+            max(1.08hif_hog_profile_maximum, eps(Float64)),
+        )
+    end
+    latex_colorbar(
+        fig_hi_faraday_hog[1, hif_hog_columns + 1],
+        first(hif_hog_heatmaps);
+        label = L"\tilde{V}_{+}",
+        tickformat = latex_ticklabels,
+    )
+    colsize!(fig_hi_faraday_hog.layout, hif_hog_columns + 1, 24)
+    rowsize!(fig_hi_faraday_hog.layout, 1, Relative(0.62))
+    rowsize!(fig_hi_faraday_hog.layout, 2, Relative(0.38))
+    display_hi_faraday_hog ? fig_hi_faraday_hog : nothing
 end
 
 # ╔═╡ a0050005-6f8c-4d0c-9a10-000000000005
@@ -8467,6 +9048,7 @@ begin
         "shine_power_spectra" => "SHINE spatial power spectra",
         "shine_rgb" => "SHINE H I velocity RGB composite",
         "shine_spectrum" => "SHINE H I spectrum",
+        "hi_faraday_hog" => "H I--Faraday channel HOG by simulation",
         "polarization_time" => "Polarization fractions versus time",
     ]
     export_figure_registry = Dict(
@@ -8515,6 +9097,7 @@ begin
         "shine_power_spectra" => fig_shine_power_spectra,
         "shine_rgb" => fig_shine_rgb,
         "shine_spectrum" => fig_shine_spectrum,
+        "hi_faraday_hog" => fig_hi_faraday_hog,
         "polarization_time" => fig_polarization_time,
     )
     nothing
@@ -10677,6 +11260,7 @@ version = "4.1.0+0"
 # ╟─bcc05889-02bb-47cf-b672-139e8efe4137
 # ╠═5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
 # ╟─27e51ba5-4592-4766-9dde-0de383a889a0
+# ╠═d5000001-6f8c-4d0c-9a10-000000000001
 # ╠═a0050005-6f8c-4d0c-9a10-000000000005
 # ╠═c3000001-6f8c-4d0c-9a10-000000000001
 # ╟─14e7606a-3a13-4c8e-b860-e40dc63a6fa2

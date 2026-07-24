@@ -41,6 +41,7 @@ begin
     MYR_S = 3.15576e13               # s
     KM_CM = 1.0e5                    # cm
     GAUSS_TO_MICROGAUSS = 1.0e6
+    PHYSICAL_BOX_LENGTH_PC = 100.0
 
     # Persistent caches. This cell has no reactive dependency, so Pluto runs it
     # once per session and the caches survive every widget change. RAW_CUBE_CACHE
@@ -66,7 +67,7 @@ begin
     const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
     const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
     const PERSISTENT_CACHE_DIRTY = Ref(false)
-    const PERSISTENT_CACHE_VERSION = 1
+    const PERSISTENT_CACHE_VERSION = 2
     const PERSISTENT_CACHE_FILE =
         strip(get(ENV, "DYNAMO_PERSISTENT_CACHE_FILE", ""))
 
@@ -485,6 +486,22 @@ begin
         Axis(parent;
             xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
             xtickformat, ytickformat, options...)
+    end
+
+    """
+    Create an axis for a projected map of the fixed 100 pc simulation domain.
+    Every spatial map therefore uses identical physical limits and tick labels,
+    independently of the numerical resolution or line of sight.
+    """
+    function physical_map_axis(parent; xlabel = L"", ylabel = L"", kwargs...)
+        ticks = collect(0.0:20.0:PHYSICAL_BOX_LENGTH_PC)
+        latex_axis(parent;
+            xlabel, ylabel,
+            xticks = ticks,
+            yticks = ticks,
+            limits = ((0.0, PHYSICAL_BOX_LENGTH_PC),
+                (0.0, PHYSICAL_BOX_LENGTH_PC)),
+            kwargs...)
     end
 
     function latex_colorbar(parent, plot; label = L"",
@@ -2034,7 +2051,7 @@ md"""
 | Pressure unit [$\mathrm{erg\,cm^{-3}}$ per stored unit] | $(@bind pressure_unit_ergcm3 PlutoUI.NumberField(default = 1.0)) |
 | Velocity unit [$\mathrm{km\,s^{-1}}$ per stored unit] | $(@bind velocity_unit_kms PlutoUI.NumberField(default = 1.0)) |
 | Magnetic-field unit [$\mathrm{G}$ per stored unit] | $(@bind magnetic_unit_G PlutoUI.NumberField(default = 1.0)) |
-| Length unit [$\mathrm{pc}$ per stored unit] | $(@bind length_unit_pc PlutoUI.NumberField(default = 1.0)) |
+| Physical box [$\mathrm{pc}^3$] | $(@sprintf("%.0f × %.0f × %.0f (fixed)", fill(PHYSICAL_BOX_LENGTH_PC, 3)...)) |
 | Time unit [$\mathrm{Myr}$ per stored unit] | $(@bind time_unit_Myr PlutoUI.NumberField(default = 1.0)) |
 | PDF weighting | $(@bind pdf_weighting PlutoUI.Select(["volume", "mass"]; default = "volume")) |
 | Number of bins | $(@bind nbins PlutoUI.Slider(20:5:100; default = 50, show_value = true)) |
@@ -2226,7 +2243,7 @@ begin
             bx = scale_field(raw.bx, magnetic_scale),
             by = scale_field(raw.by, magnetic_scale),
             bz = scale_field(raw.bz, magnetic_scale),
-            L = Float64(length_unit_pc) .* raw.L,
+            L = fill(Float64(PHYSICAL_BOX_LENGTH_PC), 3),
             t = Float64(time_unit_Myr) * raw.t,
         )
     end
@@ -2272,7 +2289,7 @@ begin
     "Every widget value that changes the physical content of a loaded cube."
     unit_signature() = (Float64(density_unit_gcm3), Float64(pressure_unit_ergcm3),
         Float64(velocity_unit_kms), Float64(magnetic_unit_G),
-        Float64(length_unit_pc), Float64(time_unit_Myr))
+        Float64(PHYSICAL_BOX_LENGTH_PC), Float64(time_unit_Myr))
 
     "Cache key identifying a snapshot together with the units it is loaded in."
     cube_signature(path) = (raw_cube_key(path), unit_signature())
@@ -2479,10 +2496,6 @@ begin
 
     function latex_decade_number(value)
         exponent = round(Int, log10(value))
-        if -3 <= exponent <= 6
-            exponent >= 0 && return latexstring(@sprintf("%.0f", value))
-            return latexstring(@sprintf("%.*f", -exponent, value))
-        end
         latexstring("10^{", exponent, "}")
     end
 
@@ -2742,6 +2755,259 @@ md"""
 | Heatmap contrast percentile | $(@bind color_percentile PlutoUI.Slider(90.0:0.5:100.0; default = 99.0, show_value = true)) |
 
 """
+
+# ╔═╡ 496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
+begin
+    function density_pdf(values, weights, edges)
+        valid = isfinite.(values) .& isfinite.(weights) .& (weights .>= 0)
+        values, weights = Float64.(values[valid]), Float64.(weights[valid])
+        centers = (edges[1:end-1] .+ edges[2:end]) ./ 2
+        isempty(values) &&
+            return (centers, fill(NaN, length(centers)))
+        h = fit(Histogram, values, Weights(weights), edges)
+        pdf = h.weights ./ max(sum(h.weights .* diff(edges)), eps())
+        centers, pdf
+    end
+
+    function cube_pdf_samples(c)
+        local_mag = magnetic_fields(c)
+        local_turb = turbulent_velocity(c)
+        local_weights = pdf_weighting == "mass" ?
+            vec(Float64.(c.rho)) : ones(length(c.rho))
+        local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
+        local_v = sqrt.(local_turb.dv2)
+        local_mean_B = finite_mean(local_mag.B)
+        (
+            density = vec(safe_log10.(number_density(c.rho))),
+            magnetic = vec(safe_log10.(local_B)),
+            velocity = vec(safe_log10.(local_v)),
+            normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
+            weights = local_weights,
+        )
+    end
+
+    function comparative_pdf_edges(samples_by_run, field, bins)
+        combined = vcat([finite_values(getfield(samples_by_run[label], field))
+            for label in comparison_run_labels]...)
+        isempty(combined) && error("No finite samples are available for $(field).")
+        lo, hi = quantile(combined, (0.001, 0.999))
+        lo == hi && ((lo, hi) = (lo - 0.5, hi + 0.5))
+        collect(range(lo, hi; length = Int(bins) + 1))
+    end
+
+    number_density_cells = number_density(cube.rho)
+    magnetic_strength_uG = GAUSS_TO_MICROGAUSS .* mag.B
+    turbulent_speed_kms = sqrt.(turb.dv2)
+    mean_B = finite_mean(mag.B)
+    sB = vec(safe_log10.(mag.B ./ mean_B))
+    logn = vec(safe_log10.(number_density_cells))
+    logBphysical = vec(safe_log10.(magnetic_strength_uG))
+    logvphysical = vec(safe_log10.(turbulent_speed_kms))
+    pdf_reference_samples =
+        Dict(label => cube_pdf_samples(comparison_cube(label))
+            for label in comparison_run_labels)
+    pdf_edges = (
+        density = comparative_pdf_edges(
+            pdf_reference_samples, :density, nbins),
+        magnetic = comparative_pdf_edges(
+            pdf_reference_samples, :magnetic, nbins),
+        velocity = comparative_pdf_edges(
+            pdf_reference_samples, :velocity, nbins),
+        normalized_B = comparative_pdf_edges(
+            pdf_reference_samples, :normalized_B, nbins),
+    )
+
+    function snapshot_pdf_products(path)
+        cached_scientific_product((
+            :snapshot_pdfs_v2,
+            cube_signature(path),
+            Tuple(Tuple(getfield(pdf_edges, field))
+                for field in (:density, :magnetic, :velocity, :normalized_B)),
+            Float64(mean_molecular_weight),
+            String(pdf_weighting),
+        )) do
+            samples = cube_pdf_samples(load_cube(path))
+            (
+                density = density_pdf(
+                    samples.density, samples.weights, pdf_edges.density),
+                magnetic = density_pdf(
+                    samples.magnetic, samples.weights, pdf_edges.magnetic),
+                velocity = density_pdf(
+                    samples.velocity, samples.weights, pdf_edges.velocity),
+                normalized_B = density_pdf(
+                    samples.normalized_B,
+                    samples.weights,
+                    pdf_edges.normalized_B,
+                ),
+            )
+        end
+    end
+
+    pdf_snapshots_by_run = Dict(
+        label => snapshot_pdf_products.(comparison_snapshot_paths[label])
+        for label in comparison_run_labels
+    )
+
+    function aggregate_snapshot_pdfs(products, field)
+        curves = getfield.(products, field)
+        logx = first(first(curves))
+        band = snapshot_curve_band(last.(curves))
+        (; logx, band...)
+    end
+
+    pdf_products = (
+        density = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :density)
+            for label in comparison_run_labels),
+        magnetic = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :magnetic)
+            for label in comparison_run_labels),
+        velocity = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :velocity)
+            for label in comparison_run_labels),
+        normalized_B = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :normalized_B)
+            for label in comparison_run_labels),
+    )
+    density_pdfs = pdf_products.density
+    magnetic_pdfs = pdf_products.magnetic
+    velocity_pdfs = pdf_products.velocity
+    normalized_B_pdfs = pdf_products.normalized_B
+end
+
+# ╔═╡ b1000006-6f8c-4d0c-9a10-000000000006
+begin
+    function hro_binned_summary(
+            density_coordinates,
+            relative_angles,
+            density_bin_count;
+            angle_bin_count = 18,
+            bootstrap_replicates = 200,
+        )
+        function orientation_parameter_with_bootstrap(local_angles, seed)
+            signs = Float64[
+                angle < 22.5 ? 1.0 : angle > 67.5 ? -1.0 : NaN
+                for angle in local_angles
+            ]
+            filter!(isfinite, signs)
+            isempty(signs) && return (NaN, NaN, NaN)
+            xi = mean(signs)
+            bootstrap_replicates <= 0 && return (xi, NaN, NaN)
+            if length(signs) > 4000
+                indices = round.(Int, range(1, length(signs); length = 4000))
+                signs = signs[indices]
+            end
+            rng = MersenneTwister(seed)
+            estimates = Vector{Float64}(undef, bootstrap_replicates)
+            for replicate in eachindex(estimates)
+                estimates[replicate] =
+                    mean(signs[rand(rng, 1:length(signs), length(signs))])
+            end
+            lower, upper = quantile(estimates, (0.16, 0.84))
+            (xi, lower, upper)
+        end
+        valid = isfinite.(density_coordinates) .& isfinite.(relative_angles)
+        densities = Float64.(density_coordinates[valid])
+        angles = Float64.(relative_angles[valid])
+        angle_edges = collect(range(0.0, 90.0; length = angle_bin_count + 1))
+        angle_centers = (angle_edges[1:end-1] .+ angle_edges[2:end]) ./ 2
+        if isempty(densities)
+            return (
+                angle_centers = angle_centers,
+                histograms = zeros(Float64, angle_bin_count, density_bin_count),
+                density_centers = fill(NaN, density_bin_count),
+                shape = fill(NaN, density_bin_count),
+                bootstrap_lower = fill(NaN, density_bin_count),
+                bootstrap_upper = fill(NaN, density_bin_count),
+                counts = zeros(Int, density_bin_count),
+            )
+        end
+        probability_edges = collect(range(0.0, 1.0; length = density_bin_count + 1))
+        density_edges = unique(quantile(densities, probability_edges))
+        length(density_edges) >= 2 || (density_edges = [minimum(densities), maximum(densities) + eps()])
+        bin_count = length(density_edges) - 1
+        histograms = zeros(Float64, length(angle_centers), bin_count)
+        shape = fill(NaN, bin_count)
+        bootstrap_lower = fill(NaN, bin_count)
+        bootstrap_upper = fill(NaN, bin_count)
+        density_centers = fill(NaN, bin_count)
+        counts = zeros(Int, bin_count)
+        for bin in 1:bin_count
+            members = (densities .>= density_edges[bin]) .&
+                (bin == bin_count ? densities .<= density_edges[bin + 1] :
+                    densities .< density_edges[bin + 1])
+            local_angles = angles[members]
+            counts[bin] = length(local_angles)
+            isempty(local_angles) && continue
+            density_centers[bin] = median(densities[members])
+            histogram = fit(Histogram, local_angles, angle_edges).weights
+            histograms[:, bin] .= histogram ./ max(sum(histogram), 1)
+            shape[bin], bootstrap_lower[bin], bootstrap_upper[bin] =
+                orientation_parameter_with_bootstrap(
+                    local_angles,
+                    hash((bin, length(local_angles)), UInt(0x48524f)),
+                )
+        end
+        (; angle_centers, histograms, density_centers, shape,
+            bootstrap_lower, bootstrap_upper, counts)
+    end
+
+    function aggregate_hro_products(products)
+        density_band = snapshot_curve_band(
+            [product.density_centers for product in products])
+        xi_band = snapshot_curve_band([product.shape for product in products])
+        bootstrap_lower_band = snapshot_curve_band(
+            [product.bootstrap_lower for product in products])
+        bootstrap_upper_band = snapshot_curve_band(
+            [product.bootstrap_upper for product in products])
+        count_band = snapshot_curve_band(
+            [Float64.(product.counts) for product in products])
+        histogram_median = mapslices(
+            median,
+            cat([product.histograms for product in products]...; dims = 3);
+            dims = 3,
+        )[:, :, 1]
+        (
+            angle_centers = first(products).angle_centers,
+            histograms = histogram_median,
+            density_centers = density_band.median,
+            shape = xi_band.median,
+            lower = xi_band.lower,
+            upper = xi_band.upper,
+            bootstrap_lower = bootstrap_lower_band.median,
+            bootstrap_upper = bootstrap_upper_band.median,
+            counts = count_band.median,
+            count_lower = count_band.lower,
+            count_upper = count_band.upper,
+            snapshot_counts = xi_band.counts,
+        )
+    end
+
+    function periodic_gaussian_smooth_2d(image, fwhm_pixels)
+        fwhm_pixels <= 0 && return Float64.(image)
+        nx, ny = size(image)
+        sigma = Float64(fwhm_pixels) / (2sqrt(2log(2)))
+        kx = reshape([i <= nx ÷ 2 ? i : i - nx for i in 0:nx-1] ./ nx, nx, 1)
+        ky = reshape([j <= ny ÷ 2 ? j : j - ny for j in 0:ny-1] ./ ny, 1, ny)
+        transfer = @. exp(-2pi^2 * sigma^2 * (kx^2 + ky^2))
+        valid = isfinite.(image)
+        filled = ifelse.(valid, Float64.(image), 0.0)
+        smoothed = real.(ifft(fft(filled) .* transfer))
+        normalization = real.(ifft(fft(Float64.(valid)) .* transfer))
+        map((value, weight) -> weight > sqrt(eps(Float64)) ? value / weight : NaN,
+            smoothed, normalization)
+    end
+
+    function hro_latex_scientific_source(value)
+        numeric_value = Float64(value)
+        if !isfinite(numeric_value) || numeric_value == 0
+            return string(numeric_value)
+        end
+        exponent = floor(Int, log10(abs(numeric_value)))
+        mantissa = numeric_value / 10.0^exponent
+        string(@sprintf("%.3g", mantissa), raw"\times10^{", exponent, "}")
+    end
+end
 
 # ╔═╡ 3190e127-1d53-49f1-bfab-b9645910c2c6
 begin
@@ -3412,6 +3678,191 @@ begin
     end
 end
 
+# ╔═╡ 62b61ef2-8e5d-4fe9-a435-e18fb5be9461
+md"""
+---
+
+## 16. MOOSE Faraday post-processing
+
+Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis.
+
+| MOOSE figure | Display |
+|:--|:--:|
+| Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = true)) |
+| Faraday tomography | $(@bind display_moose_tomography PlutoUI.CheckBox(default = true)) |
+| Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = true)) |
+| Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = true)) |
+
+| MOOSE setting | Control |
+|:--|:--|
+| Electron prescription | $(@bind moose_electron_model PlutoUI.Select(["Two-phase ionization", "Constant ionization fraction"]; default = "Two-phase ionization")) |
+| Constant $x_e$ | $(@bind moose_constant_xe PlutoUI.NumberField(default = 0.01)) |
+| CNM $x_e$ | $(@bind moose_cnm_xe PlutoUI.NumberField(default = 1.0e-4)) |
+| WNM $x_e$ | $(@bind moose_wnm_xe PlutoUI.NumberField(default = 1.0e-2)) |
+| CNM/WNM transition temperature [$\mathrm{K}$] | $(@bind moose_transition_T PlutoUI.NumberField(default = 200.0)) |
+| Cosmic-ray electron index $p$ | $(@bind moose_cr_index PlutoUI.NumberField(1.0:0.1:5.0; default = 3.0)) |
+| Observing frequency [$\mathrm{MHz}$] | $(@bind moose_frequency_MHz PlutoUI.NumberField(50.0:1.0:2000.0; default = 150.0)) |
+| Synchrotron normalization [$\mathrm{K}\,(\mu\mathrm{G})^{-(p+1)/2}\,\mathrm{pc}^{-1}$] | $(@bind moose_synchrotron_norm PlutoUI.NumberField(default = 1.0)) |
+| Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
+| Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
+| Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
+| Add MOOSE Gaussian noise to $Q/U$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = false)) |
+| Polarized signal-to-noise ratio | $(@bind moose_instrument_snr PlutoUI.NumberField(0.1:0.1:1000.0; default = 10.0)) |
+| Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
+| Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
+| Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
+| Synchrotron brightness | $(@bind show_moose_I PlutoUI.CheckBox(default = true)) |
+| Polarized brightness | $(@bind show_moose_P PlutoUI.CheckBox(default = true)) |
+| Polarization fraction | $(@bind show_moose_fraction PlutoUI.CheckBox(default = true)) |
+| RM-synthesis band start [$\mathrm{MHz}$] | $(@bind moose_band_start_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 120.0)) |
+| RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 167.0)) |
+| Frequency-channel width [$\mathrm{MHz}$] | $(@bind moose_band_step_MHz PlutoUI.NumberField(0.05:0.05:20.0; default = 1.0)) |
+| Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -20.0)) |
+| Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 20.0)) |
+| Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
+| First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
+| Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
+| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = true)) |
+| Faraday-spectrum amplitude | $(@bind show_moose_F_abs PlutoUI.CheckBox(default = true)) |
+| $\Re F(\phi)$ spectrum | $(@bind show_moose_F_real PlutoUI.CheckBox(default = true)) |
+| $\Im F(\phi)$ spectrum | $(@bind show_moose_F_imag PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 0e8d9cab-aef2-42cd-959d-973764340f08
+begin
+    moose_ne = if moose_electron_model == "Constant ionization fraction"
+        Float64(moose_constant_xe) .* number_density_cells
+    else
+        ionization_fraction = ifelse.(T .< Float64(moose_transition_T),
+            Float64(moose_cnm_xe), Float64(moose_wnm_xe))
+        ionization_fraction .* number_density_cells
+    end
+
+    moose_Blos_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[los_dim]
+    moose_Bsky1_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[1]]
+    moose_Bsky2_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[2]]
+    moose_Bperp_uG = sqrt.(moose_Bsky1_uG .^ 2 .+ moose_Bsky2_uG .^ 2)
+    moose_phi_increment = 0.812 .* moose_ne .* moose_Blos_uG .* dx_los_pc
+    moose_phi_to_cell = cumsum(moose_phi_increment; dims = los_dim) .- 0.5 .* moose_phi_increment
+    moose_phi_map = finite_sum_dims(moose_phi_increment, los_dim)
+
+    moose_p = Float64(moose_cr_index)
+    moose_B_exponent = (moose_p + 1) / 2
+    moose_temperature_spectral_index = -(moose_p + 3) / 2
+    moose_frequency_scale = (Float64(moose_frequency_MHz) / 150.0)^moose_temperature_spectral_index
+    moose_emissivity_Kpc = Float64(moose_synchrotron_norm) .* moose_frequency_scale .*
+        moose_Bperp_uG .^ moose_B_exponent
+    moose_intrinsic_angle = atan.(moose_Bsky2_uG, moose_Bsky1_uG) .+ pi / 2
+    moose_lambda2_m2 = (299_792_458.0 / (Float64(moose_frequency_MHz) * 1.0e6))^2
+    moose_polarization_phase = 2 .* (moose_intrinsic_angle .+ moose_phi_to_cell .* moose_lambda2_m2)
+    moose_I_K = finite_sum_dims(moose_emissivity_Kpc, los_dim) .* dx_los_pc
+    moose_Q_K = finite_sum_dims(moose_emissivity_Kpc .* cos.(moose_polarization_phase),
+        los_dim) .* dx_los_pc
+    moose_U_K = finite_sum_dims(moose_emissivity_Kpc .* sin.(moose_polarization_phase),
+        los_dim) .* dx_los_pc
+    moose_uv_transfer = moose_instrument_transfer(size(moose_I_K),
+        moose_largest_scale_pix, moose_smallest_scale_pix)
+    if apply_moose_interferometer
+        moose_I_K = apply_moose_interferometer_2d(moose_I_K, moose_uv_transfer)
+        moose_Q_K = apply_moose_interferometer_2d(moose_Q_K, moose_uv_transfer)
+        moose_U_K = apply_moose_interferometer_2d(moose_U_K, moose_uv_transfer)
+    end
+    moose_I_K = apply_observational_beam_2d(moose_I_K, cube, sky_dims)
+    moose_Q_K = apply_observational_beam_2d(moose_Q_K, cube, sky_dims)
+    moose_U_K = apply_observational_beam_2d(moose_U_K, cube, sky_dims)
+    add_moose_noise && add_moose_qu_noise!(moose_Q_K, moose_U_K,
+        moose_instrument_snr, MersenneTwister(Int(moose_instrument_seed)))
+    moose_P_K = sqrt.(moose_Q_K .^ 2 .+ moose_U_K .^ 2)
+    moose_fraction = moose_P_K ./ max.(abs.(moose_I_K), eps(Float64))
+
+    moose_specs = NamedTuple[]
+    show_moose_phi && push!(moose_specs, (data = moose_phi_map,
+        label = L"\phi\;[\mathrm{rad\,m}^{-2}]", colormap = :balance, diverging = true))
+    show_moose_I && push!(moose_specs, (data = moose_I_K,
+        label = L"T_{\mathrm{syn}}\;[\mathrm{K}]", colormap = :magma, diverging = false))
+    show_moose_P && push!(moose_specs, (data = moose_P_K,
+        label = L"P_\nu\;[\mathrm{K}]", colormap = :viridis, diverging = false))
+    show_moose_fraction && push!(moose_specs, (data = moose_fraction,
+        label = L"P_\nu/I_\nu", colormap = :plasma, diverging = false))
+    show_moose_uv_mask && push!(moose_specs, (data = FFTW.fftshift(moose_uv_transfer),
+        label = L"H(u,v)", colormap = :grays, diverging = false))
+
+    if isempty(moose_specs)
+        fig_moose = Figure(size = (900, 180))
+        Label(fig_moose[1, 1], L"\mathrm{Select\ at\ least\ one\ MOOSE\ product.}", fontsize = 20)
+    else
+        moose_ncols = length(moose_specs) == 1 ? 1 : 2
+        moose_nrows = cld(length(moose_specs), moose_ncols)
+        fig_moose = Figure(size = (560moose_ncols, 420moose_nrows))
+        for (index, spec) in enumerate(moose_specs)
+            row, col = cld(index, moose_ncols), mod1(index, moose_ncols)
+            panel = fig_moose[row, col] = GridLayout()
+            ax = physical_map_axis(panel[1, 1],
+                xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+                ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
+            moose_colorrange = robust_colorrange(spec.data, color_percentile; diverging = spec.diverging)
+            hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
+                colormap = spec.colormap, colorrange = moose_colorrange)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            colsize!(panel, 2, 22)
+        end
+    end
+    display_moose ? fig_moose : nothing
+end
+
+# ╔═╡ c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
+begin
+    moose_band_lo = min(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
+    moose_band_hi = max(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
+    moose_band_step = max(Float64(moose_band_step_MHz), 0.05)
+    moose_band_frequency_MHz = collect(moose_band_lo:moose_band_step:moose_band_hi)
+    length(moose_band_frequency_MHz) >= 2 ||
+        (moose_band_frequency_MHz = [moose_band_lo, moose_band_hi + moose_band_step])
+    moose_band_frequency_Hz = moose_band_frequency_MHz .* 1.0e6
+    moose_band_lambda2_m2 = (299_792_458.0 ./ moose_band_frequency_Hz) .^ 2
+    moose_phi_lo = min(Float64(moose_phi_min), Float64(moose_phi_max))
+    moose_phi_hi = max(Float64(moose_phi_min), Float64(moose_phi_max))
+    moose_phi_step = max(Float64(moose_dphi), 0.05)
+    moose_phi_axis = collect(moose_phi_lo:moose_phi_step:moose_phi_hi)
+    length(moose_phi_axis) >= 2 || (moose_phi_axis = [moose_phi_lo, moose_phi_lo + moose_phi_step])
+
+    moose_sky_shape = size(moose_phi_map)
+    moose_nfrequency = length(moose_band_frequency_MHz)
+    moose_Q_band_K = Array{Float64}(undef, moose_sky_shape..., moose_nfrequency)
+    moose_U_band_K = similar(moose_Q_band_K)
+    moose_emissivity_base_Kpc = Float64(moose_synchrotron_norm) .* moose_Bperp_uG .^ moose_B_exponent
+    for channel in eachindex(moose_band_frequency_MHz)
+        frequency_scale = (moose_band_frequency_MHz[channel] / 150.0)^moose_temperature_spectral_index
+        phase = 2 .* (moose_intrinsic_angle .+
+            moose_phi_to_cell .* moose_band_lambda2_m2[channel])
+        moose_Q_band_K[:, :, channel] .= finite_sum_dims(
+            moose_emissivity_base_Kpc .* frequency_scale .* cos.(phase), los_dim) .* dx_los_pc
+        moose_U_band_K[:, :, channel] .= finite_sum_dims(
+            moose_emissivity_base_Kpc .* frequency_scale .* sin.(phase), los_dim) .* dx_los_pc
+    end
+    if apply_moose_interferometer
+        moose_Q_band_K = apply_moose_interferometer_cube(
+            moose_Q_band_K, moose_uv_transfer)
+        moose_U_band_K = apply_moose_interferometer_cube(
+            moose_U_band_K, moose_uv_transfer)
+    end
+    moose_Q_band_K = apply_observational_beam_cube(
+        moose_Q_band_K, cube, sky_dims)
+    moose_U_band_K = apply_observational_beam_cube(
+        moose_U_band_K, cube, sky_dims)
+    add_moose_noise && add_moose_qu_noise!(moose_Q_band_K, moose_U_band_K,
+        moose_instrument_snr, MersenneTwister(Int(moose_instrument_seed)))
+
+    moose_lambda0_sq_m2 = mean(moose_band_lambda2_m2)
+    moose_rm_phase_matrix = [cis(-2.0 * phi * (lambda2 - moose_lambda0_sq_m2))
+        for lambda2 in moose_band_lambda2_m2, phi in moose_phi_axis]
+    moose_P_band_matrix = reshape(complex.(moose_Q_band_K, moose_U_band_K), :, moose_nfrequency)
+    moose_F_matrix = moose_P_band_matrix * moose_rm_phase_matrix / moose_nfrequency
+    moose_F_complex = reshape(moose_F_matrix, moose_sky_shape..., length(moose_phi_axis))
+    moose_F_abs = abs.(moose_F_complex)
+    moose_pmax_K = finite_maximum_dims(moose_F_abs, 3)
+end
+
 # ╔═╡ 478ec2f3-e057-4720-809c-17ca0a3dac21
 md"""
 ---
@@ -3424,6 +3875,7 @@ Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 **Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))  
 **Display the spatial power spectra:** $(@bind display_shine_power_spectra PlutoUI.CheckBox(default = true))
 **Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
+**Display the H I--Faraday HOG comparison:** $(@bind display_hi_faraday_hog PlutoUI.CheckBox(default = true))
 
 | SHINE setting | Control |
 |:--|:--|
@@ -3581,7 +4033,7 @@ begin
         for (index, spec) in enumerate(shine_specs)
             row, col = cld(index, shine_ncols), mod1(index, shine_ncols)
             panel = fig_shine[row, col] = GridLayout()
-            ax = latex_axis(panel[1, 1],
+            ax = physical_map_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
@@ -3649,7 +4101,7 @@ begin
     shine_rgb_image = RGBf.(shine_rgb_red, shine_rgb_green, shine_rgb_blue)
 
     fig_shine_rgb = Figure(size = (820, 670))
-    shine_rgb_axis = latex_axis(fig_shine_rgb[1, 1],
+    shine_rgb_axis = physical_map_axis(fig_shine_rgb[1, 1],
         xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
         ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"),
         title = L"\mathrm{H\,I\ velocity\ composite}")
@@ -3707,6 +4159,427 @@ begin
         end
     end
     display_shine_spectrum ? fig_shine_spectrum : nothing
+end
+
+# ╔═╡ d5000001-6f8c-4d0c-9a10-000000000001
+begin
+    """
+    Build the H I brightness-temperature PPV cube and Faraday-depth cube needed
+    for a channel-by-channel HOG comparison. This follows the same SHINE and
+    MOOSE prescriptions as their dedicated figures.
+    """
+    function hi_faraday_observable_cubes(c)
+        local_temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        local_dx_pc = c.L[los_dim] / size(c.rho, los_dim)
+        local_dx_cm = local_dx_pc * PC_CM
+
+        permutation = (sky_dims[1], sky_dims[2], los_dim)
+        local_nhi = permutedims(
+            Float64(shine_neutral_fraction) .* c.rho ./
+                (max(Float64(shine_mu_H), eps(Float64)) * M_H_CGS),
+            permutation,
+        )
+        local_hi_temperature =
+            permutedims(max.(local_temperature, eps(Float64)), permutation)
+        local_velocity = permutedims(
+            (c.vx, c.vy, c.vz)[los_dim],
+            permutation,
+        )
+        hi_cube = zeros(
+            Float64,
+            size(local_nhi, 1),
+            size(local_nhi, 2),
+            length(shine_velocity_axis),
+        )
+        thermal_mu = max(Float64(shine_thermal_mu), eps(Float64))
+        fixed_width = max(Float64(shine_fixed_width_kms), 0.0)
+        Threads.@threads for i in axes(local_nhi, 1)
+            for j in axes(local_nhi, 2)
+                brightness, _ = shine_hi_spectrum(
+                    @view(local_nhi[i, j, :]),
+                    @view(local_velocity[i, j, :]),
+                    @view(local_hi_temperature[i, j, :]),
+                    shine_velocity_axis,
+                    local_dx_cm,
+                    thermal_mu,
+                    fixed_width,
+                )
+                hi_cube[i, j, :] .= brightness
+            end
+        end
+        hi_cube = apply_observational_beam_cube(hi_cube, c, sky_dims)
+
+        local_number_density = number_density(c.rho)
+        local_ne = if moose_electron_model == "Constant ionization fraction"
+            Float64(moose_constant_xe) .* local_number_density
+        else
+            local_xe = ifelse.(
+                local_temperature .< Float64(moose_transition_T),
+                Float64(moose_cnm_xe),
+                Float64(moose_wnm_xe),
+            )
+            local_xe .* local_number_density
+        end
+        components = (c.bx, c.by, c.bz)
+        local_blos = GAUSS_TO_MICROGAUSS .* components[los_dim]
+        local_bsky1 = GAUSS_TO_MICROGAUSS .* components[sky_dims[1]]
+        local_bsky2 = GAUSS_TO_MICROGAUSS .* components[sky_dims[2]]
+        local_bperp = hypot.(local_bsky1, local_bsky2)
+        phi_increment = 0.812 .* local_ne .* local_blos .* local_dx_pc
+        phi_to_cell =
+            cumsum(phi_increment; dims = los_dim) .- 0.5 .* phi_increment
+        cosmic_ray_index = Float64(moose_cr_index)
+        magnetic_exponent = (cosmic_ray_index + 1) / 2
+        temperature_spectral_index = -(cosmic_ray_index + 3) / 2
+        emissivity_base = Float64(moose_synchrotron_norm) .*
+            local_bperp .^ magnetic_exponent
+        intrinsic_angle = atan.(local_bsky2, local_bsky1) .+ pi / 2
+
+        map_shape = size(selectdim(c.rho, los_dim, 1))
+        nfrequency = length(moose_band_frequency_MHz)
+        q_band = Array{Float64}(undef, map_shape..., nfrequency)
+        u_band = similar(q_band)
+        for channel in eachindex(moose_band_frequency_MHz)
+            frequency_scale =
+                (moose_band_frequency_MHz[channel] / 150.0)^
+                temperature_spectral_index
+            phase = 2 .* (
+                intrinsic_angle .+
+                phi_to_cell .* moose_band_lambda2_m2[channel]
+            )
+            q_band[:, :, channel] .= finite_sum_dims(
+                emissivity_base .* frequency_scale .* cos.(phase),
+                los_dim,
+            ) .* local_dx_pc
+            u_band[:, :, channel] .= finite_sum_dims(
+                emissivity_base .* frequency_scale .* sin.(phase),
+                los_dim,
+            ) .* local_dx_pc
+        end
+        if apply_moose_interferometer
+            transfer = moose_instrument_transfer(
+                map_shape,
+                moose_largest_scale_pix,
+                moose_smallest_scale_pix,
+            )
+            q_band = apply_moose_interferometer_cube(q_band, transfer)
+            u_band = apply_moose_interferometer_cube(u_band, transfer)
+        end
+        q_band = apply_observational_beam_cube(q_band, c, sky_dims)
+        u_band = apply_observational_beam_cube(u_band, c, sky_dims)
+        add_moose_noise && add_moose_qu_noise!(
+            q_band,
+            u_band,
+            moose_instrument_snr,
+            MersenneTwister(Int(moose_instrument_seed)),
+        )
+        polarized_matrix = reshape(complex.(q_band, u_band), :, nfrequency)
+        faraday_matrix =
+            polarized_matrix * moose_rm_phase_matrix / nfrequency
+        faraday_cube = abs.(reshape(
+            faraday_matrix,
+            map_shape...,
+            length(moose_phi_axis),
+        ))
+        hi_cube, faraday_cube
+    end
+
+    function hif_hog_channel_indices(channel_count, maximum_count)
+        channel_count <= maximum_count && return collect(1:channel_count)
+        unique(round.(Int, range(1, channel_count; length = maximum_count)))
+    end
+
+    function hif_hog_log_map(image)
+        positive = filter(value -> isfinite(value) && value > 0, vec(image))
+        isempty(positive) && return zeros(Float64, size(image))
+        floor_value = max(quantile(positive, 0.01), floatmin(Float64))
+        log10.(max.(Float64.(image), floor_value))
+    end
+
+    function hif_hog_gradient_channels(
+            cube3d,
+            channel_indices,
+            spatial_indices_1,
+            spatial_indices_2;
+            smoothing_fwhm = 2.0,
+            gradient_percentile = 20.0,
+        )
+        shape = (
+            length(spatial_indices_1),
+            length(spatial_indices_2),
+            length(channel_indices),
+        )
+        gx = Array{Float64}(undef, shape)
+        gy = similar(gx)
+        norm = similar(gx)
+        thresholds = zeros(Float64, length(channel_indices))
+        for (output_channel, source_channel) in enumerate(channel_indices)
+            image = hif_hog_log_map(
+                view(
+                    cube3d,
+                    spatial_indices_1,
+                    spatial_indices_2,
+                    source_channel,
+                ),
+            )
+            image = periodic_gaussian_smooth_2d(image, smoothing_fwhm)
+            gx[:, :, output_channel] .= periodic_derivative(image, 1, 1.0)
+            gy[:, :, output_channel] .= periodic_derivative(image, 2, 1.0)
+            norm[:, :, output_channel] .= hypot.(
+                @view(gx[:, :, output_channel]),
+                @view(gy[:, :, output_channel]),
+            )
+            positive_norm = filter(
+                value -> isfinite(value) && value > 0,
+                vec(@view norm[:, :, output_channel]),
+            )
+            thresholds[output_channel] = isempty(positive_norm) ? Inf :
+                quantile(positive_norm, gradient_percentile / 100)
+        end
+        (; gx, gy, norm, thresholds)
+    end
+
+    """
+    Positive normalized projected-Rayleigh HOG statistic between every H I
+    velocity channel and every Faraday-depth channel. Negative values describe
+    preferentially perpendicular gradients and are clipped to zero in the
+    requested positive-correlation representation.
+    """
+    function hi_faraday_hog_product(
+            hi_cube,
+            velocity_axis,
+            faraday_cube,
+            phi_axis;
+            maximum_velocity_channels = 41,
+            maximum_phi_channels = 81,
+            maximum_spatial_pixels = 64,
+            smoothing_fwhm = 2.0,
+            gradient_percentile = 20.0,
+            profile_percentile = 0.98,
+        )
+        velocity_indices = hif_hog_channel_indices(
+            length(velocity_axis),
+            maximum_velocity_channels,
+        )
+        phi_indices = hif_hog_channel_indices(
+            length(phi_axis),
+            maximum_phi_channels,
+        )
+        spatial_indices_1 = hif_hog_channel_indices(
+            size(hi_cube, 1),
+            maximum_spatial_pixels,
+        )
+        spatial_indices_2 = hif_hog_channel_indices(
+            size(hi_cube, 2),
+            maximum_spatial_pixels,
+        )
+        hi_gradients = hif_hog_gradient_channels(
+            hi_cube,
+            velocity_indices,
+            spatial_indices_1,
+            spatial_indices_2;
+            smoothing_fwhm,
+            gradient_percentile,
+        )
+        faraday_gradients = hif_hog_gradient_channels(
+            faraday_cube,
+            phi_indices,
+            spatial_indices_1,
+            spatial_indices_2;
+            smoothing_fwhm,
+            gradient_percentile,
+        )
+        statistic = zeros(Float64, length(velocity_indices), length(phi_indices))
+        counts = zeros(Int, size(statistic))
+        for velocity_channel in eachindex(velocity_indices)
+            hix = @view hi_gradients.gx[:, :, velocity_channel]
+            hiy = @view hi_gradients.gy[:, :, velocity_channel]
+            hinorm = @view hi_gradients.norm[:, :, velocity_channel]
+            for phi_channel in eachindex(phi_indices)
+                faradayx = @view faraday_gradients.gx[:, :, phi_channel]
+                faradayy = @view faraday_gradients.gy[:, :, phi_channel]
+                faradaynorm = @view faraday_gradients.norm[:, :, phi_channel]
+                valid = isfinite.(hix) .& isfinite.(hiy) .&
+                    isfinite.(faradayx) .& isfinite.(faradayy) .&
+                    (hinorm .> hi_gradients.thresholds[velocity_channel]) .&
+                    (faradaynorm .>
+                        faraday_gradients.thresholds[phi_channel])
+                counts[velocity_channel, phi_channel] = count(valid)
+                count(valid) >= 16 || continue
+                cosine = (
+                    hix[valid] .* faradayx[valid] .+
+                    hiy[valid] .* faradayy[valid]
+                ) ./ max.(
+                    hinorm[valid] .* faradaynorm[valid],
+                    eps(Float64),
+                )
+                projected_rayleigh = mean(
+                    2 .* clamp.(cosine, -1.0, 1.0) .^ 2 .- 1
+                )
+                statistic[velocity_channel, phi_channel] =
+                    max(projected_rayleigh, 0.0)
+            end
+        end
+        profile = [
+            quantile(
+                @view(statistic[velocity_channel, :]),
+                profile_percentile,
+            )
+            for velocity_channel in axes(statistic, 1)
+        ]
+        (
+            velocity = Float64.(velocity_axis[velocity_indices]),
+            phi = Float64.(phi_axis[phi_indices]),
+            statistic,
+            profile,
+            counts,
+        )
+    end
+
+    function hi_faraday_hog_for_cube(c)
+        hi_cube, faraday_cube = hi_faraday_observable_cubes(c)
+        hi_faraday_hog_product(
+            hi_cube,
+            shine_velocity_axis,
+            faraday_cube,
+            moose_phi_axis,
+        )
+    end
+
+    hif_hog_parameter_signature = (
+        Float64(mean_molecular_weight),
+        los_dim,
+        Float64(shine_neutral_fraction),
+        Float64(shine_mu_H),
+        Float64(shine_thermal_mu),
+        Float64(shine_fixed_width_kms),
+        first(shine_velocity_axis),
+        last(shine_velocity_axis),
+        length(shine_velocity_axis),
+        String(moose_electron_model),
+        Float64(moose_constant_xe),
+        Float64(moose_cnm_xe),
+        Float64(moose_wnm_xe),
+        Float64(moose_transition_T),
+        Float64(moose_cr_index),
+        Float64(moose_synchrotron_norm),
+        first(moose_band_frequency_MHz),
+        last(moose_band_frequency_MHz),
+        length(moose_band_frequency_MHz),
+        first(moose_phi_axis),
+        last(moose_phi_axis),
+        length(moose_phi_axis),
+        Bool(apply_moose_interferometer),
+        Float64(moose_largest_scale_pix),
+        Float64(moose_smallest_scale_pix),
+        Bool(add_moose_noise),
+        Float64(moose_instrument_snr),
+        Int(moose_instrument_seed),
+    )
+    hi_faraday_hog_by_run = Dict{String, Any}()
+    for label in comparison_run_labels
+        snapshot_path =
+            run_files[label][comparison_snapshot_indices[label]]
+        hi_faraday_hog_by_run[label] = cached_scientific_product((
+            :hi_faraday_hog_v1,
+            cube_signature(snapshot_path),
+            hif_hog_parameter_signature,
+        )) do
+            if label == selected_run &&
+                    snapshot_path == selected_path
+                hi_faraday_hog_product(
+                    shine_Tb,
+                    shine_velocity_axis,
+                    moose_F_abs,
+                    moose_phi_axis,
+                )
+            else
+                hi_faraday_hog_for_cube(comparison_cube(label))
+            end
+        end
+    end
+
+    hif_hog_positive_values = vcat([
+        filter(
+            value -> isfinite(value) && value > 0,
+            vec(hi_faraday_hog_by_run[label].statistic),
+        )
+        for label in comparison_run_labels
+    ]...)
+    hif_hog_color_maximum = isempty(hif_hog_positive_values) ? 1.0 :
+        max(quantile(hif_hog_positive_values, 0.995), eps(Float64))
+    hif_hog_profile_maximum = maximum(
+        vcat([
+            hi_faraday_hog_by_run[label].profile
+            for label in comparison_run_labels
+        ]...);
+        init = hif_hog_color_maximum,
+    )
+
+    hif_hog_columns = length(comparison_run_labels)
+    fig_hi_faraday_hog = Figure(
+        size = (400hif_hog_columns + 100, 690),
+    )
+    Label(
+        fig_hi_faraday_hog[0, 1:hif_hog_columns],
+        L"\mathrm{H\,I\!-\!Faraday\ HOG}";
+        fontsize = 23,
+    )
+    hif_hog_heatmaps = Any[]
+    for (column, label) in enumerate(comparison_run_labels)
+        product = hi_faraday_hog_by_run[label]
+        heatmap_axis = latex_axis(
+            fig_hi_faraday_hog[1, column];
+            xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
+            ylabel = L"\phi\;[\mathrm{rad\,m}^{-2}]",
+            title = legend_run_label(label),
+        )
+        heatmap_plot = heatmap!(
+            heatmap_axis,
+            product.velocity,
+            product.phi,
+            product.statistic;
+            colormap = :inferno,
+            colorrange = (0.0, hif_hog_color_maximum),
+        )
+        push!(hif_hog_heatmaps, heatmap_plot)
+
+        profile_axis = latex_axis(
+            fig_hi_faraday_hog[2, column];
+            xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
+            ylabel = L"\tilde{V}_{98}",
+        )
+        lines!(
+            profile_axis,
+            product.velocity,
+            product.profile;
+            color = run_colors[label],
+            linewidth = 2.5,
+        )
+        scatter!(
+            profile_axis,
+            product.velocity,
+            product.profile;
+            color = run_colors[label],
+            markersize = 5,
+        )
+        ylims!(
+            profile_axis,
+            0.0,
+            max(1.08hif_hog_profile_maximum, eps(Float64)),
+        )
+    end
+    latex_colorbar(
+        fig_hi_faraday_hog[1, hif_hog_columns + 1],
+        first(hif_hog_heatmaps);
+        label = L"\tilde{V}_{+}",
+        tickformat = latex_ticklabels,
+    )
+    colsize!(fig_hi_faraday_hog.layout, hif_hog_columns + 1, 24)
+    rowsize!(fig_hi_faraday_hog.layout, 1, Relative(0.62))
+    rowsize!(fig_hi_faraday_hog.layout, 2, Relative(0.38))
+    display_hi_faraday_hog ? fig_hi_faraday_hog : nothing
 end
 
 # ╔═╡ a0050005-6f8c-4d0c-9a10-000000000005
@@ -5856,15 +6729,21 @@ version = "4.1.0+0"
 # ╟─32110739-b60e-4592-856a-dd74f7a37401
 # ╟─94a0a0dc-baf6-4e62-a51e-dc6124d98fd4
 # ╟─c12d1f54-40b8-4865-9562-8dcb519f924a
+# ╟─496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
+# ╠═b1000006-6f8c-4d0c-9a10-000000000006
 # ╟─3190e127-1d53-49f1-bfab-b9645910c2c6
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
 # ╟─3a731972-3404-478c-a572-00a05ab652b1
 # ╟─62440e86-b560-44ad-bb0a-43ae62e73fc3
 # ╠═47b786d6-c7b5-44f4-946a-b8c485ad6380
+# ╟─62b61ef2-8e5d-4fe9-a435-e18fb5be9461
+# ╟─0e8d9cab-aef2-42cd-959d-973764340f08
+# ╟─c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
 # ╟─478ec2f3-e057-4720-809c-17ca0a3dac21
 # ╟─bcc05889-02bb-47cf-b672-139e8efe4137
 # ╠═5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
 # ╟─27e51ba5-4592-4766-9dde-0de383a889a0
+# ╠═d5000001-6f8c-4d0c-9a10-000000000001
 # ╠═a0050005-6f8c-4d0c-9a10-000000000005
 # ╠═c3000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000001-6f8c-4d0c-9a10-000000000001

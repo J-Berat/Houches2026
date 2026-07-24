@@ -41,6 +41,7 @@ begin
     MYR_S = 3.15576e13               # s
     KM_CM = 1.0e5                    # cm
     GAUSS_TO_MICROGAUSS = 1.0e6
+    PHYSICAL_BOX_LENGTH_PC = 100.0
 
     # Persistent caches. This cell has no reactive dependency, so Pluto runs it
     # once per session and the caches survive every widget change. RAW_CUBE_CACHE
@@ -66,7 +67,7 @@ begin
     const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
     const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
     const PERSISTENT_CACHE_DIRTY = Ref(false)
-    const PERSISTENT_CACHE_VERSION = 1
+    const PERSISTENT_CACHE_VERSION = 2
     const PERSISTENT_CACHE_FILE =
         strip(get(ENV, "DYNAMO_PERSISTENT_CACHE_FILE", ""))
 
@@ -485,6 +486,22 @@ begin
         Axis(parent;
             xlabel = as_latex(xlabel), ylabel = as_latex(ylabel),
             xtickformat, ytickformat, options...)
+    end
+
+    """
+    Create an axis for a projected map of the fixed 100 pc simulation domain.
+    Every spatial map therefore uses identical physical limits and tick labels,
+    independently of the numerical resolution or line of sight.
+    """
+    function physical_map_axis(parent; xlabel = L"", ylabel = L"", kwargs...)
+        ticks = collect(0.0:20.0:PHYSICAL_BOX_LENGTH_PC)
+        latex_axis(parent;
+            xlabel, ylabel,
+            xticks = ticks,
+            yticks = ticks,
+            limits = ((0.0, PHYSICAL_BOX_LENGTH_PC),
+                (0.0, PHYSICAL_BOX_LENGTH_PC)),
+            kwargs...)
     end
 
     function latex_colorbar(parent, plot; label = L"",
@@ -2034,7 +2051,7 @@ md"""
 | Pressure unit [$\mathrm{erg\,cm^{-3}}$ per stored unit] | $(@bind pressure_unit_ergcm3 PlutoUI.NumberField(default = 1.0)) |
 | Velocity unit [$\mathrm{km\,s^{-1}}$ per stored unit] | $(@bind velocity_unit_kms PlutoUI.NumberField(default = 1.0)) |
 | Magnetic-field unit [$\mathrm{G}$ per stored unit] | $(@bind magnetic_unit_G PlutoUI.NumberField(default = 1.0)) |
-| Length unit [$\mathrm{pc}$ per stored unit] | $(@bind length_unit_pc PlutoUI.NumberField(default = 1.0)) |
+| Physical box [$\mathrm{pc}^3$] | $(@sprintf("%.0f × %.0f × %.0f (fixed)", fill(PHYSICAL_BOX_LENGTH_PC, 3)...)) |
 | Time unit [$\mathrm{Myr}$ per stored unit] | $(@bind time_unit_Myr PlutoUI.NumberField(default = 1.0)) |
 | PDF weighting | $(@bind pdf_weighting PlutoUI.Select(["volume", "mass"]; default = "volume")) |
 | Number of bins | $(@bind nbins PlutoUI.Slider(20:5:100; default = 50, show_value = true)) |
@@ -2226,7 +2243,7 @@ begin
             bx = scale_field(raw.bx, magnetic_scale),
             by = scale_field(raw.by, magnetic_scale),
             bz = scale_field(raw.bz, magnetic_scale),
-            L = Float64(length_unit_pc) .* raw.L,
+            L = fill(Float64(PHYSICAL_BOX_LENGTH_PC), 3),
             t = Float64(time_unit_Myr) * raw.t,
         )
     end
@@ -2272,7 +2289,7 @@ begin
     "Every widget value that changes the physical content of a loaded cube."
     unit_signature() = (Float64(density_unit_gcm3), Float64(pressure_unit_ergcm3),
         Float64(velocity_unit_kms), Float64(magnetic_unit_G),
-        Float64(length_unit_pc), Float64(time_unit_Myr))
+        Float64(PHYSICAL_BOX_LENGTH_PC), Float64(time_unit_Myr))
 
     "Cache key identifying a snapshot together with the units it is loaded in."
     cube_signature(path) = (raw_cube_key(path), unit_signature())
@@ -2479,10 +2496,6 @@ begin
 
     function latex_decade_number(value)
         exponent = round(Int, log10(value))
-        if -3 <= exponent <= 6
-            exponent >= 0 && return latexstring(@sprintf("%.0f", value))
-            return latexstring(@sprintf("%.*f", -exponent, value))
-        end
         latexstring("10^{", exponent, "}")
     end
 
@@ -3641,7 +3654,7 @@ begin
         for (index, spec) in enumerate(starlight_map_specs)
             row, col = cld(index, starlight_map_ncols), mod1(index, starlight_map_ncols)
             panel = fig_starlight_maps[row, col] = GridLayout()
-            axis = latex_axis(panel[1, 1],
+            axis = physical_map_axis(panel[1, 1],
                 xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
                 ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
             colorrange = isnothing(spec.fixed_range) ?

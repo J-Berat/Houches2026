@@ -43,6 +43,7 @@ const FIGURE_REGISTRY = Dict(
     "shine_power_spectra" => :fig_shine_power_spectra,
     "shine_rgb" => :fig_shine_rgb,
     "shine_spectrum" => :fig_shine_spectrum,
+    "hi_faraday_hog" => :fig_hi_faraday_hog,
 )
 
 const NOTEBOOK_FIGURES = Dict(
@@ -94,6 +95,7 @@ const NOTEBOOK_FIGURES = Dict(
         "moose_power_spectra",
         "moose_tomography",
         "moose_p_column",
+        "hi_faraday_hog",
     ],
     "shine" => [
         "shine",
@@ -101,6 +103,7 @@ const NOTEBOOK_FIGURES = Dict(
         "shine_power_spectra",
         "shine_rgb",
         "shine_spectrum",
+        "hi_faraday_hog",
     ],
 )
 

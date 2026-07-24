@@ -102,10 +102,20 @@ The run lists and folders are configured near the top of `run_figures.jl`.
 `SELECTED_COMPARISONS` can contain `mach`, `resolution`, and/or `ratio`.
 For each selected comparison, the script creates two jobs:
 
-- the first 20 snapshots for all 19 Dynamo figures, including separate 3D and
-  projected 2D HRO outputs;
+- the first 20 snapshots for all 20 Dynamo figures, including separate 3D and
+  projected 2D HRO outputs and a seven-panel summary figure;
 - the last 10 snapshots for all 21 figures from Dust, StarlightPol, ZEEMAN,
   MOOSE, and SHINE.
+
+In batch mode, the comparative density PDFs, magnetic-field--density relation,
+3D HRO, 2D HRO, and power spectra use every selected snapshot. Their solid
+curves are snapshot medians and their shaded regions span the 16th--84th
+percentiles. The 2D HRO reports the three lines of sight, bootstrap uncertainty
+on the orientation parameter, and the number of contributing pixels. Power
+spectra include compensated panels, the fitted interval, slope uncertainty,
+the forcing wavenumber, and the Nyquist limit. A simulation keeps the same
+color throughout a comparison group. The summary also includes the magnetic
+field evolution separated into CNM, LNM, and WNM thermal phases.
 
 Check all six planned jobs without computing:
 
@@ -141,10 +151,20 @@ Le moteur batch :
 - ne charge pas Pluto ;
 - n'ouvre que les cubes nécessaires ;
 - calcule l'union des dépendances des figures demandées une seule fois ;
-- réutilise les cubes avec un cache LRU borné en mémoire ;
+- réutilise les cubes physiques et leurs champs dérivés avec des caches bornés
+  en mémoire ;
+- conserve dans `.dynamo_cache/` les réductions scientifiques compactes et un
+  manifeste des snapshots pour les exécutions suivantes ;
+- invalide automatiquement une entrée lorsque le fichier ou le dossier source
+  est modifié ;
+- limite séparément les workers de snapshots et les threads FFTW afin d'éviter
+  la sur-souscription sur le système de fichiers partagé ;
 - ferme les fichiers HDF5 après lecture ;
 - affiche une barre de progression et la phase scientifique en cours ;
 - écrit directement les figures PNG ou PDF dans `output_directory`.
+
+Le cache persistant ne contient jamais les cubes bruts. Pour forcer un calcul
+entièrement neuf, supprimer le dossier `.dynamo_cache/` avant le lancement.
 
 À la fin, le script affiche la durée totale, le dossier de sortie absolu et le
 chemin complet de chaque figure créée.
@@ -234,6 +254,11 @@ Variables utiles :
 | `DYNAMO_LOCAL_CACHE_DIRECTORY` | Parent du cache local | dossier temporaire |
 | `DYNAMO_RAW_CUBE_CACHE_ENTRIES` | Nombre maximal de cubes en batch | nombre de simulations |
 | `DYNAMO_RAW_CUBE_CACHE_MIB` | Plafond mémoire du cache | quart de la RAM |
+| `DYNAMO_DERIVED_CACHE_MIB` | Plafond mémoire des champs dérivés | quart de la RAM |
+| `DYNAMO_SNAPSHOT_WORKERS` | Nombre maximal de snapshots traités simultanément | `min(8, threads Julia)` |
+| `DYNAMO_FFTW_THREADS` | Threads internes FFTW | `1` |
+| `DYNAMO_CACHE_DIRECTORY` | Cache persistant des réductions et du manifeste | `.dynamo_cache` |
+| `DYNAMO_PERSISTENT_CACHE_FILE` | Fichier de cache explicite | `scientific_cache_v1.bin` dans le dossier précédent |
 | `PLUTO_HOST` | Adresse d'écoute | `127.0.0.1` |
 | `PLUTO_PORT` | Port Pluto | `1234` |
 | `PLUTO_LAUNCH_BROWSER` | Ouverture automatique du navigateur | oui sur macOS/Windows |

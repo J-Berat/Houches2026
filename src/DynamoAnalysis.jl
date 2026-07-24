@@ -25,6 +25,16 @@ const EARLY_DEFINITION_CELL_IDS = Base.UUID[
 include(joinpath(@__DIR__, "FigureRegistry.jl"))
 include(joinpath(@__DIR__, "BatchCellIndex.jl"))
 
+const BATCH_DISPLAY_FLAGS = Dict(
+    "time_evolution" => :display_global_evolution,
+    "phase_magnetic_time" => :display_phase_B_time,
+    "magnetic_fit" => :display_growth_fit,
+    "growth_rate_relations" => :display_gamma_relations,
+    "normalized_magnetic_relations" => :display_normalized_B_relations,
+    "energy_time" => :display_energy_time,
+    "summary" => :display_phase_B_time,
+)
+
 Base.@kwdef struct BatchConfig
     data_repository::String
     simulations::Vector{String}
@@ -242,6 +252,16 @@ function selected_cell_ids(figures)
     selected
 end
 
+function enable_requested_displays!(workspace, figures)
+    for figure in figures
+        flag = get(BATCH_DISPLAY_FLAGS, figure, nothing)
+        isnothing(flag) && continue
+        module_isdefined(workspace, flag) || continue
+        Core.eval(workspace, Expr(:(=), flag, true))
+    end
+    nothing
+end
+
 function cell_description(cell_id, code, config)
     cell_id == NAVIGATION_CELL_ID &&
         return "Selecting simulations and snapshot"
@@ -311,6 +331,7 @@ function execute_cells(config::BatchConfig)
                 code,
                 MASTER_NOTEBOOK,
             )
+            enable_requested_displays!(workspace, config.figures)
         catch error_value
             terminal_is_interactive() && println(stdout)
             println(stderr, "\nError in cell ", cell_id, ":")
@@ -399,10 +420,28 @@ function run_batch(config::BatchConfig)
     ENV["DYNAMO_DATA_REPOSITORY"] = abspath(config.data_repository)
     ENV["DYNAMO_SNAPSHOT_WINDOW_MODE"] = string(config.snapshot_window)
     ENV["DYNAMO_SNAPSHOT_WINDOW_COUNT"] = string(config.snapshot_count)
+    ENV["DYNAMO_CONFIGURED_SIMULATIONS"] = join(config.simulations, '\n')
+    ENV["DYNAMO_ENSEMBLE_FIGURES"] = "true"
     get!(
         ENV,
         "DYNAMO_RAW_CUBE_CACHE_ENTRIES",
         string(max(1, length(config.simulations))),
+    )
+    get!(
+        ENV,
+        "DYNAMO_SNAPSHOT_WORKERS",
+        string(min(8, max(1, Threads.nthreads()))),
+    )
+    get!(ENV, "DYNAMO_FFTW_THREADS", "1")
+    cache_directory = get!(
+        ENV,
+        "DYNAMO_CACHE_DIRECTORY",
+        joinpath(PROJECT_DIRECTORY, ".dynamo_cache"),
+    )
+    get!(
+        ENV,
+        "DYNAMO_PERSISTENT_CACHE_FILE",
+        joinpath(cache_directory, "scientific_cache_v1.bin"),
     )
 
     output_directory = abspath(config.output_directory)
@@ -432,6 +471,9 @@ function run_batch(config::BatchConfig)
         ENV["DYNAMO_RAW_CUBE_CACHE_ENTRIES"],
         " cube(s), with an automatic memory limit",
     )
+    println("Snapshot workers    : ", ENV["DYNAMO_SNAPSHOT_WORKERS"])
+    println("FFTW threads        : ", ENV["DYNAMO_FFTW_THREADS"])
+    println("Persistent cache    : ", ENV["DYNAMO_PERSISTENT_CACHE_FILE"])
     if Threads.nthreads() == 1
         println(
             "Tip: start Julia with --threads=auto to parallelize ",
@@ -443,6 +485,11 @@ function run_batch(config::BatchConfig)
 
     println("\nStarting scientific computations")
     workspace, executed = execute_cells(config)
+    if module_isdefined(workspace, :flush_persistent_cache!)
+        Base.invokelatest(
+            module_getfield(workspace, :flush_persistent_cache!),
+        )
+    end
     destinations = save_figures(workspace, config)
     elapsed_seconds = (time_ns() - started_at) / 1.0e9
 

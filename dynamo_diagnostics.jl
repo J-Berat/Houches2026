@@ -25,8 +25,10 @@ begin
     using FFTW
     using FITSIO
     using HDF5
+    using LinearAlgebra
     using PlutoUI
     using Random
+    using Serialization
     using Statistics
     using StatsBase
 
@@ -49,13 +51,24 @@ begin
     const RAW_CUBE_CACHE = Dict{Any,Any}()
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
+    const SCALED_CUBE_CACHE = Dict{Any,Any}()
+    const SCALED_CUBE_CACHE_BYTES = Dict{Any,Int}()
+    const SCALED_CUBE_CACHE_ORDER = Any[]
+    const DERIVED_PRODUCT_CACHE = IdDict{Any,Dict{Symbol,Any}}()
+    const DERIVED_PRODUCT_CACHE_BYTES = Ref(0)
+    const RFFT_PLAN_CACHE = Dict{Any,Any}()
     const REDUCTION_CACHE = Dict{Any,Any}()
     const SNAPSHOT_SOURCE_CACHE = Dict{String,Vector{String}}()
+    const SNAPSHOT_MANIFEST = Dict{String,Any}()
     const DIRECTORY_DISCOVERY_CACHE = Dict{String,Vector{String}}()
     const SNAPSHOT_FINGERPRINT_CACHE = Dict{String,Any}()
     const UNREADABLE_DIRECTORY_WARNINGS = Set{String}()
     const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
     const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
+    const PERSISTENT_CACHE_DIRTY = Ref(false)
+    const PERSISTENT_CACHE_VERSION = 1
+    const PERSISTENT_CACHE_FILE =
+        strip(get(ENV, "DYNAMO_PERSISTENT_CACHE_FILE", ""))
 
     function positive_integer_setting(name, default)
         value = tryparse(Int, strip(get(ENV, name, string(default))))
@@ -73,6 +86,74 @@ begin
         "DYNAMO_RAW_CUBE_CACHE_MIB",
         max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
     ) * 1024^2
+    const DERIVED_PRODUCT_CACHE_MAX_BYTES = positive_integer_setting(
+        "DYNAMO_DERIVED_CACHE_MIB",
+        max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
+    ) * 1024^2
+    const SNAPSHOT_SWEEP_MAX_WORKERS = positive_integer_setting(
+        "DYNAMO_SNAPSHOT_WORKERS",
+        min(8, max(1, Threads.nthreads())),
+    )
+    const CONFIGURED_FFTW_THREADS = positive_integer_setting(
+        "DYNAMO_FFTW_THREADS",
+        1,
+    )
+    FFTW.set_num_threads(CONFIGURED_FFTW_THREADS)
+
+    """
+    Load compact scientific reductions and the cube manifest from a previous run.
+
+    The cache format is explicitly versioned. Incompatible or interrupted cache
+    files are ignored, so cached data can never prevent a fresh computation.
+    """
+    function load_persistent_cache!()
+        isempty(PERSISTENT_CACHE_FILE) && return
+        isfile(PERSISTENT_CACHE_FILE) || return
+        payload = try
+            deserialize(PERSISTENT_CACHE_FILE)
+        catch error_value
+            println(stderr, "Warning: ignoring unreadable persistent cache ",
+                PERSISTENT_CACHE_FILE, " (", sprint(showerror, error_value), ")")
+            return
+        end
+        payload isa NamedTuple || return
+        get(payload, :version, nothing) == PERSISTENT_CACHE_VERSION || return
+        reductions = get(payload, :reductions, nothing)
+        manifest = get(payload, :snapshot_manifest, nothing)
+        reductions isa AbstractDict && merge!(REDUCTION_CACHE, reductions)
+        manifest isa AbstractDict && merge!(SNAPSHOT_MANIFEST, manifest)
+        nothing
+    end
+
+    """
+    Atomically persist compact reductions and snapshot-directory metadata.
+
+    Raw cubes and cube-sized derived arrays deliberately remain RAM-only.
+    """
+    function flush_persistent_cache!()
+        isempty(PERSISTENT_CACHE_FILE) && return false
+        PERSISTENT_CACHE_DIRTY[] || return false
+        target_directory = dirname(PERSISTENT_CACHE_FILE)
+        mkpath(target_directory)
+        temporary_path, stream = mktemp(target_directory)
+        try
+            serialize(stream, (
+                version = PERSISTENT_CACHE_VERSION,
+                reductions = REDUCTION_CACHE,
+                snapshot_manifest = SNAPSHOT_MANIFEST,
+            ))
+            close(stream)
+            mv(temporary_path, PERSISTENT_CACHE_FILE; force = true)
+            PERSISTENT_CACHE_DIRTY[] = false
+            true
+        catch
+            isopen(stream) && close(stream)
+            isfile(temporary_path) && rm(temporary_path; force = true)
+            rethrow()
+        end
+    end
+
+    load_persistent_cache!()
 
     "Memoize remote file metadata for the duration of the Pluto session."
     function cached_snapshot_fingerprint(path)
@@ -88,6 +169,14 @@ begin
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
     reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
+
+    "Return a compact cached scientific product, computing it only on a miss."
+    function cached_scientific_product(build::Function, key)
+        versioned_key = (:scientific_product, PERSISTENT_CACHE_VERSION, key)
+        hit = reduction_hit(versioned_key)
+        isnothing(hit) || return hit
+        store_reduction!(versioned_key, build())
+    end
 
     """
     List a directory during recursive data discovery.
@@ -121,8 +210,13 @@ begin
     end
 
     "Memoize a scalar summary and return it."
-    store_reduction!(key, value) =
-        lock(() -> (REDUCTION_CACHE[key] = value), CACHE_LOCK)
+    function store_reduction!(key, value)
+        lock(CACHE_LOCK) do
+            REDUCTION_CACHE[key] = value
+            PERSISTENT_CACHE_DIRTY[] = true
+        end
+        value
+    end
 
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
@@ -181,6 +275,80 @@ begin
             push!(RAW_CUBE_CACHE_ORDER, key)
         end
         value
+    end
+
+    """
+    Cache physical-unit cubes separately from their unit-free HDF5 arrays.
+
+    This prevents every figure from allocating and scaling the same eight
+    three-dimensional fields again. The cache follows the same entry and memory
+    limits as the raw-cube cache.
+    """
+    function cached_scaled_cube!(key, build)
+        hit = lock(CACHE_LOCK) do
+            if haskey(SCALED_CUBE_CACHE, key)
+                position = findfirst(isequal(key), SCALED_CUBE_CACHE_ORDER)
+                isnothing(position) || deleteat!(SCALED_CUBE_CACHE_ORDER, position)
+                push!(SCALED_CUBE_CACHE_ORDER, key)
+                SCALED_CUBE_CACHE[key]
+            else
+                nothing
+            end
+        end
+        isnothing(hit) || return hit
+
+        value = build()
+        bytes = Base.summarysize(value)
+        lock(CACHE_LOCK) do
+            while !isempty(SCALED_CUBE_CACHE_ORDER) && (
+                    length(SCALED_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    sum(values(SCALED_CUBE_CACHE_BYTES)) + bytes >
+                        RAW_CUBE_CACHE_MAX_BYTES)
+                oldest = popfirst!(SCALED_CUBE_CACHE_ORDER)
+                delete!(SCALED_CUBE_CACHE, oldest)
+                delete!(SCALED_CUBE_CACHE_BYTES, oldest)
+            end
+            if bytes <= RAW_CUBE_CACHE_MAX_BYTES
+                SCALED_CUBE_CACHE[key] = value
+                SCALED_CUBE_CACHE_BYTES[key] = bytes
+                push!(SCALED_CUBE_CACHE_ORDER, key)
+            end
+        end
+        value
+    end
+
+    """
+    Cache a derived field bundle by identity of the density array.
+
+    If the derived-field budget would be exceeded, old products are discarded
+    together. This simple bounded policy avoids retaining multi-gigabyte
+    vorticity and turbulence arrays for evicted cubes.
+    """
+    function cached_derived_product(build::Function, cube, product::Symbol)
+        hit = lock(CACHE_LOCK) do
+            products = get(DERIVED_PRODUCT_CACHE, cube.rho, nothing)
+            isnothing(products) ? nothing : get(products, product, nothing)
+        end
+        isnothing(hit) || return hit
+
+        value = build()
+        bytes = Base.summarysize(value)
+        bytes > DERIVED_PRODUCT_CACHE_MAX_BYTES && return value
+        lock(CACHE_LOCK) do
+            if DERIVED_PRODUCT_CACHE_BYTES[] + bytes >
+                    DERIVED_PRODUCT_CACHE_MAX_BYTES
+                empty!(DERIVED_PRODUCT_CACHE)
+                DERIVED_PRODUCT_CACHE_BYTES[] = 0
+            end
+            products = get!(DERIVED_PRODUCT_CACHE, cube.rho) do
+                Dict{Symbol,Any}()
+            end
+            if !haskey(products, product)
+                products[product] = value
+                DERIVED_PRODUCT_CACHE_BYTES[] += bytes
+            end
+            products[product]
+        end
     end
     const HDF5_READ_LOCK = ReentrantLock()
 
@@ -1033,6 +1201,16 @@ begin
     MAX_SNAPSHOTS_PER_RUN > 0 || error(
         "DYNAMO_SNAPSHOT_WINDOW_COUNT must be a positive integer.",
     )
+    ENSEMBLE_FIGURES = lowercase(strip(
+        get(ENV, "DYNAMO_ENSEMBLE_FIGURES", "false"),
+    )) in ("1", "true", "yes", "on")
+    CONFIGURED_SIMULATION_DIRECTORIES = filter(
+        !isempty,
+        strip.(split(
+            get(ENV, "DYNAMO_CONFIGURED_SIMULATIONS", ""),
+            '\n',
+        )),
+    )
     nothing
 end
 
@@ -1221,6 +1399,13 @@ begin
         canonical = abspath(cube_directory)
         lock(CACHE_LOCK) do
             get!(SNAPSHOT_SOURCE_CACHE, canonical) do
+                directory_mtime = mtime(canonical)
+                manifest_entry = get(SNAPSHOT_MANIFEST, canonical, nothing)
+                if !isnothing(manifest_entry) &&
+                        manifest_entry.directory_mtime == directory_mtime &&
+                        all(ispath, manifest_entry.sources)
+                    return copy(manifest_entry.sources)
+                end
                 fits_directory_is_snapshot(canonical) && return [canonical]
                 sources = String[]
                 for path in discovery_readdir(canonical; join = true)
@@ -1229,7 +1414,13 @@ begin
                         push!(sources, path)
                     end
                 end
-                sort(sources)
+                sort!(sources)
+                SNAPSHOT_MANIFEST[canonical] = (
+                    directory_mtime = directory_mtime,
+                    sources = copy(sources),
+                )
+                PERSISTENT_CACHE_DIRTY[] = true
+                sources
             end
         end
     end
@@ -1267,7 +1458,26 @@ begin
         unique(found)
     end
 
-    run_directories(path) = discover_cube_directories(path)
+    function configured_run_directories(path)
+        directories = String[]
+        for configured in CONFIGURED_SIMULATION_DIRECTORIES
+            candidates = (
+                joinpath(path, configured, "DataCubes"),
+                joinpath(path, configured),
+                joinpath(configured, "DataCubes"),
+                configured,
+            )
+            selected = findfirst(candidate -> !isempty(snapshot_sources(candidate)),
+                candidates)
+            isnothing(selected) && error(
+                "No snapshots found for configured simulation: $configured")
+            push!(directories, abspath(candidates[selected]))
+        end
+        unique(directories)
+    end
+
+    run_directories(path) = isempty(CONFIGURED_SIMULATION_DIRECTORIES) ?
+        discover_cube_directories(path) : configured_run_directories(path)
     is_dataset_root(path) = !isempty(discover_cube_directories(path))
 
     function resolve_data_root(repository)
@@ -1719,6 +1929,11 @@ begin
     legend_run_label(label) =
         latexstring(run_label_latex_source(plain_legend_run_label(label)))
     latex_run_label(label) = legend_run_label(label)
+    ensemble_legend_label(label) = latexstring(
+        run_label_latex_source(plain_legend_run_label(label)),
+        raw";\;N_{\mathrm{snap}}=",
+        ENSEMBLE_FIGURES ? length(get(run_files, label, String[])) : 1,
+    )
     legend_rate_label(gamma; fitted = false) = latexstring(
         fitted ? raw"\Gamma_B^{\mathrm{fit}}=" : raw"\Gamma_B=",
         round(gamma; sigdigits = fitted ? 4 : 3),
@@ -1846,6 +2061,15 @@ begin
     analysis_series_labels = requested_open_labels
     comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
+    comparison_snapshot_paths = Dict(
+        label => ENSEMBLE_FIGURES ?
+            run_files[label] :
+            [run_files[label][min(
+                Int(selected_snapshot),
+                length(run_files[label]),
+            )]]
+        for label in comparison_run_labels
+    )
     # Loading the selected raw cube here supplies the exact stored time and
     # primes the one-entry cache. The analysis cell below therefore reuses the
     # same arrays instead of opening this HDF5 file a second time.
@@ -2020,7 +2244,10 @@ begin
         )
     end
 
-    load_cube(path) = scale_raw_cube(load_raw_cube(path))
+    load_cube(path) = cached_scaled_cube!(
+        cube_signature(path),
+        () -> scale_raw_cube(load_raw_cube(path)),
+    )
 
     """
     How many snapshots a sweep may process at once.
@@ -2037,7 +2264,8 @@ begin
         # which together come to roughly three times the raw size.
         budget = Sys.total_memory() ÷ 4
         affordable = Int(budget ÷ (3 * cube_bytes))
-        clamp(affordable, 1, Threads.nthreads())
+        clamp(affordable, 1,
+            min(Threads.nthreads(), SNAPSHOT_SWEEP_MAX_WORKERS))
     end
 
     "Apply `work` to every index, running at most `workers` of them at a time."
@@ -2178,34 +2406,40 @@ begin
     end
 
     function turbulent_velocity(c)
-        T = float(eltype(c.rho))
-        rho, vx, vy, vz = c.rho, c.vx, c.vy, c.vz
-        wsum, sx, sy, sz = 0.0, 0.0, 0.0, 0.0
-        @inbounds for index in eachindex(rho)
-            weight = Float64(rho[index])
-            (isfinite(weight) && weight > 0) || continue
-            ux, uy, uz = Float64(vx[index]), Float64(vy[index]), Float64(vz[index])
-            (isfinite(ux) && isfinite(uy) && isfinite(uz)) || continue
-            wsum += weight
-            sx += weight * ux
-            sy += weight * uy
-            sz += weight * uz
+        cached_derived_product(c, :turbulent_velocity) do
+            T = float(eltype(c.rho))
+            rho, vx, vy, vz = c.rho, c.vx, c.vy, c.vz
+            wsum, sx, sy, sz = 0.0, 0.0, 0.0, 0.0
+            @inbounds for index in eachindex(rho)
+                weight = Float64(rho[index])
+                (isfinite(weight) && weight > 0) || continue
+                ux, uy, uz =
+                    Float64(vx[index]), Float64(vy[index]), Float64(vz[index])
+                (isfinite(ux) && isfinite(uy) && isfinite(uz)) || continue
+                wsum += weight
+                sx += weight * ux
+                sy += weight * uy
+                sz += weight * uz
+            end
+            wsum > 0 || return (
+                vbar = (NaN, NaN, NaN),
+                dvx = fill(T(NaN), size(rho)), dvy = fill(T(NaN), size(rho)),
+                dvz = fill(T(NaN), size(rho)),
+                dv2 = fill(T(NaN), size(rho)),
+            )
+            vbar = (sx / wsum, sy / wsum, sz / wsum)
+            dvx, dvy, dvz =
+                vx .- T(vbar[1]), vy .- T(vbar[2]), vz .- T(vbar[3])
+            dv2 = dvx .^ 2 .+ dvy .^ 2 .+ dvz .^ 2
+            (; vbar, dvx, dvy, dvz, dv2)
         end
-        wsum > 0 || return (
-            vbar = (NaN, NaN, NaN),
-            dvx = fill(T(NaN), size(rho)), dvy = fill(T(NaN), size(rho)),
-            dvz = fill(T(NaN), size(rho)),
-            dv2 = fill(T(NaN), size(rho)),
-        )
-        vbar = (sx / wsum, sy / wsum, sz / wsum)
-        dvx, dvy, dvz = vx .- T(vbar[1]), vy .- T(vbar[2]), vz .- T(vbar[3])
-        dv2 = dvx .^ 2 .+ dvy .^ 2 .+ dvz .^ 2
-        (; vbar, dvx, dvy, dvz, dv2)
     end
 
     function magnetic_fields(c)
-        B2 = c.bx .^ 2 .+ c.by .^ 2 .+ c.bz .^ 2
-        (; B2, B = sqrt.(B2))
+        cached_derived_product(c, :magnetic_fields) do
+            B2 = c.bx .^ 2 .+ c.by .^ 2 .+ c.bz .^ 2
+            (; B2, B = sqrt.(B2))
+        end
     end
 
     function weighted_project(A, rho, d)
@@ -2225,12 +2459,21 @@ begin
     end
 
     function vorticity(c)
-        dx = c.L ./ size(c.rho)
-        kms_per_pc_to_Myr_inv = MYR_S / (PC_CM / KM_CM)
-        wx = kms_per_pc_to_Myr_inv .* (periodic_derivative(c.vz, 2, dx[2]) .- periodic_derivative(c.vy, 3, dx[3]))
-        wy = kms_per_pc_to_Myr_inv .* (periodic_derivative(c.vx, 3, dx[3]) .- periodic_derivative(c.vz, 1, dx[1]))
-        wz = kms_per_pc_to_Myr_inv .* (periodic_derivative(c.vy, 1, dx[1]) .- periodic_derivative(c.vx, 2, dx[2]))
-        (; wx, wy, wz, magnitude = sqrt.(wx .^ 2 .+ wy .^ 2 .+ wz .^ 2))
+        cached_derived_product(c, :vorticity) do
+            dx = c.L ./ size(c.rho)
+            kms_per_pc_to_Myr_inv = MYR_S / (PC_CM / KM_CM)
+            wx = kms_per_pc_to_Myr_inv .* (
+                periodic_derivative(c.vz, 2, dx[2]) .-
+                periodic_derivative(c.vy, 3, dx[3]))
+            wy = kms_per_pc_to_Myr_inv .* (
+                periodic_derivative(c.vx, 3, dx[3]) .-
+                periodic_derivative(c.vz, 1, dx[1]))
+            wz = kms_per_pc_to_Myr_inv .* (
+                periodic_derivative(c.vy, 1, dx[1]) .-
+                periodic_derivative(c.vx, 2, dx[2]))
+            (; wx, wy, wz,
+                magnitude = sqrt.(wx .^ 2 .+ wy .^ 2 .+ wz .^ 2))
+        end
     end
 
     struct DecadeTicks end
@@ -2297,6 +2540,8 @@ begin
             ylabel = ylabel, xscale = log10,
             xticks = DECADE_TICKS,
             xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+        column_limits = enclosing_decade_limits(N)
+        isnothing(column_limits) || xlims!(axis, column_limits...)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
         scatter!(axis, N[sample], p_percent[sample];
@@ -2385,6 +2630,38 @@ begin
         low, high = quantile(finite_texture, (0.01, 0.99))
         high > low || return zeros(Float64, nx, ny)
         clamp.((texture .- low) ./ (high - low), 0.0, 1.0)
+    end
+
+    function snapshot_curve_band(curves)
+        isempty(curves) && return (
+            median = Float64[], lower = Float64[],
+            upper = Float64[], counts = Int[])
+        curve_length = length(first(curves))
+        all(curve -> length(curve) == curve_length, curves) ||
+            error("Snapshot curves must use the same binning.")
+        medians = fill(NaN, curve_length)
+        lower = fill(NaN, curve_length)
+        upper = fill(NaN, curve_length)
+        counts = zeros(Int, curve_length)
+        for index in 1:curve_length
+            values = Float64[
+                curve[index] for curve in curves if isfinite(curve[index])
+            ]
+            counts[index] = length(values)
+            isempty(values) && continue
+            lower[index], medians[index], upper[index] =
+                quantile(values, (0.16, 0.50, 0.84))
+        end
+        (median = medians, lower, upper, counts)
+    end
+
+    function shared_finite_limits(values; padding = 0.04)
+        finite = Float64.(filter(isfinite, vec(values)))
+        isempty(finite) && return nothing
+        low, high = extrema(finite)
+        low == high && return (low - 0.5, high + 0.5)
+        margin = padding * (high - low)
+        low - margin, high + margin
     end
 end
 
@@ -2633,9 +2910,10 @@ begin
     function density_pdf(values, weights, edges)
         valid = isfinite.(values) .& isfinite.(weights) .& (weights .>= 0)
         values, weights = Float64.(values[valid]), Float64.(weights[valid])
-        isempty(values) && return (Float64[], Float64[])
-        h = fit(Histogram, values, Weights(weights), edges)
         centers = (edges[1:end-1] .+ edges[2:end]) ./ 2
+        isempty(values) &&
+            return (centers, fill(NaN, length(centers)))
+        h = fit(Histogram, values, Weights(weights), edges)
         pdf = h.weights ./ max(sum(h.weights .* diff(edges)), eps())
         centers, pdf
     end
@@ -2657,16 +2935,13 @@ begin
         )
     end
 
-    function comparative_pdf(samples_by_run, field, bins)
+    function comparative_pdf_edges(samples_by_run, field, bins)
         combined = vcat([finite_values(getfield(samples_by_run[label], field))
             for label in comparison_run_labels]...)
-        isempty(combined) && return Dict{String, Any}()
+        isempty(combined) && error("No finite samples are available for $(field).")
         lo, hi = quantile(combined, (0.001, 0.999))
         lo == hi && ((lo, hi) = (lo - 0.5, hi + 0.5))
-        edges = range(lo, hi; length = Int(bins) + 1)
-        Dict(label => density_pdf(getfield(samples_by_run[label], field),
-                samples_by_run[label].weights, edges)
-            for label in comparison_run_labels)
+        collect(range(lo, hi; length = Int(bins) + 1))
     end
 
     number_density_cells = number_density(cube.rho)
@@ -2677,12 +2952,76 @@ begin
     logn = vec(safe_log10.(number_density_cells))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
-    comparative_pdf_samples = Dict(label => cube_pdf_samples(comparison_cube(label))
-        for label in comparison_run_labels)
-    density_pdfs = comparative_pdf(comparative_pdf_samples, :density, nbins)
-    magnetic_pdfs = comparative_pdf(comparative_pdf_samples, :magnetic, nbins)
-    velocity_pdfs = comparative_pdf(comparative_pdf_samples, :velocity, nbins)
-    normalized_B_pdfs = comparative_pdf(comparative_pdf_samples, :normalized_B, nbins)
+    pdf_reference_samples =
+        Dict(label => cube_pdf_samples(comparison_cube(label))
+            for label in comparison_run_labels)
+    pdf_edges = (
+        density = comparative_pdf_edges(
+            pdf_reference_samples, :density, nbins),
+        magnetic = comparative_pdf_edges(
+            pdf_reference_samples, :magnetic, nbins),
+        velocity = comparative_pdf_edges(
+            pdf_reference_samples, :velocity, nbins),
+        normalized_B = comparative_pdf_edges(
+            pdf_reference_samples, :normalized_B, nbins),
+    )
+
+    function snapshot_pdf_products(path)
+        cached_scientific_product((
+            :snapshot_pdfs_v2,
+            cube_signature(path),
+            Tuple(Tuple(getfield(pdf_edges, field))
+                for field in (:density, :magnetic, :velocity, :normalized_B)),
+            Float64(mean_molecular_weight),
+            String(pdf_weighting),
+        )) do
+            samples = cube_pdf_samples(load_cube(path))
+            (
+                density = density_pdf(
+                    samples.density, samples.weights, pdf_edges.density),
+                magnetic = density_pdf(
+                    samples.magnetic, samples.weights, pdf_edges.magnetic),
+                velocity = density_pdf(
+                    samples.velocity, samples.weights, pdf_edges.velocity),
+                normalized_B = density_pdf(
+                    samples.normalized_B,
+                    samples.weights,
+                    pdf_edges.normalized_B,
+                ),
+            )
+        end
+    end
+
+    pdf_snapshots_by_run = Dict(
+        label => snapshot_pdf_products.(comparison_snapshot_paths[label])
+        for label in comparison_run_labels
+    )
+
+    function aggregate_snapshot_pdfs(products, field)
+        curves = getfield.(products, field)
+        logx = first(first(curves))
+        band = snapshot_curve_band(last.(curves))
+        (; logx, band...)
+    end
+
+    pdf_products = (
+        density = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :density)
+            for label in comparison_run_labels),
+        magnetic = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :magnetic)
+            for label in comparison_run_labels),
+        velocity = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :velocity)
+            for label in comparison_run_labels),
+        normalized_B = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :normalized_B)
+            for label in comparison_run_labels),
+    )
+    density_pdfs = pdf_products.density
+    magnetic_pdfs = pdf_products.magnetic
+    velocity_pdfs = pdf_products.velocity
+    normalized_B_pdfs = pdf_products.normalized_B
 end
 
 # ╔═╡ 1e0e6c0e-1ae0-40a1-a6f8-9c18fae91961
@@ -2705,17 +3044,23 @@ begin
                 xticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), xminorticksvisible = true)
             for label in comparison_run_labels
-                logx, probability = spec.pdfs[label]
-                stairs!(ax, 10.0 .^ logx, probability;
+                product = spec.pdfs[label]
+                x = 10.0 .^ product.logx
+                valid_band = isfinite.(product.lower) .&
+                    isfinite.(product.upper)
+                band!(ax, x[valid_band], product.lower[valid_band],
+                    product.upper[valid_band];
+                    color = (run_colors[label], 0.16))
+                stairs!(ax, x, product.median;
                     color = run_colors[label], linewidth = 2.5, step = :center,
-                    label = legend_run_label(label))
+                    label = ensemble_legend_label(label))
             end
             ylims!(ax, low = 0)
         end
         Legend(fig_pdf[2, 1:length(pdf_specs)],
             [LineElement(color = run_colors[label], linewidth = 2.5)
                 for label in comparison_run_labels],
-            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            ensemble_legend_label.(comparison_run_labels), L"\mathrm{Simulation}";
             orientation = :horizontal, tellheight = true, framevisible = false)
     end
     display_pdfs ? fig_pdf : nothing
@@ -2784,14 +3129,20 @@ begin
         )
     end
 
-    phase_data_by_run = Dict(label => begin
-        local_cube = comparison_cube(label)
-        local_logn = vec(safe_log10.(number_density(local_cube.rho)))
-        local_logpk = vec(safe_log10.(local_cube.P ./ K_B_CGS))
-        local_weights = pdf_weighting == "mass" ?
-            vec(Float64.(local_cube.rho)) : ones(length(local_cube.rho))
-        phase_histogram(local_logn, local_logpk, local_weights, phase_bins)
-    end for label in comparison_run_labels)
+    phase_data_by_run = Dict(label => cached_scientific_product((
+            :phase_diagram,
+            cube_signature(run_files[label][comparison_snapshot_indices[label]]),
+            Float64(mean_molecular_weight),
+            String(pdf_weighting),
+            Int(phase_bins),
+        )) do
+            local_cube = comparison_cube(label)
+            local_logn = vec(safe_log10.(number_density(local_cube.rho)))
+            local_logpk = vec(safe_log10.(local_cube.P ./ K_B_CGS))
+            local_weights = pdf_weighting == "mass" ?
+                vec(Float64.(local_cube.rho)) : ones(length(local_cube.rho))
+            phase_histogram(local_logn, local_logpk, local_weights, phase_bins)
+        end for label in comparison_run_labels)
     phase_equilibrium = koyama_inutsuka_equilibrium()
 end
 
@@ -3666,10 +4017,13 @@ begin
             axhist = latex_axis(fig_logB[1, logB_column],
                 xlabel = L"\log_{10}(B/\langle B\rangle)", ylabel = L"\mathcal{P}")
             for label in comparison_run_labels
-                logB_ratio_x, logB_ratio_p = normalized_B_pdfs[label]
-                lines!(axhist, logB_ratio_x, logB_ratio_p;
+                product = normalized_B_pdfs[label]
+                valid = isfinite.(product.lower) .& isfinite.(product.upper)
+                band!(axhist, product.logx[valid], product.lower[valid],
+                    product.upper[valid]; color = (run_colors[label], 0.16))
+                lines!(axhist, product.logx, product.median;
                     color = run_colors[label], linewidth = 2.5,
-                    label = legend_run_label(label))
+                    label = ensemble_legend_label(label))
             end
             axislegend(axhist; position = :rt, framevisible = false)
         end
@@ -3749,37 +4103,120 @@ begin
         (slope = slope, intercept = ymean - slope * xmean)
     end
 
-    bn_samples_by_run = Dict(label => magnetic_density_samples(comparison_cube(label))
-        for label in comparison_run_labels)
-    all_bn_logn = vcat([bn_samples_by_run[label].logn for label in comparison_run_labels]...)
-    all_bn_logB = vcat([bn_samples_by_run[label].logB for label in comparison_run_labels]...)
-    bn_nlo, bn_nhi = quantile(all_bn_logn, (0.001, 0.999))
-    bn_Blo, bn_Bhi = quantile(all_bn_logB, (0.001, 0.999))
-    if !(bn_nhi > bn_nlo)
-        bn_nlo, bn_nhi = bn_nlo - 0.5, bn_nhi + 0.5
-    end
-    if !(bn_Bhi > bn_Blo)
-        bn_Blo, bn_Bhi = bn_Blo - 0.5, bn_Bhi + 0.5
-    end
-    bn_logn_edges = collect(range(bn_nlo, bn_nhi; length = Int(nbins) + 1))
-    bn_logB_edges = collect(range(bn_Blo, bn_Bhi; length = Int(nbins) + 1))
-    bn_profiles = Dict(label => binned_magnetic_density(
-            bn_samples_by_run[label], bn_logn_edges)
-        for label in comparison_run_labels)
-    bn_fits = Dict(label => magnetic_density_fit(
-            bn_profiles[label], Float64(bn_fit_min_density))
-        for label in comparison_run_labels)
+    bn_reference_samples =
+        Dict(label => magnetic_density_samples(comparison_cube(label))
+            for label in comparison_run_labels)
+    bn_all_logn = vcat([bn_reference_samples[label].logn
+        for label in comparison_run_labels]...)
+    bn_all_logB = vcat([bn_reference_samples[label].logB
+        for label in comparison_run_labels]...)
+    bn_nlo, bn_nhi = quantile(bn_all_logn, (0.001, 0.999))
+    bn_Blo, bn_Bhi = quantile(bn_all_logB, (0.001, 0.999))
+    !(bn_nhi > bn_nlo) &&
+        ((bn_nlo, bn_nhi) = (bn_nlo - 0.5, bn_nhi + 0.5))
+    !(bn_Bhi > bn_Blo) &&
+        ((bn_Blo, bn_Bhi) = (bn_Blo - 0.5, bn_Bhi + 0.5))
+    bn_common_logn_edges =
+        collect(range(bn_nlo, bn_nhi; length = Int(nbins) + 1))
+    bn_common_logB_edges =
+        collect(range(bn_Blo, bn_Bhi; length = Int(nbins) + 1))
 
-    active_bn_samples = haskey(bn_samples_by_run, selected_run) ?
-        bn_samples_by_run[selected_run] : magnetic_density_samples(cube)
-    active_bn_histogram = fit(Histogram,
-        (clamp.(active_bn_samples.logn, bn_nlo, prevfloat(bn_nhi)),
-            clamp.(active_bn_samples.logB, bn_Blo, prevfloat(bn_Bhi))),
-        (bn_logn_edges, bn_logB_edges))
-    bn_histogram_total = sum(active_bn_histogram.weights)
-    bn_log_probability = map(active_bn_histogram.weights) do weight
-        weight > 0 && bn_histogram_total > 0 ? log10(weight / bn_histogram_total) : NaN
+    bn_products = cached_scientific_product((
+        :magnetic_density_relation_ensemble,
+        Tuple((label, Tuple(cube_signature(path)
+            for path in comparison_snapshot_paths[label]))
+            for label in comparison_run_labels),
+        Float64(mean_molecular_weight),
+        Tuple(bn_common_logn_edges),
+        Tuple(bn_common_logB_edges),
+        Float64(bn_fit_min_density),
+        String(selected_run),
+    )) do
+        snapshot_profiles = Dict{String, Vector{Any}}()
+        snapshot_fits = Dict{String, Vector{Any}}()
+        for label in comparison_run_labels
+            profiles = Any[]
+            fits = Any[]
+            for path in comparison_snapshot_paths[label]
+                result = cached_scientific_product((
+                    :snapshot_magnetic_density_profile,
+                    cube_signature(path),
+                    Float64(mean_molecular_weight),
+                    Tuple(bn_common_logn_edges),
+                    Float64(bn_fit_min_density),
+                )) do
+                    local_cube = path ==
+                        run_files[label][comparison_snapshot_indices[label]] ?
+                        comparison_cube(label) : load_cube(path)
+                    profile = binned_magnetic_density(
+                        magnetic_density_samples(local_cube),
+                        bn_common_logn_edges,
+                    )
+                    (profile = profile, fit = magnetic_density_fit(
+                        profile, Float64(bn_fit_min_density)))
+                end
+                push!(profiles, result.profile)
+                push!(fits, result.fit)
+            end
+            snapshot_profiles[label] = profiles
+            snapshot_fits[label] = fits
+        end
+        profiles = Dict{String, Any}()
+        fits = Dict{String, Any}()
+        for label in comparison_run_labels
+            local_profiles = snapshot_profiles[label]
+            band = snapshot_curve_band(
+                [profile.medians for profile in local_profiles])
+            count_columns = [
+                Float64[profile.counts[index]
+                    for profile in local_profiles]
+                for index in eachindex(first(local_profiles).counts)
+            ]
+            cell_counts = [isempty(column) ? 0 :
+                round(Int, median(column)) for column in count_columns]
+            profiles[label] = (
+                centers = first(local_profiles).centers,
+                medians = band.median,
+                lower = band.lower,
+                upper = band.upper,
+                counts = cell_counts,
+                snapshot_counts = band.counts,
+            )
+            aggregate_fit = magnetic_density_fit(
+                profiles[label], Float64(bn_fit_min_density))
+            slopes = filter(isfinite,
+                Float64[fit.slope for fit in snapshot_fits[label]])
+            slope_lower, slope_upper = isempty(slopes) ? (NaN, NaN) :
+                quantile(slopes, (0.16, 0.84))
+            fits[label] = merge(aggregate_fit, (; slope_lower, slope_upper))
+        end
+        active_samples = bn_reference_samples[selected_run]
+        histogram = fit(
+            Histogram,
+            (
+                clamp.(active_samples.logn, bn_nlo, prevfloat(bn_nhi)),
+                clamp.(active_samples.logB, bn_Blo, prevfloat(bn_Bhi)),
+            ),
+            (bn_common_logn_edges, bn_common_logB_edges),
+        )
+        histogram_total = sum(histogram.weights)
+        log_probability = map(histogram.weights) do weight
+            weight > 0 && histogram_total > 0 ?
+                log10(weight / histogram_total) : NaN
+        end
+        (;
+            logn_edges = bn_common_logn_edges,
+            logB_edges = bn_common_logB_edges,
+            profiles,
+            fits,
+            log_probability,
+        )
     end
+    bn_logn_edges = bn_products.logn_edges
+    bn_logB_edges = bn_products.logB_edges
+    bn_profiles = bn_products.profiles
+    bn_fits = bn_products.fits
+    bn_log_probability = bn_products.log_probability
     nothing
 end
 
@@ -3825,9 +4262,20 @@ begin
                     run_label_latex_source(plain_legend_run_label(label)),
                     raw";\;\kappa=",
                     @sprintf("%.3f", fit_result.slope),
+                    raw"^{+",
+                    @sprintf("%.3f", max(
+                        fit_result.slope_upper - fit_result.slope, 0.0)),
+                    raw"}_{-",
+                    @sprintf("%.3f", max(
+                        fit_result.slope - fit_result.slope_lower, 0.0)),
+                    raw"}",
                 ))
         end
     end
+    xlims!(bn_joint_axis, 10.0^bn_logn_edges[1], 10.0^bn_logn_edges[end])
+    ylims!(bn_joint_axis, 10.0^bn_logB_edges[1], 10.0^bn_logB_edges[end])
+    xlims!(bn_relation_axis, 10.0^bn_logn_edges[1], 10.0^bn_logn_edges[end])
+    ylims!(bn_relation_axis, 10.0^bn_logB_edges[1], 10.0^bn_logB_edges[end])
     axislegend(bn_relation_axis; position = :lt, framevisible = false, labelsize = 14)
     stable_pluto_figure(display_bn_relation, fig_bn)
 end
@@ -3839,7 +4287,30 @@ begin
             relative_angles,
             density_bin_count;
             angle_bin_count = 18,
+            bootstrap_replicates = 200,
         )
+        function orientation_parameter_with_bootstrap(local_angles, seed)
+            signs = Float64[
+                angle < 22.5 ? 1.0 : angle > 67.5 ? -1.0 : NaN
+                for angle in local_angles
+            ]
+            filter!(isfinite, signs)
+            isempty(signs) && return (NaN, NaN, NaN)
+            xi = mean(signs)
+            bootstrap_replicates <= 0 && return (xi, NaN, NaN)
+            if length(signs) > 4000
+                indices = round.(Int, range(1, length(signs); length = 4000))
+                signs = signs[indices]
+            end
+            rng = MersenneTwister(seed)
+            estimates = Vector{Float64}(undef, bootstrap_replicates)
+            for replicate in eachindex(estimates)
+                estimates[replicate] =
+                    mean(signs[rand(rng, 1:length(signs), length(signs))])
+            end
+            lower, upper = quantile(estimates, (0.16, 0.84))
+            (xi, lower, upper)
+        end
         valid = isfinite.(density_coordinates) .& isfinite.(relative_angles)
         densities = Float64.(density_coordinates[valid])
         angles = Float64.(relative_angles[valid])
@@ -3851,6 +4322,8 @@ begin
                 histograms = zeros(Float64, angle_bin_count, density_bin_count),
                 density_centers = fill(NaN, density_bin_count),
                 shape = fill(NaN, density_bin_count),
+                bootstrap_lower = fill(NaN, density_bin_count),
+                bootstrap_upper = fill(NaN, density_bin_count),
                 counts = zeros(Int, density_bin_count),
             )
         end
@@ -3860,6 +4333,8 @@ begin
         bin_count = length(density_edges) - 1
         histograms = zeros(Float64, length(angle_centers), bin_count)
         shape = fill(NaN, bin_count)
+        bootstrap_lower = fill(NaN, bin_count)
+        bootstrap_upper = fill(NaN, bin_count)
         density_centers = fill(NaN, bin_count)
         counts = zeros(Int, bin_count)
         for bin in 1:bin_count
@@ -3872,11 +4347,45 @@ begin
             density_centers[bin] = median(densities[members])
             histogram = fit(Histogram, local_angles, angle_edges).weights
             histograms[:, bin] .= histogram ./ max(sum(histogram), 1)
-            central = count(angle -> angle < 22.5, local_angles)
-            edge = count(angle -> angle > 67.5, local_angles)
-            shape[bin] = (central - edge) / max(central + edge, 1)
+            shape[bin], bootstrap_lower[bin], bootstrap_upper[bin] =
+                orientation_parameter_with_bootstrap(
+                    local_angles,
+                    hash((bin, length(local_angles)), UInt(0x48524f)),
+                )
         end
-        (; angle_centers, histograms, density_centers, shape, counts)
+        (; angle_centers, histograms, density_centers, shape,
+            bootstrap_lower, bootstrap_upper, counts)
+    end
+
+    function aggregate_hro_products(products)
+        density_band = snapshot_curve_band(
+            [product.density_centers for product in products])
+        xi_band = snapshot_curve_band([product.shape for product in products])
+        bootstrap_lower_band = snapshot_curve_band(
+            [product.bootstrap_lower for product in products])
+        bootstrap_upper_band = snapshot_curve_band(
+            [product.bootstrap_upper for product in products])
+        count_band = snapshot_curve_band(
+            [Float64.(product.counts) for product in products])
+        histogram_median = mapslices(
+            median,
+            cat([product.histograms for product in products]...; dims = 3);
+            dims = 3,
+        )[:, :, 1]
+        (
+            angle_centers = first(products).angle_centers,
+            histograms = histogram_median,
+            density_centers = density_band.median,
+            shape = xi_band.median,
+            lower = xi_band.lower,
+            upper = xi_band.upper,
+            bootstrap_lower = bootstrap_lower_band.median,
+            bootstrap_upper = bootstrap_upper_band.median,
+            counts = count_band.median,
+            count_lower = count_band.lower,
+            count_upper = count_band.upper,
+            snapshot_counts = xi_band.counts,
+        )
     end
 
     function periodic_gaussian_smooth_2d(image, fwhm_pixels)
@@ -3930,13 +4439,25 @@ begin
         )
     end
 
-    hro_by_run = Dict(label => hro_products(
-            comparison_cube(label), Int(hro_density_bin_count))
-        for label in comparison_run_labels)
+    hro_by_run = Dict(label => aggregate_hro_products([
+            cached_scientific_product((
+                :hro_3d_snapshot,
+                cube_signature(path),
+                Float64(mean_molecular_weight),
+                Int(hro_density_bin_count),
+                200,
+            )) do
+                local_cube = path ==
+                    run_files[label][comparison_snapshot_indices[label]] ?
+                    comparison_cube(label) : load_cube(path)
+                hro_products(local_cube, Int(hro_density_bin_count))
+            end
+            for path in comparison_snapshot_paths[label]
+        ]) for label in comparison_run_labels)
     active_hro = haskey(hro_by_run, selected_run) ? hro_by_run[selected_run] :
         hro_products(cube, Int(hro_density_bin_count))
 
-    fig_hro = Figure(size = (1100, 470))
+    fig_hro = Figure(size = (1450, 470))
     hro_hist_axis = latex_axis(fig_hro[1, 1],
         xlabel = L"\phi_{B,\,\mathrm{structure}}\;[{}^\circ]",
         ylabel = L"\mathcal{P}(\phi)")
@@ -3954,20 +4475,60 @@ begin
     axislegend(hro_hist_axis; position = :ct, framevisible = false)
 
     hro_shape_axis = latex_axis(fig_hro[1, 2],
-        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"\zeta_{\mathrm{HRO}}",
+        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"\xi_{\mathrm{HRO}}",
         xscale = log10, xticks = DECADE_TICKS,
         xminorticks = IntervalsBetween(9), xminorticksvisible = true)
     hlines!(hro_shape_axis, [0.0]; color = (:gray45, 0.65), linestyle = :dash)
     for label in comparison_run_labels
         product = hro_by_run[label]
         valid = isfinite.(product.density_centers) .& isfinite.(product.shape)
+        band!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
+            product.lower[valid], product.upper[valid];
+            color = (run_colors[label], 0.16))
         lines!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
             product.shape[valid]; color = run_colors[label], linewidth = 2.8,
-            label = legend_run_label(label))
+            label = ensemble_legend_label(label))
         scatter!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
             product.shape[valid]; color = run_colors[label], markersize = 6)
+        bootstrap_valid = valid .& isfinite.(product.bootstrap_lower) .&
+            isfinite.(product.bootstrap_upper)
+        errorbars!(hro_shape_axis,
+            10.0 .^ product.density_centers[bootstrap_valid],
+            product.shape[bootstrap_valid],
+            max.(product.shape[bootstrap_valid] .-
+                product.bootstrap_lower[bootstrap_valid], 0.0),
+            max.(product.bootstrap_upper[bootstrap_valid] .-
+                product.shape[bootstrap_valid], 0.0);
+            color = run_colors[label], whiskerwidth = 7)
     end
     axislegend(hro_shape_axis; position = :lb, framevisible = false)
+
+    hro_count_axis = latex_axis(fig_hro[1, 3],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]",
+        ylabel = L"N_{\mathrm{cells}}",
+        xscale = log10, yscale = log10,
+        xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+        xminorticksvisible = true, yminorticksvisible = true)
+    for label in comparison_run_labels
+        product = hro_by_run[label]
+        valid = isfinite.(product.density_centers) .&
+            isfinite.(product.counts) .& (product.counts .> 0)
+        band!(hro_count_axis, 10.0 .^ product.density_centers[valid],
+            max.(product.count_lower[valid], 1.0),
+            max.(product.count_upper[valid], 1.0);
+            color = (run_colors[label], 0.16))
+        lines!(hro_count_axis, 10.0 .^ product.density_centers[valid],
+            product.counts[valid]; color = run_colors[label], linewidth = 2.5)
+    end
+    hro_count_values = vcat([
+        Float64.(filter(value -> isfinite(value) && value > 0,
+            hro_by_run[label].counts))
+        for label in comparison_run_labels
+    ]...)
+    hro_count_limits = enclosing_decade_limits(hro_count_values)
+    isnothing(hro_count_limits) ||
+        ylims!(hro_count_axis, hro_count_limits...)
     stable_pluto_figure(display_hro, fig_hro)
 end
 
@@ -4048,18 +4609,53 @@ begin
         ))
     end
 
-    hro_2d_by_run = Dict(
-        label => hro_2d_products(
-            comparison_cube(label),
-            los_dim,
-            sky_dims,
-            Int(hro_2d_density_bin_count);
-            smoothing_fwhm = Float64(hro_2d_smoothing_fwhm_pix),
-            gradient_percentile = Float64(hro_2d_gradient_percentile),
-            logarithmic_column = hro_2d_logarithmic_column,
-        )
-        for label in comparison_run_labels
-    )
+    hro_plane_dimensions =
+        Dict(1 => (2, 3), 2 => (1, 3), 3 => (1, 2))
+    hro_2d_all_los = Dict{Tuple{String, Int}, Any}()
+    for label in comparison_run_labels, local_los in 1:3
+        products = [
+            cached_scientific_product((
+                :hro_2d_snapshot,
+                cube_signature(path),
+                Float64(mean_molecular_weight),
+                local_los,
+                Int(hro_2d_density_bin_count),
+                Float64(hro_2d_smoothing_fwhm_pix),
+                Float64(hro_2d_gradient_percentile),
+                Bool(hro_2d_logarithmic_column),
+                200,
+            )) do
+                local_cube = path ==
+                    run_files[label][comparison_snapshot_indices[label]] ?
+                    comparison_cube(label) : load_cube(path)
+                product = hro_2d_products(
+                    local_cube,
+                    local_los,
+                    hro_plane_dimensions[local_los],
+                    Int(hro_2d_density_bin_count);
+                    smoothing_fwhm = Float64(hro_2d_smoothing_fwhm_pix),
+                    gradient_percentile =
+                        Float64(hro_2d_gradient_percentile),
+                    logarithmic_column = hro_2d_logarithmic_column,
+                )
+                (
+                    angle_centers = product.angle_centers,
+                    histograms = product.histograms,
+                    density_centers = product.density_centers,
+                    shape = product.shape,
+                    bootstrap_lower = product.bootstrap_lower,
+                    bootstrap_upper = product.bootstrap_upper,
+                    counts = product.counts,
+                )
+            end
+            for path in comparison_snapshot_paths[label]
+        ]
+        hro_2d_all_los[(label, local_los)] =
+            aggregate_hro_products(products)
+    end
+    hro_2d_by_run =
+        Dict(label => hro_2d_all_los[(label, los_dim)]
+            for label in comparison_run_labels)
     active_hro_2d = haskey(hro_2d_by_run, selected_run) ?
         hro_2d_by_run[selected_run] :
         hro_2d_products(
@@ -4072,7 +4668,7 @@ begin
             logarithmic_column = hro_2d_logarithmic_column,
         )
 
-    fig_hro_2d = Figure(size = (1100, 500))
+    fig_hro_2d = Figure(size = (1450, 1350))
     hro_2d_hist_axis = latex_axis(
         fig_hro_2d[1, 1];
         xlabel =
@@ -4112,7 +4708,7 @@ begin
     hro_2d_shape_axis = latex_axis(
         fig_hro_2d[1, 2];
         xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
-        ylabel = L"\zeta_{\mathrm{HRO}}^{\mathrm{2D}}",
+        ylabel = L"\xi_{\mathrm{HRO}}^{\mathrm{2D}}",
         xscale = log10,
         xticks = DECADE_TICKS,
         xminorticks = IntervalsBetween(9),
@@ -4129,13 +4725,20 @@ begin
         product = hro_2d_by_run[label]
         valid =
             isfinite.(product.density_centers) .& isfinite.(product.shape)
+        band!(
+            hro_2d_shape_axis,
+            10.0 .^ product.density_centers[valid],
+            product.lower[valid],
+            product.upper[valid];
+            color = (run_colors[label], 0.16),
+        )
         lines!(
             hro_2d_shape_axis,
             10.0 .^ product.density_centers[valid],
             product.shape[valid];
             color = run_colors[label],
             linewidth = 2.8,
-            label = legend_run_label(label),
+            label = ensemble_legend_label(label),
         )
         scatter!(
             hro_2d_shape_axis,
@@ -4151,6 +4754,73 @@ begin
         framevisible = false,
         labelsize = 14,
     )
+    los_symbols = ("x", "y", "z")
+    for local_los in 1:3
+        xi_axis = latex_axis(
+            fig_hro_2d[local_los + 1, 1];
+            xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
+            ylabel = L"\xi_{\mathrm{HRO}}^{\mathrm{2D}}",
+            xscale = log10,
+            xticks = DECADE_TICKS,
+            xminorticks = IntervalsBetween(9),
+            xminorticksvisible = true,
+            title = latexstring(
+                raw"\mathrm{Line\ of\ sight}\;", los_symbols[local_los]),
+        )
+        count_axis = latex_axis(
+            fig_hro_2d[local_los + 1, 2];
+            xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
+            ylabel = L"N_{\mathrm{pixels}}",
+            xscale = log10,
+            yscale = log10,
+            xticks = DECADE_TICKS,
+            yticks = DECADE_TICKS,
+            xminorticks = IntervalsBetween(9),
+            yminorticks = IntervalsBetween(9),
+            xminorticksvisible = true,
+            yminorticksvisible = true,
+        )
+        hlines!(xi_axis, [0.0]; color = (:gray45, 0.65),
+            linestyle = :dash)
+        for label in comparison_run_labels
+            product = hro_2d_all_los[(label, local_los)]
+            valid = isfinite.(product.density_centers) .&
+                isfinite.(product.shape)
+            x = 10.0 .^ product.density_centers[valid]
+            band!(xi_axis, x, product.lower[valid], product.upper[valid];
+                color = (run_colors[label], 0.16))
+            lines!(xi_axis, x, product.shape[valid];
+                color = run_colors[label], linewidth = 2.5)
+            bootstrap_valid = valid .&
+                isfinite.(product.bootstrap_lower) .&
+                isfinite.(product.bootstrap_upper)
+            errorbars!(xi_axis,
+                10.0 .^ product.density_centers[bootstrap_valid],
+                product.shape[bootstrap_valid],
+                max.(product.shape[bootstrap_valid] .-
+                    product.bootstrap_lower[bootstrap_valid], 0.0),
+                max.(product.bootstrap_upper[bootstrap_valid] .-
+                    product.shape[bootstrap_valid], 0.0);
+                color = run_colors[label], whiskerwidth = 6)
+            count_valid = isfinite.(product.density_centers) .&
+                isfinite.(product.counts) .& (product.counts .> 0)
+            count_x = 10.0 .^ product.density_centers[count_valid]
+            band!(count_axis, count_x,
+                max.(product.count_lower[count_valid], 1.0),
+                max.(product.count_upper[count_valid], 1.0);
+                color = (run_colors[label], 0.16))
+            lines!(count_axis, count_x, product.counts[count_valid];
+                color = run_colors[label], linewidth = 2.5)
+        end
+        los_count_values = vcat([
+            Float64.(filter(value -> isfinite(value) && value > 0,
+                hro_2d_all_los[(label, local_los)].counts))
+            for label in comparison_run_labels
+        ]...)
+        los_count_limits = enclosing_decade_limits(los_count_values)
+        isnothing(los_count_limits) ||
+            ylims!(count_axis, los_count_limits...)
+    end
     stable_pluto_figure(display_hro_2d, fig_hro_2d)
 end
 
@@ -4196,11 +4866,20 @@ begin
             ngood = length(angles))
     end
 
-    hog_by_run = Dict(label => hog_products(comparison_cube(label), los_dim, sky_dims;
-            smoothing_fwhm = Float64(hog_smoothing_fwhm_pix),
-            gradient_percentile = Float64(hog_gradient_percentile),
-            logarithmic_maps = hog_logarithmic_maps)
-        for label in comparison_run_labels)
+    hog_by_run = Dict(label => cached_scientific_product((
+            :hog,
+            cube_signature(run_files[label][comparison_snapshot_indices[label]]),
+            Float64(mean_molecular_weight),
+            los_dim,
+            Float64(hog_smoothing_fwhm_pix),
+            Float64(hog_gradient_percentile),
+            Bool(hog_logarithmic_maps),
+        )) do
+            hog_products(comparison_cube(label), los_dim, sky_dims;
+                smoothing_fwhm = Float64(hog_smoothing_fwhm_pix),
+                gradient_percentile = Float64(hog_gradient_percentile),
+                logarithmic_maps = hog_logarithmic_maps)
+        end for label in comparison_run_labels)
 
     fig_hog = Figure(size = (1100, 470))
     hog_hist_axis = latex_axis(fig_hog[1, 1],
@@ -4327,13 +5006,28 @@ begin
     for label in comparison_run_labels
         for snapshot_index in valid_energy_snapshots
             snapshot_index <= length(run_files[label]) || continue
-            # Build and retain only the one-dimensional profile. The cube from
-            # this iteration becomes collectible before the next file is read.
-            local_cube = label == selected_run && snapshot_index == selected_snapshot ?
-                cube : load_cube(run_files[label][snapshot_index])
-            local_samples = energy_density_samples(local_cube)
-            energy_profiles[(label, snapshot_index)] = energy_ratios_by_density(
-                local_samples, density_edges, gamma)
+            snapshot_path = run_files[label][snapshot_index]
+            energy_profiles[(label, snapshot_index)] =
+                cached_scientific_product((
+                    :energy_density_profile,
+                    cube_signature(snapshot_path),
+                    Float64(mean_molecular_weight),
+                    Tuple(Float64.(density_edges)),
+                    Float64(gamma),
+                )) do
+                    # Retain only the one-dimensional profile. The cube becomes
+                    # collectible before the next cache miss is processed.
+                    local_cube =
+                        label == selected_run &&
+                            snapshot_index == selected_snapshot ?
+                        cube : load_cube(snapshot_path)
+                    local_samples = energy_density_samples(local_cube)
+                    energy_ratios_by_density(
+                        local_samples,
+                        density_edges,
+                        gamma,
+                    )
+                end
         end
     end
 end
@@ -4469,24 +5163,47 @@ in $\mathrm{Myr}^{-2}$. Both maps use the active run, snapshot, and line of sigh
 # ╔═╡ 3190e127-1d53-49f1-bfab-b9645910c2c6
 begin
     function isotropic_power_spectrum(components, box_length_pc; prefactor = 1.0)
-        Fpower = zeros(Float64, size(first(components)))
-        for component in components
-            replacement = finite_mean(component; default = 0.0)
-            finite_component = ifelse.(isfinite.(component), Float64.(component), replacement)
-            Fpower .+= abs2.(fft(finite_component))
+        n = size(first(components))
+        input_buffer = Array{Float64}(undef, n)
+        plan_key = (:rfft, n, Float64, FFTW.get_num_threads())
+        transform_plan = lock(CACHE_LOCK) do
+            get!(RFFT_PLAN_CACHE, plan_key) do
+                plan_rfft(input_buffer; flags = FFTW.ESTIMATE)
+            end
         end
-        n = size(Fpower)
-        ntot = length(Fpower)
+        transformed = nothing
+        Fpower = nothing
+        for (component_index, component) in enumerate(components)
+            replacement = finite_mean(component; default = 0.0)
+            @. input_buffer = ifelse(
+                isfinite(component),
+                Float64(component),
+                replacement,
+            )
+            if component_index == 1
+                transformed = transform_plan * input_buffer
+                Fpower = abs2.(transformed)
+            else
+                mul!(transformed, transform_plan, input_buffer)
+                @. Fpower += abs2(transformed)
+            end
+        end
+        ntot = prod(n)
         kmax = floor(Int, sqrt(sum((ni ÷ 2)^2 for ni in n)))
         shell_power = zeros(kmax + 1)
         shell_count = zeros(Int, kmax + 1)
         fft_mode(i, ni) = (i - 1 <= ni ÷ 2) ? i - 1 : i - 1 - ni
         for I in CartesianIndices(Fpower)
-            kmag = sqrt(sum(fft_mode(I[d], n[d])^2 for d in 1:3))
+            k1 = I[1] - 1
+            kmag = sqrt(k1^2 + sum(
+                fft_mode(I[d], n[d])^2 for d in 2:3))
             shell = round(Int, kmag) + 1
             shell <= length(shell_power) || continue
-            shell_power[shell] += prefactor * Fpower[I] / ntot^2
-            shell_count[shell] += 1
+            hermitian_weight =
+                k1 == 0 || (iseven(n[1]) && k1 == n[1] ÷ 2) ? 1 : 2
+            shell_power[shell] +=
+                hermitian_weight * prefactor * Fpower[I] / ntot^2
+            shell_count[shell] += hermitian_weight
         end
         modes = collect(0:kmax)
         valid = (modes .> 0) .& (shell_count .> 0) .& (shell_power .> 0)
@@ -4494,17 +5211,52 @@ begin
         modes[valid] .* dk, shell_power[valid] ./ dk
     end
 
-    spectrum_box_length_pc = cbrt(prod(cube.L))
+    function all_spectrum_products(local_cube)
+        local_density = number_density(local_cube.rho)
+        local_turbulence = turbulent_velocity(local_cube)
+        local_vorticity = vorticity(local_cube)
+        local_box_length_pc = cbrt(prod(local_cube.L))
+        local_krho, local_Prho = isotropic_power_spectrum(
+            (local_density,), local_box_length_pc)
+        local_kv, local_Pv = isotropic_power_spectrum(
+            (local_turbulence.dvx, local_turbulence.dvy,
+                local_turbulence.dvz), local_box_length_pc;
+            prefactor = 0.5)
+        local_komega, local_Pomega = isotropic_power_spectrum(
+            (local_vorticity.wx, local_vorticity.wy,
+                local_vorticity.wz), local_box_length_pc)
+        local_kb, local_Pb = isotropic_power_spectrum(
+            (local_cube.bx, local_cube.by, local_cube.bz),
+            local_box_length_pc;
+            prefactor = 0.5GAUSS_TO_MICROGAUSS^2)
+        (
+            box_length_pc = local_box_length_pc,
+            krho = local_krho,
+            Prho = local_Prho,
+            kv = local_kv,
+            Pv = local_Pv,
+            komega = local_komega,
+            Pomega = local_Pomega,
+            kb = local_kb,
+            Pb = local_Pb,
+            nyquist = pi / minimum(local_cube.L ./ size(local_cube.rho)),
+        )
+    end
+
+    spectrum_products = cached_scientific_product((
+        :isotropic_power_spectra,
+        cube_signature(selected_path),
+        Float64(mean_molecular_weight),
+    )) do
+        all_spectrum_products(cube)
+    end
+    spectrum_box_length_pc = spectrum_products.box_length_pc
+    krho, Prho = spectrum_products.krho, spectrum_products.Prho
+    kv, Pv = spectrum_products.kv, spectrum_products.Pv
+    komega, Pomega = spectrum_products.komega, spectrum_products.Pomega
+    kb, Pb = spectrum_products.kb, spectrum_products.Pb
     spectrum_dk = 2pi / spectrum_box_length_pc
     spectrum_low_k_limit = 3spectrum_dk
-    krho, Prho = isotropic_power_spectrum((number_density_cells,), spectrum_box_length_pc)
-    kv, Pv = isotropic_power_spectrum((turb.dvx, turb.dvy, turb.dvz), spectrum_box_length_pc; prefactor = 0.5)
-    komega, Pomega = isotropic_power_spectrum((omega.wx, omega.wy, omega.wz), spectrum_box_length_pc)
-    # The shell power is quadratic in the field, so squaring the Gauss-to-microgauss
-    # factor into the prefactor puts E_B in microgauss^2 pc without scaling the
-    # three components into new cube-sized arrays first.
-    kb, Pb = isotropic_power_spectrum((cube.bx, cube.by, cube.bz), spectrum_box_length_pc;
-        prefactor = 0.5GAUSS_TO_MICROGAUSS^2)
     spectrum_maximum_k = maximum(vcat(krho, kv, komega, kb))
     spectrum_k_choices = spectrum_dk:spectrum_dk:spectrum_maximum_k
     spectrum_default_k_min = min(spectrum_low_k_limit, spectrum_maximum_k)
@@ -4569,11 +5321,31 @@ begin
     enstrophy_profiles = Dict{String, Any}()
     enstrophy_mach_by_run = Dict{String, Float64}()
     for label in comparison_run_labels
-        local_cube = comparison_cube(label)
-        enstrophy_profiles[label] = enstrophy_by_density(
-            local_cube, density_edges, enstrophy_density_weighting)
-        comparison_kind == :mach && (enstrophy_mach_by_run[label] =
-            bulk_metrics_from_cube(local_cube, Float64(gamma)).mach)
+        result = cached_scientific_product((
+            :enstrophy_density_profile,
+            cube_signature(run_files[label][comparison_snapshot_indices[label]]),
+            Float64(mean_molecular_weight),
+            Tuple(Float64.(density_edges)),
+            String(enstrophy_density_weighting),
+            comparison_kind == :mach ? Float64(gamma) : nothing,
+        )) do
+            local_cube = comparison_cube(label)
+            (
+                profile = enstrophy_by_density(
+                    local_cube,
+                    density_edges,
+                    enstrophy_density_weighting,
+                ),
+                mach = comparison_kind == :mach ?
+                    bulk_metrics_from_cube(
+                        local_cube,
+                        Float64(gamma),
+                    ).mach : NaN,
+            )
+        end
+        enstrophy_profiles[label] = result.profile
+        comparison_kind == :mach &&
+            (enstrophy_mach_by_run[label] = result.mach)
     end
     function enstrophy_parameter_label(label)
         if comparison_kind == :mach
@@ -4683,27 +5455,49 @@ begin
     kazantsev_reference = show_kazantsev_spectrum ?
         (exponent = 3 / 2, label = L"k^{3/2}") : nothing
 
+    spectrum_ensemble = Dict{String, Vector{Any}}()
+    for label in comparison_run_labels
+        spectrum_ensemble[label] = [
+            cached_scientific_product((
+                :isotropic_power_spectra_snapshot,
+                cube_signature(path),
+                Float64(mean_molecular_weight),
+            )) do
+                local_cube = path ==
+                    run_files[label][comparison_snapshot_indices[label]] ?
+                    comparison_cube(label) : load_cube(path)
+                all_spectrum_products(local_cube)
+            end
+            for path in comparison_snapshot_paths[label]
+        ]
+    end
+
     spectrum_specs = NamedTuple[]
     show_spectrum_density && push!(spectrum_specs,
-        (k = krho, power = Prho, ylabel = L"E_n(k)\;[\mathrm{cm}^{-6}\,\mathrm{pc}]",
-            color = MHD_COLORS[1], reference = kolmogorov_reference))
+        (kfield = :krho, pfield = :Prho,
+            ylabel = L"E_n(k)\;[\mathrm{cm}^{-6}\,\mathrm{pc}]",
+            compensated_ylabel = L"k^{5/3}E_n(k)",
+            compensation = 5 / 3, reference = kolmogorov_reference))
     show_spectrum_velocity && push!(spectrum_specs,
-        (k = kv, power = Pv,
+        (kfield = :kv, pfield = :Pv,
             ylabel = L"E_v(k)\;[(\mathrm{km\,s}^{-1})^2\,\mathrm{pc}]",
-            color = MHD_COLORS[3], reference = kolmogorov_reference))
+            compensated_ylabel = L"k^{5/3}E_v(k)",
+            compensation = 5 / 3, reference = kolmogorov_reference))
     show_spectrum_vorticity && push!(spectrum_specs,
-        (k = komega, power = Pomega,
+        (kfield = :komega, pfield = :Pomega,
             ylabel = L"E_\omega(k)\;[\mathrm{Myr}^{-2}\,\mathrm{pc}]",
-            color = MHD_COLORS[5], reference = kolmogorov_reference))
+            compensated_ylabel = L"k^{5/3}E_\omega(k)",
+            compensation = 5 / 3, reference = kolmogorov_reference))
     show_spectrum_magnetic && push!(spectrum_specs,
-        (k = kb, power = Pb,
+        (kfield = :kb, pfield = :Pb,
             ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
-            color = MHD_COLORS[4], reference = kazantsev_reference))
+            compensated_ylabel = L"k^{-3/2}E_B(k)",
+            compensation = -3 / 2, reference = kazantsev_reference))
     if isempty(spectrum_specs)
         fig_spectra = Figure(size = (900, 180))
         Label(fig_spectra[1, 1], L"\mathrm{Select\ at\ least\ one\ power\ spectrum.}", fontsize = 20)
     else
-        fig_spectra = Figure(size = (400length(spectrum_specs), 390))
+        fig_spectra = Figure(size = (440length(spectrum_specs), 760))
         for (index, spec) in enumerate(spectrum_specs)
             axis = latex_axis(fig_spectra[1, index], xlabel = L"k\;[\mathrm{pc}^{-1}]",
                 ylabel = spec.ylabel, xscale = log10, yscale = log10,
@@ -4711,46 +5505,284 @@ begin
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                 xminorticksvisible = true, yminorticksvisible = true,
                 xminorticksize = 4, yminorticksize = 4)
-            vspan!(axis, spectrum_dk, spectrum_low_k_limit;
-                color = (:gray55, 0.18))
-            vlines!(axis, [spectrum_low_k_limit];
-                color = (:gray35, 0.75), linestyle = :dash, linewidth = 1.3)
-            valid = isfinite.(spec.k) .& isfinite.(spec.power) .&
-                (spec.k .> 0) .& (spec.power .> 0)
-            lines!(axis, spec.k[valid], spec.power[valid]; color = spec.color,
-                linewidth = 2.5, label = L"E(k)")
-            scatter!(axis, spec.k[valid], spec.power[valid]; color = spec.color, markersize = 5)
-            fit_result = power_law_slope(spec.k, spec.power,
-                spectrum_fit_k_min, spectrum_fit_k_max)
-            if isfinite(fit_result.slope)
-                fit_k = 10.0 .^ range(log10(fit_result.lower),
-                    log10(fit_result.upper); length = 100)
-                fit_power = 10.0 .^ (fit_result.intercept .+
-                    fit_result.slope .* log10.(fit_k))
-                if show_spectrum_slopes
-                    vspan!(axis, fit_result.lower, fit_result.upper;
-                        color = (MHD_COLORS[2], 0.08))
-                    lines!(axis, fit_k, fit_power; color = MHD_COLORS[2],
-                        linewidth = 2.5, linestyle = :dash,
-                        label = latexstring(raw"\alpha=", @sprintf("%.3f", fit_result.slope),
-                            raw",\;R^2=", @sprintf("%.3f", fit_result.r2)))
+            compensated_axis = latex_axis(fig_spectra[2, index],
+                xlabel = L"k\;[\mathrm{pc}^{-1}]",
+                ylabel = spec.compensated_ylabel,
+                xscale = log10, yscale = log10,
+                xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9),
+                yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true, yminorticksvisible = true)
+            vspan!(axis, spectrum_fit_k_min, spectrum_fit_k_max;
+                color = (:gray55, 0.10))
+            vspan!(compensated_axis, spectrum_fit_k_min, spectrum_fit_k_max;
+                color = (:gray55, 0.10))
+            spectrum_legend_elements = Any[]
+            spectrum_legend_labels = LaTeXString[]
+            for label in comparison_run_labels
+                products = filter(
+                    product -> !isempty(getfield(product, spec.kfield)) &&
+                        !isempty(getfield(product, spec.pfield)),
+                    spectrum_ensemble[label],
+                )
+                isempty(products) && continue
+                common_length = minimum(length(
+                    getfield(product, spec.kfield)) for product in products)
+                common_length > 0 || continue
+                k = snapshot_curve_band([
+                    Float64.(getfield(product, spec.kfield)[1:common_length])
+                    for product in products
+                ]).median
+                power_band = snapshot_curve_band([
+                    Float64.(getfield(product, spec.pfield)[1:common_length])
+                    for product in products
+                ])
+                valid = isfinite.(k) .& isfinite.(power_band.median) .&
+                    (k .> 0) .& (power_band.median .> 0)
+                band!(axis, k[valid], power_band.lower[valid],
+                    power_band.upper[valid];
+                    color = (run_colors[label], 0.16))
+                slopes = Float64[]
+                for product in products
+                    result = power_law_slope(
+                        getfield(product, spec.kfield),
+                        getfield(product, spec.pfield),
+                        spectrum_fit_k_min,
+                        spectrum_fit_k_max,
+                    )
+                    isfinite(result.slope) && push!(slopes, result.slope)
                 end
-                if !isnothing(spec.reference)
-                    pivot_k = sqrt(fit_result.lower * fit_result.upper)
-                    pivot_power = 10.0^(fit_result.intercept +
-                        fit_result.slope * log10(pivot_k))
-                    reference_power = pivot_power .*
-                        (fit_k ./ pivot_k) .^ spec.reference.exponent
-                    lines!(axis, fit_k, reference_power; color = :black,
-                        linewidth = 2.2, linestyle = :dot,
-                        label = spec.reference.label)
+                slope_median, slope_lower, slope_upper =
+                    isempty(slopes) ? (NaN, NaN, NaN) :
+                    quantile(slopes, (0.50, 0.16, 0.84))
+                slope_text = isempty(slopes) ? "" : string(
+                    raw";\;\alpha=", @sprintf("%.2f", slope_median),
+                    raw"^{+", @sprintf("%.2f", slope_upper - slope_median),
+                    raw"}_{-", @sprintf("%.2f", slope_median - slope_lower),
+                    raw"}")
+                lines!(axis, k[valid], power_band.median[valid];
+                    color = run_colors[label], linewidth = 2.5,
+                    label = latexstring(
+                        run_label_latex_source(
+                            plain_legend_run_label(label)),
+                        slope_text))
+                if any(valid)
+                    push!(spectrum_legend_elements,
+                        LineElement(color = run_colors[label],
+                            linewidth = 2.5))
+                    push!(spectrum_legend_labels, latexstring(
+                        run_label_latex_source(
+                            plain_legend_run_label(label)),
+                        slope_text))
                 end
-                (show_spectrum_slopes || !isnothing(spec.reference)) &&
-                    axislegend(axis; position = :lb, framevisible = false)
+                compensated = k .^ spec.compensation .* power_band.median
+                compensated_lower =
+                    k .^ spec.compensation .* power_band.lower
+                compensated_upper =
+                    k .^ spec.compensation .* power_band.upper
+                band!(compensated_axis, k[valid],
+                    compensated_lower[valid], compensated_upper[valid];
+                    color = (run_colors[label], 0.16))
+                lines!(compensated_axis, k[valid], compensated[valid];
+                    color = run_colors[label], linewidth = 2.5)
+                forcing_k = 2.0 * 2pi / first(products).box_length_pc
+                nyquist_k = minimum(product.nyquist for product in products)
+                for local_axis in (axis, compensated_axis)
+                    vlines!(local_axis, [forcing_k];
+                        color = (:black, 0.65), linestyle = :dash,
+                        linewidth = 1.2)
+                    vlines!(local_axis, [nyquist_k];
+                        color = (:gray35, 0.65), linestyle = :dot,
+                        linewidth = 1.2)
+                end
             end
+            isempty(spectrum_legend_elements) || Legend(
+                fig_spectra[3, index],
+                spectrum_legend_elements,
+                spectrum_legend_labels;
+                orientation = :vertical,
+                tellheight = true,
+                framevisible = false,
+                labelsize = 12,
+            )
         end
     end
     display_power_spectra ? fig_spectra : nothing
+end
+
+# ╔═╡ c1000001-6f8c-4d0c-9a10-000000000001
+begin
+    fig_summary = Figure(size = (1450, 1750))
+    summary_pdf_axis = latex_axis(fig_summary[1, 1],
+        xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
+        ylabel = L"\mathrm{PDF}")
+    summary_bn_axis = latex_axis(fig_summary[1, 2],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]",
+        ylabel = L"|B|\;[\mu\mathrm{G}]",
+        xscale = log10, yscale = log10,
+        xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+        xminorticksvisible = true, yminorticksvisible = true)
+    summary_hro_axis = latex_axis(fig_summary[2, 1],
+        xlabel = L"n\;[\mathrm{cm}^{-3}]",
+        ylabel = L"\xi_{\mathrm{HRO}}^{\mathrm{3D}}",
+        xscale = log10, xticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+    summary_hro_2d_axis = latex_axis(fig_summary[2, 2],
+        xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
+        ylabel = L"\xi_{\mathrm{HRO},z}^{\mathrm{2D}}",
+        xscale = log10, xticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+    summary_spectrum_axis = latex_axis(fig_summary[3, 1],
+        xlabel = L"k\;[\mathrm{pc}^{-1}]",
+        ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
+        xscale = log10, yscale = log10,
+        xticks = DECADE_TICKS, yticks = DECADE_TICKS,
+        xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
+        xminorticksvisible = true, yminorticksvisible = true)
+    summary_time_axis = latex_axis(fig_summary[3, 2],
+        xlabel = L"t\;[\mathrm{Myr}]",
+        ylabel = L"B_{\mathrm{rms}}\;[\mu\mathrm{G}]",
+        yscale = log10, yticks = DECADE_TICKS,
+        yminorticks = IntervalsBetween(9), yminorticksvisible = true)
+    summary_phase_B_ylabel =
+        phase_B_statistic == "Mean field ⟨B⟩" ?
+        L"\langle|B|\rangle_{\mathrm{phase}}\;[\mu\mathrm{G}]" :
+        L"B_{\mathrm{rms,phase}}\;[\mu\mathrm{G}]"
+    summary_phase_B_axis = latex_axis(fig_summary[4, 1:2],
+        xlabel = L"t\;[\mathrm{Myr}]",
+        ylabel = summary_phase_B_ylabel,
+        yscale = log10, yticks = DECADE_TICKS,
+        yminorticks = IntervalsBetween(9), yminorticksvisible = true)
+    hlines!(summary_hro_axis, [0.0]; color = (:gray45, 0.6),
+        linestyle = :dash)
+    hlines!(summary_hro_2d_axis, [0.0]; color = (:gray45, 0.6),
+        linestyle = :dash)
+    for label in comparison_run_labels
+        color = run_colors[label]
+        pdf = pdf_products.density[label]
+        pdf_valid = isfinite.(pdf.median)
+        band!(summary_pdf_axis, pdf.logx[pdf_valid],
+            pdf.lower[pdf_valid], pdf.upper[pdf_valid];
+            color = (color, 0.16))
+        lines!(summary_pdf_axis, pdf.logx[pdf_valid],
+            pdf.median[pdf_valid]; color, linewidth = 2.5,
+            label = ensemble_legend_label(label))
+
+        profile = bn_profiles[label]
+        bn_valid = isfinite.(profile.medians)
+        bn_x = 10.0 .^ profile.centers[bn_valid]
+        band!(summary_bn_axis, bn_x,
+            10.0 .^ profile.lower[bn_valid],
+            10.0 .^ profile.upper[bn_valid];
+            color = (color, 0.16))
+        lines!(summary_bn_axis, bn_x,
+            10.0 .^ profile.medians[bn_valid];
+            color, linewidth = 2.5)
+
+        hro = hro_by_run[label]
+        hro_valid = isfinite.(hro.density_centers) .&
+            isfinite.(hro.shape)
+        band!(summary_hro_axis,
+            10.0 .^ hro.density_centers[hro_valid],
+            hro.lower[hro_valid], hro.upper[hro_valid];
+            color = (color, 0.16))
+        lines!(summary_hro_axis,
+            10.0 .^ hro.density_centers[hro_valid],
+            hro.shape[hro_valid]; color, linewidth = 2.5)
+
+        hro2 = hro_2d_all_los[(label, 3)]
+        hro2_valid = isfinite.(hro2.density_centers) .&
+            isfinite.(hro2.shape)
+        band!(summary_hro_2d_axis,
+            10.0 .^ hro2.density_centers[hro2_valid],
+            hro2.lower[hro2_valid], hro2.upper[hro2_valid];
+            color = (color, 0.16))
+        lines!(summary_hro_2d_axis,
+            10.0 .^ hro2.density_centers[hro2_valid],
+            hro2.shape[hro2_valid]; color, linewidth = 2.5)
+
+        spectrum_products_for_run = filter(
+            product -> !isempty(product.kb) && !isempty(product.Pb),
+            spectrum_ensemble[label],
+        )
+        isempty(spectrum_products_for_run) && continue
+        spectrum_common_length = minimum(
+            length(product.kb) for product in spectrum_products_for_run)
+        spectrum_k = snapshot_curve_band([
+            Float64.(product.kb[1:spectrum_common_length])
+            for product in spectrum_products_for_run]).median
+        spectrum_band = snapshot_curve_band([
+            Float64.(product.Pb[1:spectrum_common_length])
+            for product in spectrum_products_for_run])
+        spectrum_valid = isfinite.(spectrum_band.median) .&
+            (spectrum_band.median .> 0)
+        band!(summary_spectrum_axis, spectrum_k[spectrum_valid],
+            spectrum_band.lower[spectrum_valid],
+            spectrum_band.upper[spectrum_valid];
+            color = (color, 0.16))
+        lines!(summary_spectrum_axis, spectrum_k[spectrum_valid],
+            spectrum_band.median[spectrum_valid];
+            color, linewidth = 2.5)
+
+        series = all_series[label]
+        times = Float64.(getfield.(series, :t))
+        brms = Float64.(getfield.(series, :Brms))
+        lines!(summary_time_axis, times, brms;
+            color, linewidth = 2.5)
+        scatter!(summary_time_axis, times, brms;
+            color, markersize = 5)
+
+        phase_series = phase_B_series_by_run[label]
+        phase_times = Float64.(getfield.(phase_series, :t))
+        phase_suffix =
+            phase_B_statistic == "Mean field ⟨B⟩" ? "mean" : "rms"
+        for (phase, linestyle) in (
+                (:cold, :solid),
+                (:lukewarm, :dash),
+                (:warm, :dot),
+            )
+            phase_values = Float64.(getfield.(
+                phase_series,
+                Symbol("B_", phase, "_", phase_suffix),
+            ))
+            phase_valid = isfinite.(phase_times) .&
+                isfinite.(phase_values) .& (phase_values .> 0)
+            lines!(summary_phase_B_axis,
+                phase_times[phase_valid], phase_values[phase_valid];
+                color, linestyle, linewidth = 2.5)
+            scatter!(summary_phase_B_axis,
+                phase_times[phase_valid], phase_values[phase_valid];
+                color, marker = :circle, markersize = 5)
+        end
+    end
+    axislegend(summary_pdf_axis; position = :rt,
+        framevisible = false, labelsize = 13)
+    Legend(
+        fig_summary[5, 1:2],
+        [
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            [
+                LineElement(color = :gray25, linestyle = :solid,
+                    linewidth = 2.5),
+                LineElement(color = :gray25, linestyle = :dash,
+                    linewidth = 2.5),
+                LineElement(color = :gray25, linestyle = :dot,
+                    linewidth = 2.5),
+            ],
+        ],
+        [
+            legend_run_label.(comparison_run_labels),
+            LaTeXString[L"\mathrm{CNM}", L"\mathrm{LNM}", L"\mathrm{WNM}"],
+        ],
+        LaTeXString[L"\mathrm{Simulation}", L"\mathrm{Thermal\ phase}"];
+        orientation = :horizontal,
+        tellheight = true,
+        framevisible = false,
+        labelsize = 14,
+    )
+    fig_summary
 end
 
 # ╔═╡ 24e60849-1c70-4df3-bd17-57d29949b7a6
@@ -4807,14 +5839,49 @@ begin
         values
     end
 
-    maximum_lag = max(1, minimum(size(cube.rho)) ÷ 2)
-    structure_lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag)); length = structure_samples))))
-    structure_separations_pc = structure_lags .* minimum(cube.L ./ size(cube.rho))
-    Sv = vector_structure_function((turb.dvx, turb.dvy, turb.dvz), structure_lags, structure_order)
-    Somega = vector_structure_function((omega.wx, omega.wy, omega.wz), structure_lags, structure_order)
-    SB = vector_structure_function(
-        (GAUSS_TO_MICROGAUSS .* cube.bx, GAUSS_TO_MICROGAUSS .* cube.by, GAUSS_TO_MICROGAUSS .* cube.bz),
-        structure_lags, structure_order)
+    structure_products = cached_scientific_product((
+        :vector_structure_functions,
+        cube_signature(selected_path),
+        Int(structure_order),
+        Int(structure_samples),
+    )) do
+        maximum_lag = max(1, minimum(size(cube.rho)) ÷ 2)
+        local_lags = unique(round.(Int, exp.(range(
+            log(1.0),
+            log(Float64(maximum_lag));
+            length = structure_samples,
+        ))))
+        local_separations =
+            local_lags .* minimum(cube.L ./ size(cube.rho))
+        (
+            lags = local_lags,
+            separations = local_separations,
+            velocity = vector_structure_function(
+                (turb.dvx, turb.dvy, turb.dvz),
+                local_lags,
+                structure_order,
+            ),
+            vorticity = vector_structure_function(
+                (omega.wx, omega.wy, omega.wz),
+                local_lags,
+                structure_order,
+            ),
+            magnetic = vector_structure_function(
+                (
+                    GAUSS_TO_MICROGAUSS .* cube.bx,
+                    GAUSS_TO_MICROGAUSS .* cube.by,
+                    GAUSS_TO_MICROGAUSS .* cube.bz,
+                ),
+                local_lags,
+                structure_order,
+            ),
+        )
+    end
+    structure_lags = structure_products.lags
+    structure_separations_pc = structure_products.separations
+    Sv = structure_products.velocity
+    Somega = structure_products.vorticity
+    SB = structure_products.magnetic
 end
 
 # ╔═╡ d69dd1ce-312a-48e0-a478-b470b299ed1b
@@ -7023,6 +8090,7 @@ begin
         "normalized_magnetic_field" => fig_logB,
         "magnetic_density" => fig_bn,
         "hro" => fig_hro,
+        "hro_2d" => fig_hro_2d,
         "hog" => fig_hog,
         "energy_ratios" => fig_energy,
         "energy_time" => fig_energy_time,
@@ -7030,6 +8098,7 @@ begin
         "enstrophy_density" => fig_enstrophy_density,
         "power_spectra" => fig_spectra,
         "structure_functions" => fig_structure,
+        "summary" => fig_summary,
         "dust_polarization" => fig_dust,
         "dust_structure" => fig_dust_structure,
         "dust_pixel_spectrum" => fig_dust_pixel_spectrum,
@@ -9176,6 +10245,7 @@ version = "4.1.0+0"
 # ╟─873f7ef2-719b-4ae6-b015-1a23c6c27836
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
 # ╟─3a731972-3404-478c-a572-00a05ab652b1
+# ╠═c1000001-6f8c-4d0c-9a10-000000000001
 # ╠═24e60849-1c70-4df3-bd17-57d29949b7a6
 # ╠═4b16d83f-4a1d-49e7-9270-8f573fd46835
 # ╠═d69dd1ce-312a-48e0-a478-b470b299ed1b

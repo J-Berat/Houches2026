@@ -18,6 +18,7 @@ const FIGURE_REGISTRY = Dict(
     "enstrophy_density" => :fig_enstrophy_density,
     "power_spectra" => :fig_spectra,
     "structure_functions" => :fig_structure,
+    "summary" => :fig_summary,
     "dust_polarization" => :fig_dust,
     "dust_structure" => :fig_dust_structure,
     "dust_pixel_spectrum" => :fig_dust_pixel_spectrum,
@@ -62,6 +63,7 @@ const NOTEBOOK_FIGURES = Dict(
         "enstrophy_density",
         "power_spectra",
         "structure_functions",
+        "summary",
     ],
     "dust" => [
         "dust_polarization",

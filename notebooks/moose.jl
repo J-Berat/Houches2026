@@ -25,8 +25,10 @@ begin
     using FFTW
     using FITSIO
     using HDF5
+    using LinearAlgebra
     using PlutoUI
     using Random
+    using Serialization
     using Statistics
     using StatsBase
 
@@ -49,13 +51,24 @@ begin
     const RAW_CUBE_CACHE = Dict{Any,Any}()
     const RAW_CUBE_CACHE_BYTES = Dict{Any,Int}()
     const RAW_CUBE_CACHE_ORDER = Any[]
+    const SCALED_CUBE_CACHE = Dict{Any,Any}()
+    const SCALED_CUBE_CACHE_BYTES = Dict{Any,Int}()
+    const SCALED_CUBE_CACHE_ORDER = Any[]
+    const DERIVED_PRODUCT_CACHE = IdDict{Any,Dict{Symbol,Any}}()
+    const DERIVED_PRODUCT_CACHE_BYTES = Ref(0)
+    const RFFT_PLAN_CACHE = Dict{Any,Any}()
     const REDUCTION_CACHE = Dict{Any,Any}()
     const SNAPSHOT_SOURCE_CACHE = Dict{String,Vector{String}}()
+    const SNAPSHOT_MANIFEST = Dict{String,Any}()
     const DIRECTORY_DISCOVERY_CACHE = Dict{String,Vector{String}}()
     const SNAPSHOT_FINGERPRINT_CACHE = Dict{String,Any}()
     const UNREADABLE_DIRECTORY_WARNINGS = Set{String}()
     const LOCAL_HDF5_STAGE = Ref{Any}(nothing)
     const LOCAL_HDF5_STAGE_DIRECTORY = Ref{Union{Nothing,String}}(nothing)
+    const PERSISTENT_CACHE_DIRTY = Ref(false)
+    const PERSISTENT_CACHE_VERSION = 1
+    const PERSISTENT_CACHE_FILE =
+        strip(get(ENV, "DYNAMO_PERSISTENT_CACHE_FILE", ""))
 
     function positive_integer_setting(name, default)
         value = tryparse(Int, strip(get(ENV, name, string(default))))
@@ -73,6 +86,74 @@ begin
         "DYNAMO_RAW_CUBE_CACHE_MIB",
         max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
     ) * 1024^2
+    const DERIVED_PRODUCT_CACHE_MAX_BYTES = positive_integer_setting(
+        "DYNAMO_DERIVED_CACHE_MIB",
+        max(1, Int(Sys.total_memory() ÷ 4 ÷ 1024^2)),
+    ) * 1024^2
+    const SNAPSHOT_SWEEP_MAX_WORKERS = positive_integer_setting(
+        "DYNAMO_SNAPSHOT_WORKERS",
+        min(8, max(1, Threads.nthreads())),
+    )
+    const CONFIGURED_FFTW_THREADS = positive_integer_setting(
+        "DYNAMO_FFTW_THREADS",
+        1,
+    )
+    FFTW.set_num_threads(CONFIGURED_FFTW_THREADS)
+
+    """
+    Load compact scientific reductions and the cube manifest from a previous run.
+
+    The cache format is explicitly versioned. Incompatible or interrupted cache
+    files are ignored, so cached data can never prevent a fresh computation.
+    """
+    function load_persistent_cache!()
+        isempty(PERSISTENT_CACHE_FILE) && return
+        isfile(PERSISTENT_CACHE_FILE) || return
+        payload = try
+            deserialize(PERSISTENT_CACHE_FILE)
+        catch error_value
+            println(stderr, "Warning: ignoring unreadable persistent cache ",
+                PERSISTENT_CACHE_FILE, " (", sprint(showerror, error_value), ")")
+            return
+        end
+        payload isa NamedTuple || return
+        get(payload, :version, nothing) == PERSISTENT_CACHE_VERSION || return
+        reductions = get(payload, :reductions, nothing)
+        manifest = get(payload, :snapshot_manifest, nothing)
+        reductions isa AbstractDict && merge!(REDUCTION_CACHE, reductions)
+        manifest isa AbstractDict && merge!(SNAPSHOT_MANIFEST, manifest)
+        nothing
+    end
+
+    """
+    Atomically persist compact reductions and snapshot-directory metadata.
+
+    Raw cubes and cube-sized derived arrays deliberately remain RAM-only.
+    """
+    function flush_persistent_cache!()
+        isempty(PERSISTENT_CACHE_FILE) && return false
+        PERSISTENT_CACHE_DIRTY[] || return false
+        target_directory = dirname(PERSISTENT_CACHE_FILE)
+        mkpath(target_directory)
+        temporary_path, stream = mktemp(target_directory)
+        try
+            serialize(stream, (
+                version = PERSISTENT_CACHE_VERSION,
+                reductions = REDUCTION_CACHE,
+                snapshot_manifest = SNAPSHOT_MANIFEST,
+            ))
+            close(stream)
+            mv(temporary_path, PERSISTENT_CACHE_FILE; force = true)
+            PERSISTENT_CACHE_DIRTY[] = false
+            true
+        catch
+            isopen(stream) && close(stream)
+            isfile(temporary_path) && rm(temporary_path; force = true)
+            rethrow()
+        end
+    end
+
+    load_persistent_cache!()
 
     "Memoize remote file metadata for the duration of the Pluto session."
     function cached_snapshot_fingerprint(path)
@@ -88,6 +169,14 @@ begin
 
     "Return a memoized scalar summary, or `nothing` if it has not been computed."
     reduction_hit(key) = lock(() -> get(REDUCTION_CACHE, key, nothing), CACHE_LOCK)
+
+    "Return a compact cached scientific product, computing it only on a miss."
+    function cached_scientific_product(build::Function, key)
+        versioned_key = (:scientific_product, PERSISTENT_CACHE_VERSION, key)
+        hit = reduction_hit(versioned_key)
+        isnothing(hit) || return hit
+        store_reduction!(versioned_key, build())
+    end
 
     """
     List a directory during recursive data discovery.
@@ -121,8 +210,13 @@ begin
     end
 
     "Memoize a scalar summary and return it."
-    store_reduction!(key, value) =
-        lock(() -> (REDUCTION_CACHE[key] = value), CACHE_LOCK)
+    function store_reduction!(key, value)
+        lock(CACHE_LOCK) do
+            REDUCTION_CACHE[key] = value
+            PERSISTENT_CACHE_DIRTY[] = true
+        end
+        value
+    end
 
     """
     Return the cached raw cube for `key`, evaluating `build()` on a miss.
@@ -181,6 +275,80 @@ begin
             push!(RAW_CUBE_CACHE_ORDER, key)
         end
         value
+    end
+
+    """
+    Cache physical-unit cubes separately from their unit-free HDF5 arrays.
+
+    This prevents every figure from allocating and scaling the same eight
+    three-dimensional fields again. The cache follows the same entry and memory
+    limits as the raw-cube cache.
+    """
+    function cached_scaled_cube!(key, build)
+        hit = lock(CACHE_LOCK) do
+            if haskey(SCALED_CUBE_CACHE, key)
+                position = findfirst(isequal(key), SCALED_CUBE_CACHE_ORDER)
+                isnothing(position) || deleteat!(SCALED_CUBE_CACHE_ORDER, position)
+                push!(SCALED_CUBE_CACHE_ORDER, key)
+                SCALED_CUBE_CACHE[key]
+            else
+                nothing
+            end
+        end
+        isnothing(hit) || return hit
+
+        value = build()
+        bytes = Base.summarysize(value)
+        lock(CACHE_LOCK) do
+            while !isempty(SCALED_CUBE_CACHE_ORDER) && (
+                    length(SCALED_CUBE_CACHE_ORDER) >= RAW_CUBE_CACHE_MAX_ENTRIES ||
+                    sum(values(SCALED_CUBE_CACHE_BYTES)) + bytes >
+                        RAW_CUBE_CACHE_MAX_BYTES)
+                oldest = popfirst!(SCALED_CUBE_CACHE_ORDER)
+                delete!(SCALED_CUBE_CACHE, oldest)
+                delete!(SCALED_CUBE_CACHE_BYTES, oldest)
+            end
+            if bytes <= RAW_CUBE_CACHE_MAX_BYTES
+                SCALED_CUBE_CACHE[key] = value
+                SCALED_CUBE_CACHE_BYTES[key] = bytes
+                push!(SCALED_CUBE_CACHE_ORDER, key)
+            end
+        end
+        value
+    end
+
+    """
+    Cache a derived field bundle by identity of the density array.
+
+    If the derived-field budget would be exceeded, old products are discarded
+    together. This simple bounded policy avoids retaining multi-gigabyte
+    vorticity and turbulence arrays for evicted cubes.
+    """
+    function cached_derived_product(build::Function, cube, product::Symbol)
+        hit = lock(CACHE_LOCK) do
+            products = get(DERIVED_PRODUCT_CACHE, cube.rho, nothing)
+            isnothing(products) ? nothing : get(products, product, nothing)
+        end
+        isnothing(hit) || return hit
+
+        value = build()
+        bytes = Base.summarysize(value)
+        bytes > DERIVED_PRODUCT_CACHE_MAX_BYTES && return value
+        lock(CACHE_LOCK) do
+            if DERIVED_PRODUCT_CACHE_BYTES[] + bytes >
+                    DERIVED_PRODUCT_CACHE_MAX_BYTES
+                empty!(DERIVED_PRODUCT_CACHE)
+                DERIVED_PRODUCT_CACHE_BYTES[] = 0
+            end
+            products = get!(DERIVED_PRODUCT_CACHE, cube.rho) do
+                Dict{Symbol,Any}()
+            end
+            if !haskey(products, product)
+                products[product] = value
+                DERIVED_PRODUCT_CACHE_BYTES[] += bytes
+            end
+            products[product]
+        end
     end
     const HDF5_READ_LOCK = ReentrantLock()
 
@@ -1039,6 +1207,16 @@ begin
     MAX_SNAPSHOTS_PER_RUN > 0 || error(
         "DYNAMO_SNAPSHOT_WINDOW_COUNT must be a positive integer.",
     )
+    ENSEMBLE_FIGURES = lowercase(strip(
+        get(ENV, "DYNAMO_ENSEMBLE_FIGURES", "false"),
+    )) in ("1", "true", "yes", "on")
+    CONFIGURED_SIMULATION_DIRECTORIES = filter(
+        !isempty,
+        strip.(split(
+            get(ENV, "DYNAMO_CONFIGURED_SIMULATIONS", ""),
+            '\n',
+        )),
+    )
     nothing
 end
 
@@ -1227,6 +1405,13 @@ begin
         canonical = abspath(cube_directory)
         lock(CACHE_LOCK) do
             get!(SNAPSHOT_SOURCE_CACHE, canonical) do
+                directory_mtime = mtime(canonical)
+                manifest_entry = get(SNAPSHOT_MANIFEST, canonical, nothing)
+                if !isnothing(manifest_entry) &&
+                        manifest_entry.directory_mtime == directory_mtime &&
+                        all(ispath, manifest_entry.sources)
+                    return copy(manifest_entry.sources)
+                end
                 fits_directory_is_snapshot(canonical) && return [canonical]
                 sources = String[]
                 for path in discovery_readdir(canonical; join = true)
@@ -1235,7 +1420,13 @@ begin
                         push!(sources, path)
                     end
                 end
-                sort(sources)
+                sort!(sources)
+                SNAPSHOT_MANIFEST[canonical] = (
+                    directory_mtime = directory_mtime,
+                    sources = copy(sources),
+                )
+                PERSISTENT_CACHE_DIRTY[] = true
+                sources
             end
         end
     end
@@ -1273,7 +1464,26 @@ begin
         unique(found)
     end
 
-    run_directories(path) = discover_cube_directories(path)
+    function configured_run_directories(path)
+        directories = String[]
+        for configured in CONFIGURED_SIMULATION_DIRECTORIES
+            candidates = (
+                joinpath(path, configured, "DataCubes"),
+                joinpath(path, configured),
+                joinpath(configured, "DataCubes"),
+                configured,
+            )
+            selected = findfirst(candidate -> !isempty(snapshot_sources(candidate)),
+                candidates)
+            isnothing(selected) && error(
+                "No snapshots found for configured simulation: $configured")
+            push!(directories, abspath(candidates[selected]))
+        end
+        unique(directories)
+    end
+
+    run_directories(path) = isempty(CONFIGURED_SIMULATION_DIRECTORIES) ?
+        discover_cube_directories(path) : configured_run_directories(path)
     is_dataset_root(path) = !isempty(discover_cube_directories(path))
 
     function resolve_data_root(repository)
@@ -1725,6 +1935,11 @@ begin
     legend_run_label(label) =
         latexstring(run_label_latex_source(plain_legend_run_label(label)))
     latex_run_label(label) = legend_run_label(label)
+    ensemble_legend_label(label) = latexstring(
+        run_label_latex_source(plain_legend_run_label(label)),
+        raw";\;N_{\mathrm{snap}}=",
+        ENSEMBLE_FIGURES ? length(get(run_files, label, String[])) : 1,
+    )
     legend_rate_label(gamma; fitted = false) = latexstring(
         fitted ? raw"\Gamma_B^{\mathrm{fit}}=" : raw"\Gamma_B=",
         round(gamma; sigdigits = fitted ? 4 : 3),
@@ -1833,6 +2048,15 @@ begin
     analysis_series_labels = requested_open_labels
     comparison_run_labels = requested_comparison_run_labels
     isempty(comparison_run_labels) && (comparison_run_labels = [selected_run])
+    comparison_snapshot_paths = Dict(
+        label => ENSEMBLE_FIGURES ?
+            run_files[label] :
+            [run_files[label][min(
+                Int(selected_snapshot),
+                length(run_files[label]),
+            )]]
+        for label in comparison_run_labels
+    )
     # Loading the selected raw cube here supplies the exact stored time and
     # primes the one-entry cache. The analysis cell below therefore reuses the
     # same arrays instead of opening this HDF5 file a second time.
@@ -2007,7 +2231,10 @@ begin
         )
     end
 
-    load_cube(path) = scale_raw_cube(load_raw_cube(path))
+    load_cube(path) = cached_scaled_cube!(
+        cube_signature(path),
+        () -> scale_raw_cube(load_raw_cube(path)),
+    )
 
     """
     How many snapshots a sweep may process at once.
@@ -2024,7 +2251,8 @@ begin
         # which together come to roughly three times the raw size.
         budget = Sys.total_memory() ÷ 4
         affordable = Int(budget ÷ (3 * cube_bytes))
-        clamp(affordable, 1, Threads.nthreads())
+        clamp(affordable, 1,
+            min(Threads.nthreads(), SNAPSHOT_SWEEP_MAX_WORKERS))
     end
 
     "Apply `work` to every index, running at most `workers` of them at a time."
@@ -2165,34 +2393,40 @@ begin
     end
 
     function turbulent_velocity(c)
-        T = float(eltype(c.rho))
-        rho, vx, vy, vz = c.rho, c.vx, c.vy, c.vz
-        wsum, sx, sy, sz = 0.0, 0.0, 0.0, 0.0
-        @inbounds for index in eachindex(rho)
-            weight = Float64(rho[index])
-            (isfinite(weight) && weight > 0) || continue
-            ux, uy, uz = Float64(vx[index]), Float64(vy[index]), Float64(vz[index])
-            (isfinite(ux) && isfinite(uy) && isfinite(uz)) || continue
-            wsum += weight
-            sx += weight * ux
-            sy += weight * uy
-            sz += weight * uz
+        cached_derived_product(c, :turbulent_velocity) do
+            T = float(eltype(c.rho))
+            rho, vx, vy, vz = c.rho, c.vx, c.vy, c.vz
+            wsum, sx, sy, sz = 0.0, 0.0, 0.0, 0.0
+            @inbounds for index in eachindex(rho)
+                weight = Float64(rho[index])
+                (isfinite(weight) && weight > 0) || continue
+                ux, uy, uz =
+                    Float64(vx[index]), Float64(vy[index]), Float64(vz[index])
+                (isfinite(ux) && isfinite(uy) && isfinite(uz)) || continue
+                wsum += weight
+                sx += weight * ux
+                sy += weight * uy
+                sz += weight * uz
+            end
+            wsum > 0 || return (
+                vbar = (NaN, NaN, NaN),
+                dvx = fill(T(NaN), size(rho)), dvy = fill(T(NaN), size(rho)),
+                dvz = fill(T(NaN), size(rho)),
+                dv2 = fill(T(NaN), size(rho)),
+            )
+            vbar = (sx / wsum, sy / wsum, sz / wsum)
+            dvx, dvy, dvz =
+                vx .- T(vbar[1]), vy .- T(vbar[2]), vz .- T(vbar[3])
+            dv2 = dvx .^ 2 .+ dvy .^ 2 .+ dvz .^ 2
+            (; vbar, dvx, dvy, dvz, dv2)
         end
-        wsum > 0 || return (
-            vbar = (NaN, NaN, NaN),
-            dvx = fill(T(NaN), size(rho)), dvy = fill(T(NaN), size(rho)),
-            dvz = fill(T(NaN), size(rho)),
-            dv2 = fill(T(NaN), size(rho)),
-        )
-        vbar = (sx / wsum, sy / wsum, sz / wsum)
-        dvx, dvy, dvz = vx .- T(vbar[1]), vy .- T(vbar[2]), vz .- T(vbar[3])
-        dv2 = dvx .^ 2 .+ dvy .^ 2 .+ dvz .^ 2
-        (; vbar, dvx, dvy, dvz, dv2)
     end
 
     function magnetic_fields(c)
-        B2 = c.bx .^ 2 .+ c.by .^ 2 .+ c.bz .^ 2
-        (; B2, B = sqrt.(B2))
+        cached_derived_product(c, :magnetic_fields) do
+            B2 = c.bx .^ 2 .+ c.by .^ 2 .+ c.bz .^ 2
+            (; B2, B = sqrt.(B2))
+        end
     end
 
     function weighted_project(A, rho, d)
@@ -2212,12 +2446,21 @@ begin
     end
 
     function vorticity(c)
-        dx = c.L ./ size(c.rho)
-        kms_per_pc_to_Myr_inv = MYR_S / (PC_CM / KM_CM)
-        wx = kms_per_pc_to_Myr_inv .* (periodic_derivative(c.vz, 2, dx[2]) .- periodic_derivative(c.vy, 3, dx[3]))
-        wy = kms_per_pc_to_Myr_inv .* (periodic_derivative(c.vx, 3, dx[3]) .- periodic_derivative(c.vz, 1, dx[1]))
-        wz = kms_per_pc_to_Myr_inv .* (periodic_derivative(c.vy, 1, dx[1]) .- periodic_derivative(c.vx, 2, dx[2]))
-        (; wx, wy, wz, magnitude = sqrt.(wx .^ 2 .+ wy .^ 2 .+ wz .^ 2))
+        cached_derived_product(c, :vorticity) do
+            dx = c.L ./ size(c.rho)
+            kms_per_pc_to_Myr_inv = MYR_S / (PC_CM / KM_CM)
+            wx = kms_per_pc_to_Myr_inv .* (
+                periodic_derivative(c.vz, 2, dx[2]) .-
+                periodic_derivative(c.vy, 3, dx[3]))
+            wy = kms_per_pc_to_Myr_inv .* (
+                periodic_derivative(c.vx, 3, dx[3]) .-
+                periodic_derivative(c.vz, 1, dx[1]))
+            wz = kms_per_pc_to_Myr_inv .* (
+                periodic_derivative(c.vy, 1, dx[1]) .-
+                periodic_derivative(c.vx, 2, dx[2]))
+            (; wx, wy, wz,
+                magnitude = sqrt.(wx .^ 2 .+ wy .^ 2 .+ wz .^ 2))
+        end
     end
 
     struct DecadeTicks end
@@ -2284,6 +2527,8 @@ begin
             ylabel = ylabel, xscale = log10,
             xticks = DECADE_TICKS,
             xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+        column_limits = enclosing_decade_limits(N)
+        isnothing(column_limits) || xlims!(axis, column_limits...)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
         scatter!(axis, N[sample], p_percent[sample];
@@ -2372,6 +2617,38 @@ begin
         low, high = quantile(finite_texture, (0.01, 0.99))
         high > low || return zeros(Float64, nx, ny)
         clamp.((texture .- low) ./ (high - low), 0.0, 1.0)
+    end
+
+    function snapshot_curve_band(curves)
+        isempty(curves) && return (
+            median = Float64[], lower = Float64[],
+            upper = Float64[], counts = Int[])
+        curve_length = length(first(curves))
+        all(curve -> length(curve) == curve_length, curves) ||
+            error("Snapshot curves must use the same binning.")
+        medians = fill(NaN, curve_length)
+        lower = fill(NaN, curve_length)
+        upper = fill(NaN, curve_length)
+        counts = zeros(Int, curve_length)
+        for index in 1:curve_length
+            values = Float64[
+                curve[index] for curve in curves if isfinite(curve[index])
+            ]
+            counts[index] = length(values)
+            isempty(values) && continue
+            lower[index], medians[index], upper[index] =
+                quantile(values, (0.16, 0.50, 0.84))
+        end
+        (median = medians, lower, upper, counts)
+    end
+
+    function shared_finite_limits(values; padding = 0.04)
+        finite = Float64.(filter(isfinite, vec(values)))
+        isempty(finite) && return nothing
+        low, high = extrema(finite)
+        low == high && return (low - 0.5, high + 0.5)
+        margin = padding * (high - low)
+        low - margin, high + margin
     end
 end
 
@@ -2471,9 +2748,10 @@ begin
     function density_pdf(values, weights, edges)
         valid = isfinite.(values) .& isfinite.(weights) .& (weights .>= 0)
         values, weights = Float64.(values[valid]), Float64.(weights[valid])
-        isempty(values) && return (Float64[], Float64[])
-        h = fit(Histogram, values, Weights(weights), edges)
         centers = (edges[1:end-1] .+ edges[2:end]) ./ 2
+        isempty(values) &&
+            return (centers, fill(NaN, length(centers)))
+        h = fit(Histogram, values, Weights(weights), edges)
         pdf = h.weights ./ max(sum(h.weights .* diff(edges)), eps())
         centers, pdf
     end
@@ -2495,16 +2773,13 @@ begin
         )
     end
 
-    function comparative_pdf(samples_by_run, field, bins)
+    function comparative_pdf_edges(samples_by_run, field, bins)
         combined = vcat([finite_values(getfield(samples_by_run[label], field))
             for label in comparison_run_labels]...)
-        isempty(combined) && return Dict{String, Any}()
+        isempty(combined) && error("No finite samples are available for $(field).")
         lo, hi = quantile(combined, (0.001, 0.999))
         lo == hi && ((lo, hi) = (lo - 0.5, hi + 0.5))
-        edges = range(lo, hi; length = Int(bins) + 1)
-        Dict(label => density_pdf(getfield(samples_by_run[label], field),
-                samples_by_run[label].weights, edges)
-            for label in comparison_run_labels)
+        collect(range(lo, hi; length = Int(bins) + 1))
     end
 
     number_density_cells = number_density(cube.rho)
@@ -2515,12 +2790,76 @@ begin
     logn = vec(safe_log10.(number_density_cells))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
-    comparative_pdf_samples = Dict(label => cube_pdf_samples(comparison_cube(label))
-        for label in comparison_run_labels)
-    density_pdfs = comparative_pdf(comparative_pdf_samples, :density, nbins)
-    magnetic_pdfs = comparative_pdf(comparative_pdf_samples, :magnetic, nbins)
-    velocity_pdfs = comparative_pdf(comparative_pdf_samples, :velocity, nbins)
-    normalized_B_pdfs = comparative_pdf(comparative_pdf_samples, :normalized_B, nbins)
+    pdf_reference_samples =
+        Dict(label => cube_pdf_samples(comparison_cube(label))
+            for label in comparison_run_labels)
+    pdf_edges = (
+        density = comparative_pdf_edges(
+            pdf_reference_samples, :density, nbins),
+        magnetic = comparative_pdf_edges(
+            pdf_reference_samples, :magnetic, nbins),
+        velocity = comparative_pdf_edges(
+            pdf_reference_samples, :velocity, nbins),
+        normalized_B = comparative_pdf_edges(
+            pdf_reference_samples, :normalized_B, nbins),
+    )
+
+    function snapshot_pdf_products(path)
+        cached_scientific_product((
+            :snapshot_pdfs_v2,
+            cube_signature(path),
+            Tuple(Tuple(getfield(pdf_edges, field))
+                for field in (:density, :magnetic, :velocity, :normalized_B)),
+            Float64(mean_molecular_weight),
+            String(pdf_weighting),
+        )) do
+            samples = cube_pdf_samples(load_cube(path))
+            (
+                density = density_pdf(
+                    samples.density, samples.weights, pdf_edges.density),
+                magnetic = density_pdf(
+                    samples.magnetic, samples.weights, pdf_edges.magnetic),
+                velocity = density_pdf(
+                    samples.velocity, samples.weights, pdf_edges.velocity),
+                normalized_B = density_pdf(
+                    samples.normalized_B,
+                    samples.weights,
+                    pdf_edges.normalized_B,
+                ),
+            )
+        end
+    end
+
+    pdf_snapshots_by_run = Dict(
+        label => snapshot_pdf_products.(comparison_snapshot_paths[label])
+        for label in comparison_run_labels
+    )
+
+    function aggregate_snapshot_pdfs(products, field)
+        curves = getfield.(products, field)
+        logx = first(first(curves))
+        band = snapshot_curve_band(last.(curves))
+        (; logx, band...)
+    end
+
+    pdf_products = (
+        density = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :density)
+            for label in comparison_run_labels),
+        magnetic = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :magnetic)
+            for label in comparison_run_labels),
+        velocity = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :velocity)
+            for label in comparison_run_labels),
+        normalized_B = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :normalized_B)
+            for label in comparison_run_labels),
+    )
+    density_pdfs = pdf_products.density
+    magnetic_pdfs = pdf_products.magnetic
+    velocity_pdfs = pdf_products.velocity
+    normalized_B_pdfs = pdf_products.normalized_B
 end
 
 # ╔═╡ 62440e86-b560-44ad-bb0a-43ae62e73fc3

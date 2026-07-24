@@ -12,6 +12,9 @@ exports/
 *.pdf
 *.html
 
+# Cache batch régénérable (réductions scientifiques et manifeste des cubes).
+.dynamo_cache/
+
 # Les cubes de simulation ne doivent pas être versionnés avec le code.
 *.h5
 *.hdf5

@@ -17,10 +17,19 @@ const REQUIRED_SETUP_CELL_IDS = Set([
 ])
 const EXPLICIT_FIGURE_DEPENDENCY_IDS = Dict(
     # Pluto does not detect the short-circuited Mach-only call to
-    # bulk_metrics_from_cube in the enstrophy-density cell.
-    "enstrophy_density" => Set([
-        Base.UUID("904ba663-d536-4b27-a379-4af927b0affb"),
-    ]),
+    # bulk_metrics_from_cube in the enstrophy-density cell, nor the conditional
+    # time-series call to run_metric_series.
+    name => Set([Base.UUID("904ba663-d536-4b27-a379-4af927b0affb")])
+    for name in (
+        "enstrophy_density",
+        "time_evolution",
+        "phase_magnetic_time",
+        "magnetic_fit",
+        "growth_rate_relations",
+        "normalized_magnetic_relations",
+        "energy_time",
+        "summary",
+    )
 )
 
 function source_checksum(path)

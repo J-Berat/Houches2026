@@ -4,7 +4,8 @@ using CairoMakie
 using Printf
 import REPL
 
-export BatchConfig, available_figures, run_batch
+export BatchConfig, available_figures, available_notebooks,
+    figures_for_notebooks, run_batch
 
 const PROJECT_DIRECTORY = normpath(joinpath(@__DIR__, ".."))
 const MASTER_NOTEBOOK =

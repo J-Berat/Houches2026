@@ -39,3 +39,75 @@ const FIGURE_REGISTRY = Dict(
     "shine_rgb" => :fig_shine_rgb,
     "shine_spectrum" => :fig_shine_spectrum,
 )
+
+const NOTEBOOK_FIGURES = Dict(
+    "dynamo" => [
+        "heatmaps",
+        "pdfs",
+        "phase_diagram",
+        "time_evolution",
+        "phase_magnetic_time",
+        "magnetic_fit",
+        "growth_rate_relations",
+        "normalized_magnetic_relations",
+        "normalized_magnetic_field",
+        "magnetic_density",
+        "hro",
+        "hog",
+        "energy_ratios",
+        "energy_time",
+        "vorticity",
+        "enstrophy_density",
+        "power_spectra",
+        "structure_functions",
+    ],
+    "dust" => [
+        "dust_polarization",
+        "dust_structure",
+        "dust_pixel_spectrum",
+        "dust_statistics",
+        "dust_p_column",
+    ],
+    "starlightpol" => [
+        "starlight_maps",
+        "starlight_structure",
+        "starlight_profiles",
+        "starlight_p_column",
+    ],
+    "zeeman" => [
+        "zeeman_maps",
+        "zeeman_structure",
+        "zeeman_spectra",
+        "zeeman_p_column",
+    ],
+    "moose" => [
+        "moose",
+        "moose_structure",
+        "moose_tomography",
+        "moose_p_column",
+    ],
+    "shine" => [
+        "shine",
+        "shine_structure",
+        "shine_rgb",
+        "shine_spectrum",
+    ],
+)
+
+available_notebooks() = sort(collect(keys(NOTEBOOK_FIGURES)))
+
+function figures_for_notebooks(notebook_names)
+    normalized_names = lowercase.(strip.(String.(notebook_names)))
+    unknown = setdiff(normalized_names, available_notebooks())
+    isempty(unknown) || error(
+        "Unknown notebooks: $(join(unknown, ", ")). Available notebooks: " *
+        join(available_notebooks(), ", "),
+    )
+    unique(vcat((NOTEBOOK_FIGURES[name] for name in normalized_names)...))
+end
+
+all(
+    figure_name in keys(FIGURE_REGISTRY)
+    for figures in values(NOTEBOOK_FIGURES)
+    for figure_name in figures
+) || error("A notebook group references an unknown figure.")

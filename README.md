@@ -101,15 +101,15 @@ const CONFIG = BatchConfig(
     ],
     snapshot = :last,
     line_of_sight = "z",
-    figures = [
-        "pdfs",
-        "phase_diagram",
-        "magnetic_density",
-    ],
-    output_directory = joinpath(PROJECT_DIRECTORY, "figures"),
+    figures = figures_for_notebooks(["dynamo", "dust"]),
+    output_directory = joinpath(PROJECT_DIRECTORY, "figures", "dynamo_dust"),
     output_format = "png",
 )
 ```
+
+The notebook groups are `dynamo`, `dust`, `starlightpol`, `zeeman`, `moose`,
+and `shine`. Selecting `dynamo` and `dust` computes all 23 figures from those
+two notebooks.
 
 Puis lancer :
 

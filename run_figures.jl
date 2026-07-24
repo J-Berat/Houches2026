@@ -12,6 +12,13 @@ using .DynamoAnalysis
 
 const DEFAULT_DATA_REPOSITORY = "/Xnfs/Houches2026/DynSim"
 
+# Every figure from the selected notebooks will be computed. Available groups:
+# "dynamo", "dust", "starlightpol", "zeeman", "moose", and "shine".
+const SELECTED_NOTEBOOKS = [
+    "dynamo",
+    "dust",
+]
+
 const CONFIG = BatchConfig(
     # Shared data root used by the notebooks on the server. The engine
     # recursively discovers simulations and their DataCubes directories.
@@ -27,12 +34,12 @@ const CONFIG = BatchConfig(
     ],
     snapshot = :last,
     line_of_sight = "z",
-    figures = [
-        "pdfs",
-        "phase_diagram",
-        "magnetic_density",
-    ],
-    output_directory = joinpath(PROJECT_DIRECTORY, "figures"),
+    figures = figures_for_notebooks(SELECTED_NOTEBOOKS),
+    output_directory = joinpath(
+        PROJECT_DIRECTORY,
+        "figures",
+        join(SELECTED_NOTEBOOKS, "_"),
+    ),
     output_format = "png",
 )
 

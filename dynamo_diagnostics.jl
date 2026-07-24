@@ -1611,32 +1611,103 @@ begin
         comparison_kind == :ratio ? "χ = Ecomp/Esol" :
         comparison_kind == :mach ? "Mach number" : "simulation folder"
 
-    function run_label_latex_source(label)
-        if startswith(label, "N = ")
-            value = replace(replace(label, "N = " => ""; count = 1), "³" => "")
-            return "N=" * value * "^3"
-        elseif startswith(label, "χ = ")
-            value = replace(replace(label, "χ = " => ""; count = 1), "∞" => "\\infty")
-            return "\\chi=" * value
-        elseif startswith(label, "χ: ")
-            value = replace(replace(label, "χ: " => ""; count = 1), " " => "~")
-            return "\\chi:\\mathrm{" * value * "}"
-        elseif endswith(label, " χ")
-            qualifier = replace(replace(label, r"\s*χ$" => ""), " " => "~")
-            return "\\mathrm{" * qualifier * "}~\\chi"
-        end
-        "\\mathrm{" * replace(label, " " => "~") * "}"
+    function latex_text_source(text)
+        escaped = replace(
+            String(text),
+            "\\" => raw"\backslash{}",
+            "_" => raw"\_",
+            "%" => raw"\%",
+            "&" => raw"\&",
+            "#" => raw"\#",
+            "{" => raw"\{",
+            "}" => raw"\}",
+            " " => "~",
+            "—" => raw"\;-\;",
+        )
+        "\\mathrm{" * escaped * "}"
     end
 
-    latex_run_label(label) = latexstring(run_label_latex_source(label))
-    # Makie legends are rebuilt reactively by Pluto.  Keep their text as one
-    # atomic block: changing a LaTeXString can otherwise update its glyph blocks
-    # before the matching positions and trigger a ComputePipeline length error.
-    legend_run_label(label) = String(label)
-    legend_rate_label(gamma; fitted = false) = string(
-        fitted ? "ΓB, fit = " : "ΓB = ", round(gamma; sigdigits = fitted ? 4 : 3), " Myr⁻¹")
+    function run_label_latex_source(label)
+        text = String(label)
+        if startswith(text, "N = ")
+            value = replace(replace(text, "N = " => ""; count = 1), "³" => "")
+            return "N=" * value * "^3"
+        elseif startswith(text, "χ = ")
+            value = replace(replace(text, "χ = " => ""; count = 1), "∞" => "\\infty")
+            return "\\chi=" * value
+        elseif startswith(text, "χ: ")
+            value = replace(replace(text, "χ: " => ""; count = 1), " " => "~")
+            return "\\chi:\\mathrm{" * value * "}"
+        elseif endswith(text, " χ")
+            qualifier = replace(replace(text, r"\s*χ$" => ""), " " => "~")
+            return "\\mathrm{" * qualifier * "}~\\chi"
+        end
+        latex_text_source(text)
+    end
+
+    """
+    Return a compact, human-readable simulation name for plot legends.
+
+    A broad data root can make the internal run label a path such as
+    `cooling/VaryingMach/run_turb_cooling_mhd_hi_mach`. Paths are useful for
+    resolving the simulation but unsuitable for a legend, and underscores are
+    especially misleading when a downstream label uses LaTeX rendering.
+    """
+    function base_legend_run_label(label)
+        text = String(label)
+        any(prefix -> startswith(text, prefix), ("N = ", "χ = ", "χ: ")) &&
+            return text
+        endswith(text, " χ") && return text
+
+        directory = get(RUN_DIRS, label, text)
+        name = lowercase(run_directory_name(directory))
+        occursin(r"(?:^|_)(?:lo|low)_mach(?:_|$)", name) &&
+            return "Low Mach"
+        occursin(r"(?:^|_)(?:mi|mid|intermediate)_mach(?:_|$)", name) &&
+            return "Intermediate Mach"
+        occursin(r"(?:^|_)(?:hi|high)_mach(?:_|$)", name) &&
+            return "High Mach"
+
+        cleaned = replace(name, r"^run_turb_" => "", r"^run_" => "")
+        titlecase(replace(cleaned, '_' => ' ', '-' => ' '))
+    end
+
+    function run_family_qualifier(label)
+        directory = get(RUN_DIRS, label, String(label))
+        run_root = lowercase(basename(directory)) == "datacubes" ?
+            dirname(directory) : directory
+        family = relpath(dirname(run_root), ROOT)
+        family == "." ? "" : replace(family, '\\' => '/')
+    end
+
+    # Keep the plain wording separate from its rendering so paths remain useful
+    # internally while every visible legend entry is a genuine LaTeXString.
+    function plain_legend_run_label(label)
+        short = base_legend_run_label(label)
+        peers = isdefined(@__MODULE__, :comparison_run_labels) ?
+            getfield(@__MODULE__, :comparison_run_labels) : run_labels
+        duplicate = count(
+            peer -> base_legend_run_label(peer) == short,
+            peers,
+        ) > 1
+        family = duplicate ? run_family_qualifier(label) : ""
+        isempty(family) ? short : "$short — $family"
+    end
+    legend_run_label(label) =
+        latexstring(run_label_latex_source(plain_legend_run_label(label)))
+    latex_run_label(label) = legend_run_label(label)
+    legend_rate_label(gamma; fitted = false) = latexstring(
+        fitted ? raw"\Gamma_B^{\mathrm{fit}}=" : raw"\Gamma_B=",
+        round(gamma; sigdigits = fitted ? 4 : 3),
+        raw"\;\mathrm{Myr}^{-1}",
+    )
     latex_run_field_label(field, label) =
-        latexstring(field, "\\;[", run_label_latex_source(label), "]")
+        latexstring(
+            field,
+            "\\;[",
+            run_label_latex_source(plain_legend_run_label(label)),
+            "]",
+        )
 
     function available_snapshot_files(label)
         sources = snapshot_sources(run_cube_directory(ROOT, RUN_DIRS[label]))
@@ -2607,7 +2678,7 @@ begin
         fig_pdf = Figure(size = (420length(pdf_specs), 430))
         for (j, spec) in enumerate(pdf_specs)
             ax = latex_axis(fig_pdf[1, j], xlabel = spec.xlabel,
-                ylabel = L"\mathrm{d}\mathcal{P}/\mathrm{d}\log_{10}X", xscale = log10,
+                ylabel = L"\mathrm{PDF}", xscale = log10,
                 xticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), xminorticksvisible = true)
             for label in comparison_run_labels
@@ -3176,7 +3247,7 @@ begin
     else
         time_ncols = length(time_panel_keys) == 1 ? 1 : 2
         time_nrows = cld(length(time_panel_keys), time_ncols)
-        fig_time = Figure(size = (560time_ncols, 380time_nrows + 110))
+        fig_time = Figure(size = (560time_ncols, 380time_nrows + 230))
         time_axes = Dict{Symbol, Any}()
         for (index, key) in enumerate(time_panel_keys)
             row, col = cld(index, time_ncols), mod1(index, time_ncols)
@@ -3233,21 +3304,20 @@ begin
         end
 
         time_legend_layout = GridLayout(fig_time[time_nrows + 1, 1:time_ncols])
-        time_legend_column = 1
-        Legend(time_legend_layout[1, time_legend_column],
+        Legend(time_legend_layout[1, 1],
             [LineElement(color = run_colors[label], linewidth = 2.5)
                 for label in comparison_run_labels],
-            legend_run_label.(comparison_run_labels), "Simulation";
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
             orientation = :horizontal, tellheight = true, framevisible = false,
-            labelsize = 11)
+            labelsize = 14)
         if haskey(time_axes, :magnetic)
-            time_legend_column += 1
-            Legend(time_legend_layout[1, time_legend_column], [
+            Legend(time_legend_layout[2, 1], [
                 LineElement(color = :gray25, linewidth = 2.5, linestyle = :solid),
                 LineElement(color = :gray25, linewidth = 2.5, linestyle = :dash),
-            ], ["⟨B⟩", "Bᵣₘₛ"], "Magnetic statistic";
+            ], LaTeXString[L"\langle B\rangle", L"B_{\mathrm{rms}}"],
+                L"\mathrm{Magnetic\ statistic}";
                 orientation = :horizontal, tellheight = true, framevisible = false,
-                labelsize = 11)
+                labelsize = 14)
 
             model_elements = Any[
                 LineElement(color = color, linewidth = 2.2, linestyle = :dot)
@@ -3259,11 +3329,11 @@ begin
                     LineElement(color = :black, linewidth = 2.5, linestyle = :dashdot))
                 push!(model_labels, legend_rate_label(growth_fit.gamma; fitted = true))
             end
-            time_legend_column += 1
-            Legend(time_legend_layout[1, time_legend_column],
-                model_elements, model_labels, "Selected-run model";
-                orientation = :horizontal, tellheight = true, framevisible = false,
-                labelsize = 11)
+            Legend(time_legend_layout[3, 1],
+                model_elements, model_labels, L"\mathrm{Selected\ run\ model}";
+                orientation = :horizontal, nbanks = 2,
+                tellheight = true, framevisible = false,
+                labelsize = 14)
         end
     end
     stable_pluto_figure(display_global_evolution, fig_time)
@@ -3475,11 +3545,11 @@ end
 begin
     phase_B_specs = NamedTuple[]
     show_phase_B_cold && push!(phase_B_specs,
-        (key = :cold, label = "CNM", linestyle = :solid))
+        (key = :cold, label = L"\mathrm{CNM}", linestyle = :solid))
     show_phase_B_lukewarm && push!(phase_B_specs,
-        (key = :lukewarm, label = "LNM", linestyle = :dash))
+        (key = :lukewarm, label = L"\mathrm{LNM}", linestyle = :dash))
     show_phase_B_warm && push!(phase_B_specs,
-        (key = :warm, label = "WNM", linestyle = :dot))
+        (key = :warm, label = L"\mathrm{WNM}", linestyle = :dot))
 
     if !display_phase_B_time
         fig_phase_B_time = Figure(size = (900, 180))
@@ -3517,8 +3587,9 @@ begin
              [LineElement(color = :gray25, linestyle = spec.linestyle, linewidth = 2.5)
                 for spec in phase_B_specs]],
             [legend_run_label.(comparison_run_labels), [spec.label for spec in phase_B_specs]],
-            ["Simulation", "Phase"];
-            orientation = :horizontal, tellheight = true, framevisible = false)
+            LaTeXString[L"\mathrm{Simulation}", L"\mathrm{Phase}"];
+            orientation = :horizontal, tellheight = true, framevisible = false,
+            labelsize = 14)
     end
     display_phase_B_time ? fig_phase_B_time : nothing
 end
@@ -3714,11 +3785,14 @@ begin
                 fit_result.slope .* log10.(collect(fit_x)))
             lines!(bn_relation_axis, collect(fit_x), fit_y;
                 color = run_colors[label], linestyle = :dash, linewidth = 2,
-                label = latexstring(legend_run_label(label),
-                    raw";\;\kappa=", @sprintf("%.3f", fit_result.slope)))
+                label = latexstring(
+                    run_label_latex_source(plain_legend_run_label(label)),
+                    raw";\;\kappa=",
+                    @sprintf("%.3f", fit_result.slope),
+                ))
         end
     end
-    axislegend(bn_relation_axis; position = :lt, framevisible = false)
+    axislegend(bn_relation_axis; position = :lt, framevisible = false, labelsize = 14)
     stable_pluto_figure(display_bn_relation, fig_bn)
 end
 
@@ -3800,7 +3874,7 @@ begin
         valid = isfinite.(product.density_centers) .& isfinite.(product.shape)
         lines!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
             product.shape[valid]; color = run_colors[label], linewidth = 2.8,
-            label = latexstring(legend_run_label(label)))
+            label = legend_run_label(label))
         scatter!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
             product.shape[valid]; color = run_colors[label], markersize = 6)
     end
@@ -3879,7 +3953,7 @@ begin
         product = hog_by_run[label]
         lines!(hog_hist_axis, product.angle_centers, product.histogram;
             color = run_colors[label], linewidth = 2.8,
-            label = latexstring(legend_run_label(label)))
+            label = legend_run_label(label))
     end
     axislegend(hog_hist_axis; position = :rt, framevisible = false)
 
@@ -3888,9 +3962,9 @@ begin
     hog_prs_axis = latex_axis(fig_hog[1, 2],
         xlabel = L"\mathrm{simulation}", ylabel = L"V/V_{\max}",
         xticks = hog_positions,
-        xtickformat = values -> [latexstring(legend_run_label(
+        xtickformat = values -> [legend_run_label(
             comparison_run_labels[clamp(round(Int, value), 1,
-                length(comparison_run_labels))])) for value in values])
+                length(comparison_run_labels))]) for value in values])
     hlines!(hog_prs_axis, [0.0]; color = (:gray45, 0.65), linestyle = :dash)
     barplot!(hog_prs_axis, hog_positions, hog_values;
         color = [run_colors[label] for label in comparison_run_labels])
@@ -4055,12 +4129,16 @@ begin
             for index in valid_energy_snapshots
         ]
         energy_run_labels = legend_run_label.(comparison_run_labels)
-        energy_snapshot_labels = ["Snapshot $(index)" for index in valid_energy_snapshots]
+        energy_snapshot_labels = [
+            latexstring(raw"\mathrm{Snapshot}\;", index)
+            for index in valid_energy_snapshots
+        ]
         Legend(fig_energy[2, 1:length(energy_panel_keys)],
             [run_legend_elements, snapshot_legend_elements],
             [energy_run_labels, energy_snapshot_labels],
-            ["Run", "Snapshot"];
-            orientation = :horizontal, tellheight = true, framevisible = false)
+            LaTeXString[L"\mathrm{Simulation}", L"\mathrm{Snapshot}"];
+            orientation = :horizontal, tellheight = true, framevisible = false,
+            labelsize = 14)
     end
     display_energy_ratios ? fig_energy : nothing
 end
@@ -5873,11 +5951,13 @@ begin
                     xlabel = L"\phi\;[\mathrm{rad\,m}^{-2}]", ylabel = L"F(\phi)\;[\mathrm{K}]")
                 spectrum = @view moose_F_complex[Int(moose_sky_i), Int(moose_sky_j), :]
                 show_moose_F_abs && lines!(ax, moose_phi_axis, abs.(spectrum);
-                    color = :black, linewidth = 2.8, label = "|F(φ)|")
+                    color = :black, linewidth = 2.8, label = L"|F(\phi)|")
                 show_moose_F_real && lines!(ax, moose_phi_axis, real.(spectrum);
-                    color = MHD_COLORS[1], linewidth = 2, label = "Re F(φ)")
+                    color = MHD_COLORS[1], linewidth = 2,
+                    label = L"\mathrm{Re}\,F(\phi)")
                 show_moose_F_imag && lines!(ax, moose_phi_axis, imag.(spectrum);
-                    color = MHD_COLORS[2], linewidth = 2, label = "Im F(φ)")
+                    color = MHD_COLORS[2], linewidth = 2,
+                    label = L"\mathrm{Im}\,F(\phi)")
                 hlines!(ax, [0.0]; color = (:gray, 0.5), linestyle = :dot)
                 axislegend(ax; position = :rt, framevisible = false)
             end
@@ -6291,7 +6371,7 @@ begin
                     xlabel = L"v_{\mathrm{LOS}}\;[\mathrm{km\,s}^{-1}]", ylabel = L"T_B\;[\mathrm{K}]")
                 show_shine_Tb_spectrum && lines!(ax, shine_velocity_axis,
                     @view(shine_Tb[Int(shine_sky_i), Int(shine_sky_j), :]);
-                    color = MHD_COLORS[1], linewidth = 2.5, label = "T_B")
+                    color = MHD_COLORS[1], linewidth = 2.5, label = L"T_B")
                 axislegend(ax; position = :rt, framevisible = false)
             else
                 ax = latex_axis(fig_shine_spectrum[1, index],
@@ -6611,16 +6691,17 @@ begin
         Legend(polarization_legend_layout[1, 1],
             [LineElement(color = run_colors[label], linewidth = 2.5)
                 for label in comparison_run_labels],
-            legend_run_label.(comparison_run_labels), "Simulation";
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
             orientation = :horizontal, tellheight = true, framevisible = false,
-            labelsize = 11)
+            labelsize = 14)
         if show_polarization_regime_bars
             Legend(polarization_legend_layout[1, 2], [
                 LineElement(color = MHD_COLORS[2], linewidth = 7),
                 LineElement(color = MHD_COLORS[3], linewidth = 7),
-            ], ["ΓB growth", "Steady state"], "Time regime";
+            ], LaTeXString[L"\Gamma_B\ \mathrm{growth}", L"\mathrm{Steady\ state}"],
+                L"\mathrm{Time\ regime}";
                 orientation = :horizontal, tellheight = true, framevisible = false,
-                labelsize = 11)
+                labelsize = 14)
         end
     end
     fig_polarization_time

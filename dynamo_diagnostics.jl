@@ -5603,7 +5603,13 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 
 **Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
 
-**Display every selected magnetic spectrum through time:** $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true))
+| Time-resolved spectrum | Display |
+|:--|:--:|
+| Number density | $(@bind display_density_spectra_time PlutoUI.CheckBox(default = true)) |
+| Turbulent velocity | $(@bind display_velocity_spectra_time PlutoUI.CheckBox(default = true)) |
+| Vorticity | $(@bind display_vorticity_spectra_time PlutoUI.CheckBox(default = true)) |
+| Enstrophy | $(@bind display_enstrophy_spectra_time PlutoUI.CheckBox(default = true)) |
+| Magnetic field | $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true)) |
 
 | Power-spectrum panel | Display |
 |:--|:--:|
@@ -5805,7 +5811,7 @@ end
 
 # ╔═╡ c4000001-6f8c-4d0c-9a10-000000000001
 begin
-    magnetic_spectrum_time_records = Dict{String, Vector{Any}}()
+    spectrum_time_records = Dict{String, Vector{Any}}()
     for label in comparison_run_labels
         records = Any[]
         for (path, product) in zip(
@@ -5822,150 +5828,243 @@ begin
             push!(records, (
                 path,
                 time = physical_time,
-                k = Float64.(product.kb),
-                power = Float64.(product.Pb),
-                box_length_pc = Float64(product.box_length_pc),
-                nyquist = Float64(product.nyquist),
+                product,
             ))
         end
         sort!(records; by = record ->
             isfinite(record.time) ? record.time : Inf)
-        magnetic_spectrum_time_records[label] = records
+        spectrum_time_records[label] = records
     end
 
-    magnetic_spectrum_times = Float64[
+    spectrum_times = Float64[
         record.time
         for label in comparison_run_labels
-        for record in magnetic_spectrum_time_records[label]
+        for record in spectrum_time_records[label]
         if isfinite(record.time)
     ]
-    magnetic_spectrum_time_limits =
-        isempty(magnetic_spectrum_times) ? (0.0, 1.0) :
-        extrema(magnetic_spectrum_times)
-    magnetic_spectrum_time_limits[1] ==
-        magnetic_spectrum_time_limits[2] &&
-        (magnetic_spectrum_time_limits = (
-            magnetic_spectrum_time_limits[1] - 0.5,
-            magnetic_spectrum_time_limits[2] + 0.5,
+    spectrum_time_limits =
+        isempty(spectrum_times) ? (0.0, 1.0) :
+        extrema(spectrum_times)
+    spectrum_time_limits[1] == spectrum_time_limits[2] &&
+        (spectrum_time_limits = (
+            spectrum_time_limits[1] - 0.5,
+            spectrum_time_limits[2] + 0.5,
         ))
-    magnetic_time_colormap = Makie.to_colormap(:viridis)
-    function magnetic_time_color(time)
+    spectrum_time_colormap = Makie.to_colormap(:viridis)
+    function spectrum_time_color(time)
         fraction = clamp(
-            (Float64(time) - magnetic_spectrum_time_limits[1]) /
-                (magnetic_spectrum_time_limits[2] -
-                    magnetic_spectrum_time_limits[1]),
+            (Float64(time) - spectrum_time_limits[1]) /
+                (spectrum_time_limits[2] - spectrum_time_limits[1]),
             0.0,
             1.0,
         )
         index = clamp(
-            round(Int, 1 + fraction * (length(magnetic_time_colormap) - 1)),
+            round(Int, 1 + fraction * (length(spectrum_time_colormap) - 1)),
             1,
-            length(magnetic_time_colormap),
+            length(spectrum_time_colormap),
         )
-        magnetic_time_colormap[index], fraction
+        spectrum_time_colormap[index], fraction
     end
 
-    magnetic_all_k = Float64[
-        value
-        for label in comparison_run_labels
-        for record in magnetic_spectrum_time_records[label]
-        for value in record.k
-        if isfinite(value) && value > 0
-    ]
-    magnetic_all_power = Float64[
-        value
-        for label in comparison_run_labels
-        for record in magnetic_spectrum_time_records[label]
-        for value in record.power
-        if isfinite(value) && value > 0
-    ]
-    magnetic_k_limits = enclosing_decade_limits(magnetic_all_k)
-    magnetic_power_limits = enclosing_decade_limits(magnetic_all_power)
-
-    magnetic_panel_columns = min(3, length(comparison_run_labels))
-    magnetic_panel_rows =
-        cld(length(comparison_run_labels), magnetic_panel_columns)
-    fig_magnetic_spectra_time = Figure(
-        size = (520magnetic_panel_columns,
-            470magnetic_panel_rows + 100),
-    )
-    Label(
-        fig_magnetic_spectra_time[0, 1:magnetic_panel_columns],
-        L"\mathrm{Magnetic\ power\ spectra\ through\ time}";
-        fontsize = 23,
-        font = :bold,
-    )
-    for (panel_index, label) in enumerate(comparison_run_labels)
-        row = cld(panel_index, magnetic_panel_columns)
-        column = mod1(panel_index, magnetic_panel_columns)
-        records = magnetic_spectrum_time_records[label]
-        plottable_count = count(records) do record
-            any(isfinite.(record.k) .& isfinite.(record.power) .&
-                (record.k .> 0) .& (record.power .> 0))
-        end
-        panel_title = latexstring(
-            run_label_latex_source(plain_legend_run_label(label)),
-            raw";\;N_{\mathrm{nonzero}}=",
-            plottable_count,
-            raw"/",
-            length(records),
-        )
-        axis = latex_axis(
-            fig_magnetic_spectra_time[row, column];
-            xlabel = L"k\;[\mathrm{pc}^{-1}]",
+    spectrum_time_specs = (
+        density = (
+            kfield = :krho,
+            pfield = :Prho,
+            scale = 1.0,
+            title = L"\mathrm{Number\!-\!density\ power\ spectra\ through\ time}",
+            ylabel = L"E_n(k)\;[\mathrm{cm}^{-6}\,\mathrm{pc}]",
+        ),
+        velocity = (
+            kfield = :kv,
+            pfield = :Pv,
+            scale = 1.0,
+            title = L"\mathrm{Turbulent\!-\!velocity\ power\ spectra\ through\ time}",
+            ylabel = L"E_v(k)\;[(\mathrm{km\,s}^{-1})^2\,\mathrm{pc}]",
+        ),
+        vorticity = (
+            kfield = :komega,
+            pfield = :Pomega,
+            scale = 1.0,
+            title = L"\mathrm{Vorticity\ power\ spectra\ through\ time}",
+            ylabel = L"E_\omega(k)\;[\mathrm{Myr}^{-2}\,\mathrm{pc}]",
+        ),
+        enstrophy = (
+            kfield = :komega,
+            pfield = :Pomega,
+            scale = 0.5,
+            title = L"\mathrm{Enstrophy\ spectra\ through\ time}",
+            ylabel = L"\mathcal{Z}(k)=\frac{1}{2}E_\omega(k)\;[\mathrm{Myr}^{-2}\,\mathrm{pc}]",
+        ),
+        magnetic = (
+            kfield = :kb,
+            pfield = :Pb,
+            scale = 1.0,
+            title = L"\mathrm{Magnetic\ power\ spectra\ through\ time}",
             ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
-            title = panel_title,
-            xscale = log10,
-            yscale = log10,
-            xticks = DECADE_TICKS,
-            yticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9),
-            yminorticks = IntervalsBetween(9),
-            xminorticksvisible = true,
-            yminorticksvisible = true,
-        )
-        for record in records
-            valid = isfinite.(record.k) .& isfinite.(record.power) .&
-                (record.k .> 0) .& (record.power .> 0)
-            any(valid) || continue
-            color, time_fraction = magnetic_time_color(record.time)
-            lines!(
-                axis,
-                record.k[valid],
-                record.power[valid];
-                color = (color, 0.35 + 0.65time_fraction),
-                linewidth = 1.2 + 1.8time_fraction,
-            )
-        end
-        representative = findfirst(record -> !isempty(record.k), records)
-        if !isnothing(representative)
-            product = records[representative]
-            forcing_k = 2 * 2pi / product.box_length_pc
-            vlines!(axis, [forcing_k];
-                color = (:black, 0.60), linestyle = :dash,
-                linewidth = 1.2)
-            vlines!(axis, [product.nyquist];
-                color = (:gray35, 0.60), linestyle = :dot,
-                linewidth = 1.2)
-        end
-        isnothing(magnetic_k_limits) ||
-            xlims!(axis, magnetic_k_limits...)
-        isnothing(magnetic_power_limits) ||
-            ylims!(axis, magnetic_power_limits...)
-    end
-    Colorbar(
-        fig_magnetic_spectra_time[
-            1:magnetic_panel_rows,
-            magnetic_panel_columns + 1,
-        ];
-        limits = magnetic_spectrum_time_limits,
-        colormap = :viridis,
-        label = L"t\;[\mathrm{Myr}]",
-        tickformat = latex_ticklabels,
-        width = 18,
+        ),
     )
-    colgap!(fig_magnetic_spectra_time.layout, 35)
-    display_magnetic_spectra_time ? fig_magnetic_spectra_time : nothing
+
+    function time_resolved_spectrum_figure(spec)
+        panel_columns = min(3, length(comparison_run_labels))
+        panel_rows = cld(length(comparison_run_labels), panel_columns)
+        figure = Figure(
+            size = (560panel_columns + 120, 470panel_rows + 100),
+            figure_padding = (100, 70, 25, 25),
+        )
+        Label(
+            figure[0, 1:panel_columns],
+            spec.title;
+            fontsize = 23,
+            font = :bold,
+        )
+
+        all_modes = Float64[]
+        all_power = Float64[]
+        for label in comparison_run_labels, record in spectrum_time_records[label]
+            product = record.product
+            physical_k = Float64.(getfield(product, spec.kfield))
+            power = spec.scale .* Float64.(getfield(product, spec.pfield))
+            append!(all_modes, physical_k .* Float64(product.box_length_pc) ./ (2pi))
+            append!(all_power, power)
+        end
+        mode_limits = enclosing_decade_limits(filter(
+            value -> isfinite(value) && value > 0,
+            all_modes,
+        ))
+        power_limits = enclosing_decade_limits(filter(
+            value -> isfinite(value) && value > 0,
+            all_power,
+        ))
+
+        for (panel_index, label) in enumerate(comparison_run_labels)
+            row = cld(panel_index, panel_columns)
+            column = mod1(panel_index, panel_columns)
+            records = spectrum_time_records[label]
+            plottable_count = count(records) do record
+                product = record.product
+                k = getfield(product, spec.kfield)
+                power = spec.scale .* getfield(product, spec.pfield)
+                any(isfinite.(k) .& isfinite.(power) .&
+                    (k .> 0) .& (power .> 0))
+            end
+            panel_title = latexstring(
+                run_label_latex_source(plain_legend_run_label(label)),
+                raw";\;N_{\mathrm{snap}}=",
+                plottable_count,
+                raw"/",
+                length(records),
+            )
+            axis = latex_axis(
+                figure[row, column];
+                xlabel = L"kL/(2\pi)",
+                ylabel = spec.ylabel,
+                title = panel_title,
+                xscale = log10,
+                yscale = log10,
+                xticks = DECADE_TICKS,
+                yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9),
+                yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true,
+                yminorticksvisible = true,
+            )
+            for record in records
+                product = record.product
+                mode = Float64.(getfield(product, spec.kfield)) .*
+                    Float64(product.box_length_pc) ./ (2pi)
+                power = spec.scale .* Float64.(getfield(product, spec.pfield))
+                valid = isfinite.(mode) .& isfinite.(power) .&
+                    (mode .> 0) .& (power .> 0)
+                any(valid) || continue
+                color, time_fraction = spectrum_time_color(record.time)
+                lines!(
+                    axis,
+                    mode[valid],
+                    power[valid];
+                    color = (color, 0.35 + 0.65time_fraction),
+                    linewidth = 1.2 + 1.8time_fraction,
+                )
+            end
+            representative = findfirst(records) do record
+                !isempty(getfield(record.product, spec.kfield))
+            end
+            if !isnothing(representative)
+                product = records[representative].product
+                nyquist_mode = Float64(product.nyquist) *
+                    Float64(product.box_length_pc) / (2pi)
+                vlines!(axis, [2.0];
+                    color = (:black, 0.60), linestyle = :dash,
+                    linewidth = 1.2)
+                vlines!(axis, [nyquist_mode];
+                    color = (:gray35, 0.60), linestyle = :dot,
+                    linewidth = 1.2)
+            end
+            isnothing(mode_limits) || xlims!(axis, mode_limits...)
+            isnothing(power_limits) || ylims!(axis, power_limits...)
+        end
+        Colorbar(
+            figure[1:panel_rows, panel_columns + 1];
+            limits = spectrum_time_limits,
+            colormap = :viridis,
+            label = L"t\;[\mathrm{Myr}]",
+            tickformat = latex_ticklabels,
+            width = 18,
+        )
+        colgap!(figure.layout, 35)
+        figure
+    end
+
+    fig_magnetic_spectra_time = display_magnetic_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.magnetic) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_magnetic_spectra_time,
+        fig_magnetic_spectra_time,
+    )
+end
+
+# ╔═╡ c4000002-6f8c-4d0c-9a10-000000000002
+begin
+    fig_density_spectra_time = display_density_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.density) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_density_spectra_time,
+        fig_density_spectra_time,
+    )
+end
+
+# ╔═╡ c4000003-6f8c-4d0c-9a10-000000000003
+begin
+    fig_velocity_spectra_time = display_velocity_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.velocity) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_velocity_spectra_time,
+        fig_velocity_spectra_time,
+    )
+end
+
+# ╔═╡ c4000004-6f8c-4d0c-9a10-000000000004
+begin
+    fig_vorticity_spectra_time = display_vorticity_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.vorticity) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_vorticity_spectra_time,
+        fig_vorticity_spectra_time,
+    )
+end
+
+# ╔═╡ c4000005-6f8c-4d0c-9a10-000000000005
+begin
+    fig_enstrophy_spectra_time = display_enstrophy_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.enstrophy) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_enstrophy_spectra_time,
+        fig_enstrophy_spectra_time,
+    )
 end
 
 # ╔═╡ c1000001-6f8c-4d0c-9a10-000000000001
@@ -6600,24 +6699,29 @@ begin
         output
     end
 
-    function add_moose_qu_noise!(Q, U, snr, rng)
-        signal_to_noise = Float64(snr)
-        isfinite(signal_to_noise) && signal_to_noise > 0 ||
-            error("MOOSE Q/U signal-to-noise ratio must be finite and positive.")
-        if ndims(Q) == 2
-            polarized_rms = sqrt(finite_mean(abs2.(Q); default = 0.0) +
-                finite_mean(abs2.(U); default = 0.0))
-            sigma = polarized_rms / signal_to_noise
-            sigma > 0 && (Q .+= sigma .* randn(rng, size(Q));
-                U .+= sigma .* randn(rng, size(U)))
-        else
+    """
+    Add channel noise whose RM-synthesis image has the requested rms in each
+    of Re F(phi) and Im F(phi).
+
+    For the equal-weight transform F = sum(P_j exp(-2i phi dlambda2_j))/N,
+    independent Q/U noise sigma_channel gives sigma_F =
+    sigma_channel/sqrt(N). Injecting the noise before RM synthesis therefore
+    preserves the Faraday-channel correlations imposed by the RMSF.
+    """
+    function add_moose_faraday_noise!(Q, U, faraday_rms_mK, rng)
+        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
+        ndims(Q) == 3 || error("LoTSS-like MOOSE noise requires Q/U frequency cubes.")
+        sigma_F_K = Float64(faraday_rms_mK) * 1.0e-3
+        isfinite(sigma_F_K) && sigma_F_K >= 0 ||
+            error("MOOSE Faraday-spectrum noise must be finite and non-negative.")
+        sigma_channel_K = sigma_F_K * sqrt(size(Q, 3))
+        if sigma_channel_K > 0
+            noise_buffer = Matrix{Float64}(undef, size(Q, 1), size(Q, 2))
             @views for channel in axes(Q, 3)
-                Qchannel, Uchannel = Q[:, :, channel], U[:, :, channel]
-                polarized_rms = sqrt(finite_mean(abs2.(Qchannel); default = 0.0) +
-                    finite_mean(abs2.(Uchannel); default = 0.0))
-                sigma = polarized_rms / signal_to_noise
-                sigma > 0 && (Qchannel .+= sigma .* randn(rng, size(Qchannel));
-                    Uchannel .+= sigma .* randn(rng, size(Uchannel)))
+                randn!(rng, noise_buffer)
+                Q[:, :, channel] .+= sigma_channel_K .* noise_buffer
+                randn!(rng, noise_buffer)
+                U[:, :, channel] .+= sigma_channel_K .* noise_buffer
             end
         end
         Q, U
@@ -7584,8 +7688,8 @@ use all physical and instrumental defaults listed below.
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
-| Add MOOSE Gaussian noise to $Q/U$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = false)) |
-| Polarized signal-to-noise ratio | $(@bind moose_instrument_snr PlutoUI.NumberField(0.1:0.1:1000.0; default = 10.0)) |
+| Add LoTSS-like noise to $F(\phi)$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = true)) |
+| $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
 | Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
 | Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
@@ -7594,9 +7698,9 @@ use all physical and instrumental defaults listed below.
 | Polarization fraction | $(@bind show_moose_fraction PlutoUI.CheckBox(default = true)) |
 | RM-synthesis band start [$\mathrm{MHz}$] | $(@bind moose_band_start_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 120.0)) |
 | RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 167.0)) |
-| Frequency-channel width [$\mathrm{MHz}$] | $(@bind moose_band_step_MHz PlutoUI.NumberField(0.05:0.05:20.0; default = 1.0)) |
-| Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -20.0)) |
-| Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 20.0)) |
+| Number of frequency channels | $(@bind moose_band_channels PlutoUI.NumberField(2:1:4096; default = 401)) |
+| Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -10.0)) |
+| Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 10.0)) |
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
 | First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
@@ -7697,8 +7801,6 @@ begin
     moose_I_K = apply_observational_beam_2d(moose_I_K, cube, sky_dims)
     moose_Q_K = apply_observational_beam_2d(moose_Q_K, cube, sky_dims)
     moose_U_K = apply_observational_beam_2d(moose_U_K, cube, sky_dims)
-    add_moose_noise && add_moose_qu_noise!(moose_Q_K, moose_U_K,
-        moose_instrument_snr, MersenneTwister(Int(moose_instrument_seed)))
     moose_P_K = sqrt.(moose_Q_K .^ 2 .+ moose_U_K .^ 2)
     moose_fraction = moose_P_K ./ max.(abs.(moose_I_K), eps(Float64))
 
@@ -7749,10 +7851,14 @@ end
 begin
     moose_band_lo = min(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
     moose_band_hi = max(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
-    moose_band_step = max(Float64(moose_band_step_MHz), 0.05)
-    moose_band_frequency_MHz = collect(moose_band_lo:moose_band_step:moose_band_hi)
-    length(moose_band_frequency_MHz) >= 2 ||
-        (moose_band_frequency_MHz = [moose_band_lo, moose_band_hi + moose_band_step])
+    moose_nfrequency = max(Int(moose_band_channels), 2)
+    moose_band_hi > moose_band_lo ||
+        error("The MOOSE RM-synthesis band must have a non-zero width.")
+    moose_band_frequency_MHz = collect(range(
+        moose_band_lo,
+        moose_band_hi;
+        length = moose_nfrequency,
+    ))
     moose_band_frequency_Hz = moose_band_frequency_MHz .* 1.0e6
     moose_band_lambda2_m2 = (299_792_458.0 ./ moose_band_frequency_Hz) .^ 2
     moose_phi_lo = min(Float64(moose_phi_min), Float64(moose_phi_max))
@@ -7762,7 +7868,6 @@ begin
     length(moose_phi_axis) >= 2 || (moose_phi_axis = [moose_phi_lo, moose_phi_lo + moose_phi_step])
 
     moose_sky_shape = size(moose_phi_map)
-    moose_nfrequency = length(moose_band_frequency_MHz)
     moose_Q_band_K = Array{Float64}(undef, moose_sky_shape..., moose_nfrequency)
     moose_U_band_K = similar(moose_Q_band_K)
     moose_emissivity_base_Kpc = Float64(moose_synchrotron_norm) .* moose_Bperp_uG .^ moose_B_exponent
@@ -7785,8 +7890,12 @@ begin
         moose_Q_band_K, cube, sky_dims)
     moose_U_band_K = apply_observational_beam_cube(
         moose_U_band_K, cube, sky_dims)
-    add_moose_noise && add_moose_qu_noise!(moose_Q_band_K, moose_U_band_K,
-        moose_instrument_snr, MersenneTwister(Int(moose_instrument_seed)))
+    add_moose_noise && add_moose_faraday_noise!(
+        moose_Q_band_K,
+        moose_U_band_K,
+        moose_faraday_noise_mK,
+        MersenneTwister(Int(moose_instrument_seed)),
+    )
 
     moose_lambda0_sq_m2 = mean(moose_band_lambda2_m2)
     moose_rm_phase_matrix = [cis(-2.0 * phi * (lambda2 - moose_lambda0_sq_m2))
@@ -8404,10 +8513,10 @@ begin
         end
         q_band = apply_observational_beam_cube(q_band, c, sky_dims)
         u_band = apply_observational_beam_cube(u_band, c, sky_dims)
-        add_moose_noise && add_moose_qu_noise!(
+        add_moose_noise && add_moose_faraday_noise!(
             q_band,
             u_band,
-            moose_instrument_snr,
+            moose_faraday_noise_mK,
             MersenneTwister(Int(moose_instrument_seed)),
         )
         polarized_matrix = reshape(complex.(q_band, u_band), :, nfrequency)
@@ -8615,7 +8724,7 @@ begin
         Float64(moose_largest_scale_pix),
         Float64(moose_smallest_scale_pix),
         Bool(add_moose_noise),
-        Float64(moose_instrument_snr),
+        Float64(moose_faraday_noise_mK),
         Int(moose_instrument_seed),
     )
     hi_faraday_hog_by_run = Dict{String, Any}()
@@ -8936,12 +9045,6 @@ begin
         I = apply_observational_beam_2d(I, c, plane_dims)
         Q = apply_observational_beam_2d(Q, c, plane_dims)
         U = apply_observational_beam_2d(U, c, plane_dims)
-        if add_moose_noise
-            temporal_seed = Int(moose_instrument_seed) +
-                round(Int, 1000abs(Float64(c.t)))
-            add_moose_qu_noise!(Q, U, moose_instrument_snr,
-                MersenneTwister(temporal_seed))
-        end
         P = sqrt.(Q .^ 2 .+ U .^ 2)
         polarization_sky_average(P ./ max.(abs.(I), eps(Float64)), abs.(I), weighting)
     end
@@ -9109,6 +9212,10 @@ begin
         "vorticity" => "Vorticity map",
         "enstrophy_density" => "Enstrophy by density and family parameter",
         "power_spectra" => "Power spectra",
+        "density_spectra_time" => "Number-density power spectra through time",
+        "velocity_spectra_time" => "Turbulent-velocity power spectra through time",
+        "vorticity_spectra_time" => "Vorticity power spectra through time",
+        "enstrophy_spectra_time" => "Enstrophy spectra through time",
         "magnetic_spectra_time" => "Magnetic power spectra through time",
         "structure_functions" => "Structure functions",
         "dust_polarization" => "Dust-polarization maps",
@@ -9157,6 +9264,10 @@ begin
         "vorticity" => fig_vorticity,
         "enstrophy_density" => fig_enstrophy_density,
         "power_spectra" => fig_spectra,
+        "density_spectra_time" => fig_density_spectra_time,
+        "velocity_spectra_time" => fig_velocity_spectra_time,
+        "vorticity_spectra_time" => fig_vorticity_spectra_time,
+        "enstrophy_spectra_time" => fig_enstrophy_spectra_time,
         "magnetic_spectra_time" => fig_magnetic_spectra_time,
         "structure_functions" => fig_structure,
         "summary" => fig_summary,
@@ -11310,6 +11421,10 @@ version = "4.1.0+0"
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
 # ╟─3a731972-3404-478c-a572-00a05ab652b1
 # ╠═c4000001-6f8c-4d0c-9a10-000000000001
+# ╠═c4000002-6f8c-4d0c-9a10-000000000002
+# ╠═c4000003-6f8c-4d0c-9a10-000000000003
+# ╠═c4000004-6f8c-4d0c-9a10-000000000004
+# ╠═c4000005-6f8c-4d0c-9a10-000000000005
 # ╠═c1000001-6f8c-4d0c-9a10-000000000001
 # ╠═24e60849-1c70-4df3-bd17-57d29949b7a6
 # ╠═4b16d83f-4a1d-49e7-9270-8f573fd46835

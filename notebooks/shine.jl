@@ -3626,7 +3626,13 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 
 **Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
 
-**Display every selected magnetic spectrum through time:** $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true))
+| Time-resolved spectrum | Display |
+|:--|:--:|
+| Number density | $(@bind display_density_spectra_time PlutoUI.CheckBox(default = true)) |
+| Turbulent velocity | $(@bind display_velocity_spectra_time PlutoUI.CheckBox(default = true)) |
+| Vorticity | $(@bind display_vorticity_spectra_time PlutoUI.CheckBox(default = true)) |
+| Enstrophy | $(@bind display_enstrophy_spectra_time PlutoUI.CheckBox(default = true)) |
+| Magnetic field | $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true)) |
 
 | Power-spectrum panel | Display |
 |:--|:--:|
@@ -4142,24 +4148,29 @@ begin
         output
     end
 
-    function add_moose_qu_noise!(Q, U, snr, rng)
-        signal_to_noise = Float64(snr)
-        isfinite(signal_to_noise) && signal_to_noise > 0 ||
-            error("MOOSE Q/U signal-to-noise ratio must be finite and positive.")
-        if ndims(Q) == 2
-            polarized_rms = sqrt(finite_mean(abs2.(Q); default = 0.0) +
-                finite_mean(abs2.(U); default = 0.0))
-            sigma = polarized_rms / signal_to_noise
-            sigma > 0 && (Q .+= sigma .* randn(rng, size(Q));
-                U .+= sigma .* randn(rng, size(U)))
-        else
+    """
+    Add channel noise whose RM-synthesis image has the requested rms in each
+    of Re F(phi) and Im F(phi).
+
+    For the equal-weight transform F = sum(P_j exp(-2i phi dlambda2_j))/N,
+    independent Q/U noise sigma_channel gives sigma_F =
+    sigma_channel/sqrt(N). Injecting the noise before RM synthesis therefore
+    preserves the Faraday-channel correlations imposed by the RMSF.
+    """
+    function add_moose_faraday_noise!(Q, U, faraday_rms_mK, rng)
+        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
+        ndims(Q) == 3 || error("LoTSS-like MOOSE noise requires Q/U frequency cubes.")
+        sigma_F_K = Float64(faraday_rms_mK) * 1.0e-3
+        isfinite(sigma_F_K) && sigma_F_K >= 0 ||
+            error("MOOSE Faraday-spectrum noise must be finite and non-negative.")
+        sigma_channel_K = sigma_F_K * sqrt(size(Q, 3))
+        if sigma_channel_K > 0
+            noise_buffer = Matrix{Float64}(undef, size(Q, 1), size(Q, 2))
             @views for channel in axes(Q, 3)
-                Qchannel, Uchannel = Q[:, :, channel], U[:, :, channel]
-                polarized_rms = sqrt(finite_mean(abs2.(Qchannel); default = 0.0) +
-                    finite_mean(abs2.(Uchannel); default = 0.0))
-                sigma = polarized_rms / signal_to_noise
-                sigma > 0 && (Qchannel .+= sigma .* randn(rng, size(Qchannel));
-                    Uchannel .+= sigma .* randn(rng, size(Uchannel)))
+                randn!(rng, noise_buffer)
+                Q[:, :, channel] .+= sigma_channel_K .* noise_buffer
+                randn!(rng, noise_buffer)
+                U[:, :, channel] .+= sigma_channel_K .* noise_buffer
             end
         end
         Q, U
@@ -4601,8 +4612,8 @@ use all physical and instrumental defaults listed below.
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
-| Add MOOSE Gaussian noise to $Q/U$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = false)) |
-| Polarized signal-to-noise ratio | $(@bind moose_instrument_snr PlutoUI.NumberField(0.1:0.1:1000.0; default = 10.0)) |
+| Add LoTSS-like noise to $F(\phi)$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = true)) |
+| $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
 | Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
 | Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
@@ -4611,9 +4622,9 @@ use all physical and instrumental defaults listed below.
 | Polarization fraction | $(@bind show_moose_fraction PlutoUI.CheckBox(default = true)) |
 | RM-synthesis band start [$\mathrm{MHz}$] | $(@bind moose_band_start_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 120.0)) |
 | RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 167.0)) |
-| Frequency-channel width [$\mathrm{MHz}$] | $(@bind moose_band_step_MHz PlutoUI.NumberField(0.05:0.05:20.0; default = 1.0)) |
-| Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -20.0)) |
-| Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 20.0)) |
+| Number of frequency channels | $(@bind moose_band_channels PlutoUI.NumberField(2:1:4096; default = 401)) |
+| Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -10.0)) |
+| Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 10.0)) |
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
 | First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
@@ -4714,8 +4725,6 @@ begin
     moose_I_K = apply_observational_beam_2d(moose_I_K, cube, sky_dims)
     moose_Q_K = apply_observational_beam_2d(moose_Q_K, cube, sky_dims)
     moose_U_K = apply_observational_beam_2d(moose_U_K, cube, sky_dims)
-    add_moose_noise && add_moose_qu_noise!(moose_Q_K, moose_U_K,
-        moose_instrument_snr, MersenneTwister(Int(moose_instrument_seed)))
     moose_P_K = sqrt.(moose_Q_K .^ 2 .+ moose_U_K .^ 2)
     moose_fraction = moose_P_K ./ max.(abs.(moose_I_K), eps(Float64))
 
@@ -4758,10 +4767,14 @@ end
 begin
     moose_band_lo = min(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
     moose_band_hi = max(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
-    moose_band_step = max(Float64(moose_band_step_MHz), 0.05)
-    moose_band_frequency_MHz = collect(moose_band_lo:moose_band_step:moose_band_hi)
-    length(moose_band_frequency_MHz) >= 2 ||
-        (moose_band_frequency_MHz = [moose_band_lo, moose_band_hi + moose_band_step])
+    moose_nfrequency = max(Int(moose_band_channels), 2)
+    moose_band_hi > moose_band_lo ||
+        error("The MOOSE RM-synthesis band must have a non-zero width.")
+    moose_band_frequency_MHz = collect(range(
+        moose_band_lo,
+        moose_band_hi;
+        length = moose_nfrequency,
+    ))
     moose_band_frequency_Hz = moose_band_frequency_MHz .* 1.0e6
     moose_band_lambda2_m2 = (299_792_458.0 ./ moose_band_frequency_Hz) .^ 2
     moose_phi_lo = min(Float64(moose_phi_min), Float64(moose_phi_max))
@@ -4771,7 +4784,6 @@ begin
     length(moose_phi_axis) >= 2 || (moose_phi_axis = [moose_phi_lo, moose_phi_lo + moose_phi_step])
 
     moose_sky_shape = size(moose_phi_map)
-    moose_nfrequency = length(moose_band_frequency_MHz)
     moose_Q_band_K = Array{Float64}(undef, moose_sky_shape..., moose_nfrequency)
     moose_U_band_K = similar(moose_Q_band_K)
     moose_emissivity_base_Kpc = Float64(moose_synchrotron_norm) .* moose_Bperp_uG .^ moose_B_exponent
@@ -4794,8 +4806,12 @@ begin
         moose_Q_band_K, cube, sky_dims)
     moose_U_band_K = apply_observational_beam_cube(
         moose_U_band_K, cube, sky_dims)
-    add_moose_noise && add_moose_qu_noise!(moose_Q_band_K, moose_U_band_K,
-        moose_instrument_snr, MersenneTwister(Int(moose_instrument_seed)))
+    add_moose_noise && add_moose_faraday_noise!(
+        moose_Q_band_K,
+        moose_U_band_K,
+        moose_faraday_noise_mK,
+        MersenneTwister(Int(moose_instrument_seed)),
+    )
 
     moose_lambda0_sq_m2 = mean(moose_band_lambda2_m2)
     moose_rm_phase_matrix = [cis(-2.0 * phi * (lambda2 - moose_lambda0_sq_m2))
@@ -5205,10 +5221,10 @@ begin
         end
         q_band = apply_observational_beam_cube(q_band, c, sky_dims)
         u_band = apply_observational_beam_cube(u_band, c, sky_dims)
-        add_moose_noise && add_moose_qu_noise!(
+        add_moose_noise && add_moose_faraday_noise!(
             q_band,
             u_band,
-            moose_instrument_snr,
+            moose_faraday_noise_mK,
             MersenneTwister(Int(moose_instrument_seed)),
         )
         polarized_matrix = reshape(complex.(q_band, u_band), :, nfrequency)
@@ -5416,7 +5432,7 @@ begin
         Float64(moose_largest_scale_pix),
         Float64(moose_smallest_scale_pix),
         Bool(add_moose_noise),
-        Float64(moose_instrument_snr),
+        Float64(moose_faraday_noise_mK),
         Int(moose_instrument_seed),
     )
     hi_faraday_hog_by_run = Dict{String, Any}()
@@ -5737,12 +5753,6 @@ begin
         I = apply_observational_beam_2d(I, c, plane_dims)
         Q = apply_observational_beam_2d(Q, c, plane_dims)
         U = apply_observational_beam_2d(U, c, plane_dims)
-        if add_moose_noise
-            temporal_seed = Int(moose_instrument_seed) +
-                round(Int, 1000abs(Float64(c.t)))
-            add_moose_qu_noise!(Q, U, moose_instrument_snr,
-                MersenneTwister(temporal_seed))
-        end
         P = sqrt.(Q .^ 2 .+ U .^ 2)
         polarization_sky_average(P ./ max.(abs.(I), eps(Float64)), abs.(I), weighting)
     end

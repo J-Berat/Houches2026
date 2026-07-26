@@ -19,8 +19,9 @@ LesHouchesGit/
 ├── run_figures.jl              # calcul batch sans interface
 ├── export_html.jl              # export du notebook maître
 ├── Project.toml
-├── Manifest-v1.11.toml
-├── Manifest-v1.12.toml
+├── Manifest.toml               # environnement de repli (toute version)
+├── Manifest-v1.11.toml         # environnement résolu pour Julia 1.11
+├── Manifest-v1.12.toml         # environnement résolu pour Julia 1.12
 ├── notebooks/                  # notebooks spécialisés générés
 │   ├── dynamo.jl
 │   ├── dust.jl
@@ -51,6 +52,13 @@ Julia 1.11 ou 1.12 est recommandé.
 cd "/Users/jb270005/Desktop/LesHouchesGit"
 julia --project=. -e 'import Pkg; Pkg.instantiate()'
 ```
+
+Le dépôt versionne trois manifestes, ce qui est voulu : Julia sélectionne
+automatiquement le manifeste correspondant à sa version
+(`Manifest-v1.11.toml` sous Julia 1.11, `Manifest-v1.12.toml` sous Julia
+1.12) et retombe sur `Manifest.toml` pour toute autre version. Chaque
+manifeste est régénéré par `Pkg.instantiate()` / `Pkg.resolve()` sous la
+version de Julia concernée ; il ne faut pas les éditer à la main.
 
 ## Utilisation interactive avec Pluto
 
@@ -102,7 +110,7 @@ The run lists and folders are configured near the top of `run_figures.jl`.
 `SELECTED_COMPARISONS` can contain `mach`, `resolution`, and/or `ratio`.
 For each selected comparison, the script creates two jobs:
 
-- the first 20 snapshots for all 21 Dynamo figures, including separate 3D and
+- the first 20 snapshots for all 24 Dynamo figures, including separate 3D and
   projected 2D HRO outputs and a seven-panel summary figure;
 - the last 10 snapshots for all 23 figures from Dust, StarlightPol, ZEEMAN,
   MOOSE, and SHINE.
@@ -117,10 +125,12 @@ the forcing wavenumber, and the Nyquist limit. A simulation keeps the same
 color throughout a comparison group. The summary also includes the magnetic
 field evolution separated into CNM, LNM, and WNM thermal phases.
 
-The additional `magnetic_spectra_time` figure overlays every selected
-\(E_B(k)\) snapshot in one panel per simulation. A shared physical-time
-colorbar, together with increasing opacity and line width, shows the temporal
-ordering while common axes preserve direct comparison between simulations.
+The five time-resolved spectrum figures overlay every selected density,
+velocity, vorticity, enstrophy, or magnetic snapshot in one panel per
+simulation. Their horizontal coordinate is the dimensionless mode
+\(kL/(2\pi)\). A shared physical-time colorbar, together with increasing
+opacity and line width, shows temporal ordering while common axes preserve
+direct comparison between simulations.
 
 MOOSE and SHINE each export an additional four-panel spatial power-spectrum
 figure. MOOSE covers Faraday depth, synchrotron intensity, polarized intensity,

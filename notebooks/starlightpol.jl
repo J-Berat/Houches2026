@@ -2885,7 +2885,13 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 
 **Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
 
-**Display every selected magnetic spectrum through time:** $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true))
+| Time-resolved spectrum | Display |
+|:--|:--:|
+| Number density | $(@bind display_density_spectra_time PlutoUI.CheckBox(default = true)) |
+| Turbulent velocity | $(@bind display_velocity_spectra_time PlutoUI.CheckBox(default = true)) |
+| Vorticity | $(@bind display_vorticity_spectra_time PlutoUI.CheckBox(default = true)) |
+| Enstrophy | $(@bind display_enstrophy_spectra_time PlutoUI.CheckBox(default = true)) |
+| Magnetic field | $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true)) |
 
 | Power-spectrum panel | Display |
 |:--|:--:|
@@ -3401,24 +3407,29 @@ begin
         output
     end
 
-    function add_moose_qu_noise!(Q, U, snr, rng)
-        signal_to_noise = Float64(snr)
-        isfinite(signal_to_noise) && signal_to_noise > 0 ||
-            error("MOOSE Q/U signal-to-noise ratio must be finite and positive.")
-        if ndims(Q) == 2
-            polarized_rms = sqrt(finite_mean(abs2.(Q); default = 0.0) +
-                finite_mean(abs2.(U); default = 0.0))
-            sigma = polarized_rms / signal_to_noise
-            sigma > 0 && (Q .+= sigma .* randn(rng, size(Q));
-                U .+= sigma .* randn(rng, size(U)))
-        else
+    """
+    Add channel noise whose RM-synthesis image has the requested rms in each
+    of Re F(phi) and Im F(phi).
+
+    For the equal-weight transform F = sum(P_j exp(-2i phi dlambda2_j))/N,
+    independent Q/U noise sigma_channel gives sigma_F =
+    sigma_channel/sqrt(N). Injecting the noise before RM synthesis therefore
+    preserves the Faraday-channel correlations imposed by the RMSF.
+    """
+    function add_moose_faraday_noise!(Q, U, faraday_rms_mK, rng)
+        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
+        ndims(Q) == 3 || error("LoTSS-like MOOSE noise requires Q/U frequency cubes.")
+        sigma_F_K = Float64(faraday_rms_mK) * 1.0e-3
+        isfinite(sigma_F_K) && sigma_F_K >= 0 ||
+            error("MOOSE Faraday-spectrum noise must be finite and non-negative.")
+        sigma_channel_K = sigma_F_K * sqrt(size(Q, 3))
+        if sigma_channel_K > 0
+            noise_buffer = Matrix{Float64}(undef, size(Q, 1), size(Q, 2))
             @views for channel in axes(Q, 3)
-                Qchannel, Uchannel = Q[:, :, channel], U[:, :, channel]
-                polarized_rms = sqrt(finite_mean(abs2.(Qchannel); default = 0.0) +
-                    finite_mean(abs2.(Uchannel); default = 0.0))
-                sigma = polarized_rms / signal_to_noise
-                sigma > 0 && (Qchannel .+= sigma .* randn(rng, size(Qchannel));
-                    Uchannel .+= sigma .* randn(rng, size(Uchannel)))
+                randn!(rng, noise_buffer)
+                Q[:, :, channel] .+= sigma_channel_K .* noise_buffer
+                randn!(rng, noise_buffer)
+                U[:, :, channel] .+= sigma_channel_K .* noise_buffer
             end
         end
         Q, U

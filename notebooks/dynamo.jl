@@ -5609,7 +5609,13 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 
 **Display density, velocity, vorticity, and magnetic power spectra:** $(@bind display_power_spectra PlutoUI.CheckBox(default = true))
 
-**Display every selected magnetic spectrum through time:** $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true))
+| Time-resolved spectrum | Display |
+|:--|:--:|
+| Number density | $(@bind display_density_spectra_time PlutoUI.CheckBox(default = true)) |
+| Turbulent velocity | $(@bind display_velocity_spectra_time PlutoUI.CheckBox(default = true)) |
+| Vorticity | $(@bind display_vorticity_spectra_time PlutoUI.CheckBox(default = true)) |
+| Enstrophy | $(@bind display_enstrophy_spectra_time PlutoUI.CheckBox(default = true)) |
+| Magnetic field | $(@bind display_magnetic_spectra_time PlutoUI.CheckBox(default = true)) |
 
 | Power-spectrum panel | Display |
 |:--|:--:|
@@ -5811,7 +5817,7 @@ end
 
 # ╔═╡ c4000001-6f8c-4d0c-9a10-000000000001
 begin
-    magnetic_spectrum_time_records = Dict{String, Vector{Any}}()
+    spectrum_time_records = Dict{String, Vector{Any}}()
     for label in comparison_run_labels
         records = Any[]
         for (path, product) in zip(
@@ -5828,150 +5834,243 @@ begin
             push!(records, (
                 path,
                 time = physical_time,
-                k = Float64.(product.kb),
-                power = Float64.(product.Pb),
-                box_length_pc = Float64(product.box_length_pc),
-                nyquist = Float64(product.nyquist),
+                product,
             ))
         end
         sort!(records; by = record ->
             isfinite(record.time) ? record.time : Inf)
-        magnetic_spectrum_time_records[label] = records
+        spectrum_time_records[label] = records
     end
 
-    magnetic_spectrum_times = Float64[
+    spectrum_times = Float64[
         record.time
         for label in comparison_run_labels
-        for record in magnetic_spectrum_time_records[label]
+        for record in spectrum_time_records[label]
         if isfinite(record.time)
     ]
-    magnetic_spectrum_time_limits =
-        isempty(magnetic_spectrum_times) ? (0.0, 1.0) :
-        extrema(magnetic_spectrum_times)
-    magnetic_spectrum_time_limits[1] ==
-        magnetic_spectrum_time_limits[2] &&
-        (magnetic_spectrum_time_limits = (
-            magnetic_spectrum_time_limits[1] - 0.5,
-            magnetic_spectrum_time_limits[2] + 0.5,
+    spectrum_time_limits =
+        isempty(spectrum_times) ? (0.0, 1.0) :
+        extrema(spectrum_times)
+    spectrum_time_limits[1] == spectrum_time_limits[2] &&
+        (spectrum_time_limits = (
+            spectrum_time_limits[1] - 0.5,
+            spectrum_time_limits[2] + 0.5,
         ))
-    magnetic_time_colormap = Makie.to_colormap(:viridis)
-    function magnetic_time_color(time)
+    spectrum_time_colormap = Makie.to_colormap(:viridis)
+    function spectrum_time_color(time)
         fraction = clamp(
-            (Float64(time) - magnetic_spectrum_time_limits[1]) /
-                (magnetic_spectrum_time_limits[2] -
-                    magnetic_spectrum_time_limits[1]),
+            (Float64(time) - spectrum_time_limits[1]) /
+                (spectrum_time_limits[2] - spectrum_time_limits[1]),
             0.0,
             1.0,
         )
         index = clamp(
-            round(Int, 1 + fraction * (length(magnetic_time_colormap) - 1)),
+            round(Int, 1 + fraction * (length(spectrum_time_colormap) - 1)),
             1,
-            length(magnetic_time_colormap),
+            length(spectrum_time_colormap),
         )
-        magnetic_time_colormap[index], fraction
+        spectrum_time_colormap[index], fraction
     end
 
-    magnetic_all_k = Float64[
-        value
-        for label in comparison_run_labels
-        for record in magnetic_spectrum_time_records[label]
-        for value in record.k
-        if isfinite(value) && value > 0
-    ]
-    magnetic_all_power = Float64[
-        value
-        for label in comparison_run_labels
-        for record in magnetic_spectrum_time_records[label]
-        for value in record.power
-        if isfinite(value) && value > 0
-    ]
-    magnetic_k_limits = enclosing_decade_limits(magnetic_all_k)
-    magnetic_power_limits = enclosing_decade_limits(magnetic_all_power)
-
-    magnetic_panel_columns = min(3, length(comparison_run_labels))
-    magnetic_panel_rows =
-        cld(length(comparison_run_labels), magnetic_panel_columns)
-    fig_magnetic_spectra_time = Figure(
-        size = (520magnetic_panel_columns,
-            470magnetic_panel_rows + 100),
-    )
-    Label(
-        fig_magnetic_spectra_time[0, 1:magnetic_panel_columns],
-        L"\mathrm{Magnetic\ power\ spectra\ through\ time}";
-        fontsize = 23,
-        font = :bold,
-    )
-    for (panel_index, label) in enumerate(comparison_run_labels)
-        row = cld(panel_index, magnetic_panel_columns)
-        column = mod1(panel_index, magnetic_panel_columns)
-        records = magnetic_spectrum_time_records[label]
-        plottable_count = count(records) do record
-            any(isfinite.(record.k) .& isfinite.(record.power) .&
-                (record.k .> 0) .& (record.power .> 0))
-        end
-        panel_title = latexstring(
-            run_label_latex_source(plain_legend_run_label(label)),
-            raw";\;N_{\mathrm{nonzero}}=",
-            plottable_count,
-            raw"/",
-            length(records),
-        )
-        axis = latex_axis(
-            fig_magnetic_spectra_time[row, column];
-            xlabel = L"k\;[\mathrm{pc}^{-1}]",
+    spectrum_time_specs = (
+        density = (
+            kfield = :krho,
+            pfield = :Prho,
+            scale = 1.0,
+            title = L"\mathrm{Number\!-\!density\ power\ spectra\ through\ time}",
+            ylabel = L"E_n(k)\;[\mathrm{cm}^{-6}\,\mathrm{pc}]",
+        ),
+        velocity = (
+            kfield = :kv,
+            pfield = :Pv,
+            scale = 1.0,
+            title = L"\mathrm{Turbulent\!-\!velocity\ power\ spectra\ through\ time}",
+            ylabel = L"E_v(k)\;[(\mathrm{km\,s}^{-1})^2\,\mathrm{pc}]",
+        ),
+        vorticity = (
+            kfield = :komega,
+            pfield = :Pomega,
+            scale = 1.0,
+            title = L"\mathrm{Vorticity\ power\ spectra\ through\ time}",
+            ylabel = L"E_\omega(k)\;[\mathrm{Myr}^{-2}\,\mathrm{pc}]",
+        ),
+        enstrophy = (
+            kfield = :komega,
+            pfield = :Pomega,
+            scale = 0.5,
+            title = L"\mathrm{Enstrophy\ spectra\ through\ time}",
+            ylabel = L"\mathcal{Z}(k)=\frac{1}{2}E_\omega(k)\;[\mathrm{Myr}^{-2}\,\mathrm{pc}]",
+        ),
+        magnetic = (
+            kfield = :kb,
+            pfield = :Pb,
+            scale = 1.0,
+            title = L"\mathrm{Magnetic\ power\ spectra\ through\ time}",
             ylabel = L"E_B(k)\;[\mu\mathrm{G}^2\,\mathrm{pc}]",
-            title = panel_title,
-            xscale = log10,
-            yscale = log10,
-            xticks = DECADE_TICKS,
-            yticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9),
-            yminorticks = IntervalsBetween(9),
-            xminorticksvisible = true,
-            yminorticksvisible = true,
-        )
-        for record in records
-            valid = isfinite.(record.k) .& isfinite.(record.power) .&
-                (record.k .> 0) .& (record.power .> 0)
-            any(valid) || continue
-            color, time_fraction = magnetic_time_color(record.time)
-            lines!(
-                axis,
-                record.k[valid],
-                record.power[valid];
-                color = (color, 0.35 + 0.65time_fraction),
-                linewidth = 1.2 + 1.8time_fraction,
-            )
-        end
-        representative = findfirst(record -> !isempty(record.k), records)
-        if !isnothing(representative)
-            product = records[representative]
-            forcing_k = 2 * 2pi / product.box_length_pc
-            vlines!(axis, [forcing_k];
-                color = (:black, 0.60), linestyle = :dash,
-                linewidth = 1.2)
-            vlines!(axis, [product.nyquist];
-                color = (:gray35, 0.60), linestyle = :dot,
-                linewidth = 1.2)
-        end
-        isnothing(magnetic_k_limits) ||
-            xlims!(axis, magnetic_k_limits...)
-        isnothing(magnetic_power_limits) ||
-            ylims!(axis, magnetic_power_limits...)
-    end
-    Colorbar(
-        fig_magnetic_spectra_time[
-            1:magnetic_panel_rows,
-            magnetic_panel_columns + 1,
-        ];
-        limits = magnetic_spectrum_time_limits,
-        colormap = :viridis,
-        label = L"t\;[\mathrm{Myr}]",
-        tickformat = latex_ticklabels,
-        width = 18,
+        ),
     )
-    colgap!(fig_magnetic_spectra_time.layout, 35)
-    display_magnetic_spectra_time ? fig_magnetic_spectra_time : nothing
+
+    function time_resolved_spectrum_figure(spec)
+        panel_columns = min(3, length(comparison_run_labels))
+        panel_rows = cld(length(comparison_run_labels), panel_columns)
+        figure = Figure(
+            size = (560panel_columns + 120, 470panel_rows + 100),
+            figure_padding = (100, 70, 25, 25),
+        )
+        Label(
+            figure[0, 1:panel_columns],
+            spec.title;
+            fontsize = 23,
+            font = :bold,
+        )
+
+        all_modes = Float64[]
+        all_power = Float64[]
+        for label in comparison_run_labels, record in spectrum_time_records[label]
+            product = record.product
+            physical_k = Float64.(getfield(product, spec.kfield))
+            power = spec.scale .* Float64.(getfield(product, spec.pfield))
+            append!(all_modes, physical_k .* Float64(product.box_length_pc) ./ (2pi))
+            append!(all_power, power)
+        end
+        mode_limits = enclosing_decade_limits(filter(
+            value -> isfinite(value) && value > 0,
+            all_modes,
+        ))
+        power_limits = enclosing_decade_limits(filter(
+            value -> isfinite(value) && value > 0,
+            all_power,
+        ))
+
+        for (panel_index, label) in enumerate(comparison_run_labels)
+            row = cld(panel_index, panel_columns)
+            column = mod1(panel_index, panel_columns)
+            records = spectrum_time_records[label]
+            plottable_count = count(records) do record
+                product = record.product
+                k = getfield(product, spec.kfield)
+                power = spec.scale .* getfield(product, spec.pfield)
+                any(isfinite.(k) .& isfinite.(power) .&
+                    (k .> 0) .& (power .> 0))
+            end
+            panel_title = latexstring(
+                run_label_latex_source(plain_legend_run_label(label)),
+                raw";\;N_{\mathrm{snap}}=",
+                plottable_count,
+                raw"/",
+                length(records),
+            )
+            axis = latex_axis(
+                figure[row, column];
+                xlabel = L"kL/(2\pi)",
+                ylabel = spec.ylabel,
+                title = panel_title,
+                xscale = log10,
+                yscale = log10,
+                xticks = DECADE_TICKS,
+                yticks = DECADE_TICKS,
+                xminorticks = IntervalsBetween(9),
+                yminorticks = IntervalsBetween(9),
+                xminorticksvisible = true,
+                yminorticksvisible = true,
+            )
+            for record in records
+                product = record.product
+                mode = Float64.(getfield(product, spec.kfield)) .*
+                    Float64(product.box_length_pc) ./ (2pi)
+                power = spec.scale .* Float64.(getfield(product, spec.pfield))
+                valid = isfinite.(mode) .& isfinite.(power) .&
+                    (mode .> 0) .& (power .> 0)
+                any(valid) || continue
+                color, time_fraction = spectrum_time_color(record.time)
+                lines!(
+                    axis,
+                    mode[valid],
+                    power[valid];
+                    color = (color, 0.35 + 0.65time_fraction),
+                    linewidth = 1.2 + 1.8time_fraction,
+                )
+            end
+            representative = findfirst(records) do record
+                !isempty(getfield(record.product, spec.kfield))
+            end
+            if !isnothing(representative)
+                product = records[representative].product
+                nyquist_mode = Float64(product.nyquist) *
+                    Float64(product.box_length_pc) / (2pi)
+                vlines!(axis, [2.0];
+                    color = (:black, 0.60), linestyle = :dash,
+                    linewidth = 1.2)
+                vlines!(axis, [nyquist_mode];
+                    color = (:gray35, 0.60), linestyle = :dot,
+                    linewidth = 1.2)
+            end
+            isnothing(mode_limits) || xlims!(axis, mode_limits...)
+            isnothing(power_limits) || ylims!(axis, power_limits...)
+        end
+        Colorbar(
+            figure[1:panel_rows, panel_columns + 1];
+            limits = spectrum_time_limits,
+            colormap = :viridis,
+            label = L"t\;[\mathrm{Myr}]",
+            tickformat = latex_ticklabels,
+            width = 18,
+        )
+        colgap!(figure.layout, 35)
+        figure
+    end
+
+    fig_magnetic_spectra_time = display_magnetic_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.magnetic) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_magnetic_spectra_time,
+        fig_magnetic_spectra_time,
+    )
+end
+
+# ╔═╡ c4000002-6f8c-4d0c-9a10-000000000002
+begin
+    fig_density_spectra_time = display_density_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.density) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_density_spectra_time,
+        fig_density_spectra_time,
+    )
+end
+
+# ╔═╡ c4000003-6f8c-4d0c-9a10-000000000003
+begin
+    fig_velocity_spectra_time = display_velocity_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.velocity) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_velocity_spectra_time,
+        fig_velocity_spectra_time,
+    )
+end
+
+# ╔═╡ c4000004-6f8c-4d0c-9a10-000000000004
+begin
+    fig_vorticity_spectra_time = display_vorticity_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.vorticity) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_vorticity_spectra_time,
+        fig_vorticity_spectra_time,
+    )
+end
+
+# ╔═╡ c4000005-6f8c-4d0c-9a10-000000000005
+begin
+    fig_enstrophy_spectra_time = display_enstrophy_spectra_time ?
+        time_resolved_spectrum_figure(spectrum_time_specs.enstrophy) :
+        Figure(size = (900, 180))
+    stable_pluto_figure(
+        display_enstrophy_spectra_time,
+        fig_enstrophy_spectra_time,
+    )
 end
 
 # ╔═╡ c1000001-6f8c-4d0c-9a10-000000000001
@@ -6349,6 +6448,10 @@ begin
         "vorticity" => "Vorticity map",
         "enstrophy_density" => "Enstrophy by density",
         "power_spectra" => "Power spectra",
+        "density_spectra_time" => "Number-density power spectra through time",
+        "velocity_spectra_time" => "Turbulent-velocity power spectra through time",
+        "vorticity_spectra_time" => "Vorticity power spectra through time",
+        "enstrophy_spectra_time" => "Enstrophy spectra through time",
         "magnetic_spectra_time" => "Magnetic power spectra through time",
         "structure_functions" => "Structure functions",
         "summary" => "Dynamo summary",
@@ -6372,6 +6475,10 @@ begin
         "vorticity" => fig_vorticity,
         "enstrophy_density" => fig_enstrophy_density,
         "power_spectra" => fig_spectra,
+        "density_spectra_time" => fig_density_spectra_time,
+        "velocity_spectra_time" => fig_velocity_spectra_time,
+        "vorticity_spectra_time" => fig_vorticity_spectra_time,
+        "enstrophy_spectra_time" => fig_enstrophy_spectra_time,
         "magnetic_spectra_time" => fig_magnetic_spectra_time,
         "structure_functions" => fig_structure,
         "summary" => fig_summary,
@@ -8492,6 +8599,10 @@ version = "4.1.0+0"
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
 # ╟─3a731972-3404-478c-a572-00a05ab652b1
 # ╠═c4000001-6f8c-4d0c-9a10-000000000001
+# ╠═c4000002-6f8c-4d0c-9a10-000000000002
+# ╠═c4000003-6f8c-4d0c-9a10-000000000003
+# ╠═c4000004-6f8c-4d0c-9a10-000000000004
+# ╠═c4000005-6f8c-4d0c-9a10-000000000005
 # ╠═c1000001-6f8c-4d0c-9a10-000000000001
 # ╠═24e60849-1c70-4df3-bd17-57d29949b7a6
 # ╠═4b16d83f-4a1d-49e7-9270-8f573fd46835

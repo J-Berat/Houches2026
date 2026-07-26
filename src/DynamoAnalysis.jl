@@ -251,6 +251,11 @@ function selected_cell_ids(figures)
     for name in figures
         union!(selected, FIGURE_CELL_IDS[name])
     end
+    # These cells define loader and numerical helpers that Pluto may expose
+    # before their narrative position. Always include them in the sequential
+    # batch plan, even when a conditional call is invisible to Pluto's static
+    # dependency analysis.
+    union!(selected, EARLY_DEFINITION_CELL_IDS)
     selected
 end
 

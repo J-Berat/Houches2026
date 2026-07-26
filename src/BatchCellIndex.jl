@@ -754,6 +754,7 @@ const FIGURE_CELL_IDS = Dict{String,Set{Base.UUID}}(
         Base.UUID("32110739-b60e-4592-856a-dd74f7a37401"),
         Base.UUID("94a0a0dc-baf6-4e62-a51e-dc6124d98fd4"),
         Base.UUID("c12d1f54-40b8-4865-9562-8dcb519f924a"),
+        Base.UUID("904ba663-d536-4b27-a379-4af927b0affb"),
         Base.UUID("36aef377-3de7-435a-af83-3a90421e3159"),
         Base.UUID("71c8ea26-d2ad-4430-9265-0b28d45bba1c"),
         Base.UUID("cd7e037c-62f5-4682-92c2-92af7169d692"),

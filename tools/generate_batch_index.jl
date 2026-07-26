@@ -28,6 +28,7 @@ const EXPLICIT_FIGURE_DEPENDENCY_IDS = Dict(
         "growth_rate_relations",
         "normalized_magnetic_relations",
         "energy_time",
+        "polarization_time",
         "summary",
     )
 )

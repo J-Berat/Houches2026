@@ -3087,7 +3087,7 @@ md"""
 
 This comparative figure shows one joint distribution of number density $n$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. The plotted coordinates are $\log_{10}n$ and $\log_{10}(P/k_{\mathrm B})$; empty probability bins are masked and all panels share one color scale.
 
-The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curve satisfies $n\Lambda(T)=\Gamma$ with $P/k_{\mathrm B}=nT$.
+The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curves satisfy $n\Lambda(T,Z)=\Gamma$ with $P/k_{\mathrm B}=nT$. In this illustrative metallicity extension, the low-temperature metal-line cooling term scales linearly with $Z/Z_\odot$, while the hydrogen cooling term and the heating rate remain fixed. These curves compare cooling multiplicities; they are not a substitute for a self-consistent chemical network.
 
 **Display the pressure-density phase diagram:** $(@bind display_phase_diagram PlutoUI.CheckBox(default = true))
 
@@ -3095,6 +3095,7 @@ The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H
 |:--|:--|
 | Bins per axis | $(@bind phase_bins PlutoUI.Slider(20:5:120; default = 60, show_value = true)) |
 | Thermal-equilibrium curve | $(@bind show_phase_equilibrium PlutoUI.CheckBox(default = true)) |
+| Equilibrium metallicities $Z/Z_\odot$ | $(@bind phase_equilibrium_metallicities PlutoUI.MultiSelect([0.1, 0.3, 1.0, 2.0]; default = [0.1, 0.3, 1.0, 2.0])) |
 """
 
 # ╔═╡ 9da572fe-21f2-43df-9320-b8742fd64773
@@ -3124,13 +3125,18 @@ begin
         (; xcenters, ycenters, log_probability)
     end
 
-    function koyama_inutsuka_equilibrium(; temperature_min = 10.0,
+    function koyama_inutsuka_equilibrium(metallicity; temperature_min = 10.0,
             temperature_max = 1.0e5, samples = 2400)
+        metallicity_value = Float64(metallicity)
+        metallicity_value > 0 || error("Metallicity must be positive.")
         temperature_K = 10.0 .^ range(log10(temperature_min), log10(temperature_max);
             length = samples)
-        cooling_over_heating_cm3 =
-            1.0e7 .* exp.(-1.184e5 ./ (temperature_K .+ 1000.0)) .+
+        hydrogen_cooling_over_heating_cm3 =
+            1.0e7 .* exp.(-1.184e5 ./ (temperature_K .+ 1000.0))
+        metal_cooling_over_heating_cm3 =
             1.4e-2 .* sqrt.(temperature_K) .* exp.(-92.0 ./ temperature_K)
+        cooling_over_heating_cm3 = hydrogen_cooling_over_heating_cm3 .+
+            metallicity_value .* metal_cooling_over_heating_cm3
         equilibrium_density_cm3 = 1.0 ./ cooling_over_heating_cm3
         equilibrium_pressure_over_k = equilibrium_density_cm3 .* temperature_K
         valid = isfinite.(equilibrium_density_cm3) .&
@@ -3156,13 +3162,21 @@ begin
                 vec(Float64.(local_cube.rho)) : ones(length(local_cube.rho))
             phase_histogram(local_logn, local_logpk, local_weights, phase_bins)
         end for label in comparison_run_labels)
-    phase_equilibrium = koyama_inutsuka_equilibrium()
+    phase_metallicities = sort(unique(Float64.(phase_equilibrium_metallicities)))
+    phase_equilibria = [(
+        metallicity = metallicity,
+        curve = koyama_inutsuka_equilibrium(metallicity),
+    ) for metallicity in phase_metallicities]
 end
 
 # ╔═╡ 41b4eb12-889d-43b3-87c2-fc7cccf8679f
 begin
     phase_panel_count = length(comparison_run_labels)
-    fig_phase = Figure(size = (560phase_panel_count + 80, 520))
+    fig_phase = Figure(size = (560phase_panel_count + 80, 620))
+    phase_equilibrium_colors = [
+        MHD_COLORS[mod1(index, length(MHD_COLORS))]
+        for index in eachindex(phase_equilibria)
+    ]
     combined_phase_probability = vcat([
         finite_values(phase_data_by_run[label].log_probability)
         for label in comparison_run_labels]...)
@@ -3176,13 +3190,17 @@ begin
             title = latex_run_label(label))
         phase_heatmap = heatmap!(phase_axis, phase_data.xcenters, phase_data.ycenters,
             phase_data.log_probability; colormap = :magma, colorrange = phase_range)
-        if show_phase_equilibrium
-            lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
-                color = :black, linewidth = 4.5)
-            lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
-                color = :white, linewidth = 2.5,
-                label = L"n\Lambda(T)=\Gamma")
-            panel_index == 1 && axislegend(phase_axis; position = :rt, labelsize = 14)
+        if show_phase_equilibrium && !isempty(phase_equilibria)
+            for (curve_index, equilibrium) in enumerate(phase_equilibria)
+                curve_color = phase_equilibrium_colors[curve_index]
+                curve_width = isapprox(equilibrium.metallicity, 1.0) ? 3.2 : 2.4
+                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                    color = (:black, 0.72), linewidth = curve_width + 2.0)
+                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                    color = curve_color, linewidth = curve_width,
+                    label = latexstring("Z/Z_{\\odot}=",
+                        @sprintf("%.2g", equilibrium.metallicity)))
+            end
         end
         phase_dx = length(phase_data.xcenters) > 1 ?
             phase_data.xcenters[2] - phase_data.xcenters[1] : 1.0
@@ -3196,6 +3214,20 @@ begin
     latex_colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
         label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)
     colsize!(fig_phase.layout, phase_panel_count + 1, 22)
+    if show_phase_equilibrium && !isempty(phase_equilibria)
+        Legend(fig_phase[2, 1:phase_panel_count], [
+                LineElement(color = color, linewidth =
+                    isapprox(equilibrium.metallicity, 1.0) ? 3.2 : 2.4)
+                for (color, equilibrium) in zip(
+                    phase_equilibrium_colors, phase_equilibria)
+            ], [
+                latexstring("Z/Z_{\\odot}=",
+                    @sprintf("%.2g", equilibrium.metallicity))
+                for equilibrium in phase_equilibria
+            ], L"n\Lambda(T,Z)=\Gamma";
+            orientation = :horizontal, nbanks = 2,
+            tellheight = true, framevisible = false, labelsize = 14)
+    end
     display_phase_diagram ? fig_phase : nothing
 end
 
@@ -7523,22 +7555,30 @@ md"""
 ## 16. MOOSE Faraday post-processing
 
 Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis.
+The default MOOSE output is restricted to Faraday-depth space: the local
+$F(\phi)$ spectrum and the H I--Faraday HOG in $(u,\phi)$. Batch calculations
+use all physical and instrumental defaults listed below.
 
 | MOOSE figure | Display |
 |:--|:--:|
-| Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = true)) |
+| Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = false)) |
 | Faraday tomography | $(@bind display_moose_tomography PlutoUI.CheckBox(default = true)) |
-| Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = true)) |
-| Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = true)) |
+| Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = false)) |
+| Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = false)) |
 
 | MOOSE setting | Control |
 |:--|:--|
-| Electron prescription | $(@bind moose_electron_model PlutoUI.Select(["Two-phase ionization", "Constant ionization fraction"]; default = "Two-phase ionization")) |
+| Electron prescription | $(@bind moose_electron_model PlutoUI.Select(["Wolfire–Bellomi equilibrium", "Two-phase ionization (legacy)", "Constant ionization fraction"]; default = "Wolfire–Bellomi equilibrium")) |
+| Total H ionization rate $\zeta$ [$\mathrm{s}^{-1}$] | $(@bind moose_ionization_rate PlutoUI.NumberField(default = 2.5e-16)) |
+| Effective radiation field $G_{\rm eff}$ [Habing] | $(@bind moose_effective_radiation_field PlutoUI.NumberField(default = 1.7)) |
+| PAH recombination parameter $\omega_{\rm PAH}$ | $(@bind moose_pah_recombination PlutoUI.NumberField(default = 0.5)) |
+| Ionized-carbon abundance $X_{\rm C^+}$ | $(@bind moose_ionized_carbon_abundance PlutoUI.NumberField(default = 1.4e-4)) |
+| Fully ionized threshold [$\mathrm{K}$] | $(@bind moose_fully_ionized_temperature PlutoUI.NumberField(default = 10.0^4.2)) |
 | Constant $x_e$ | $(@bind moose_constant_xe PlutoUI.NumberField(default = 0.01)) |
 | CNM $x_e$ | $(@bind moose_cnm_xe PlutoUI.NumberField(default = 1.0e-4)) |
 | WNM $x_e$ | $(@bind moose_wnm_xe PlutoUI.NumberField(default = 1.0e-2)) |
 | CNM/WNM transition temperature [$\mathrm{K}$] | $(@bind moose_transition_T PlutoUI.NumberField(default = 200.0)) |
-| Cosmic-ray electron index $p$ | $(@bind moose_cr_index PlutoUI.NumberField(1.0:0.1:5.0; default = 3.0)) |
+| Synchrotron cosmic-ray electron index $p$ | $(@bind moose_cr_index PlutoUI.NumberField(1.0:0.1:5.0; default = 3.0)) |
 | Observing frequency [$\mathrm{MHz}$] | $(@bind moose_frequency_MHz PlutoUI.NumberField(50.0:1.0:2000.0; default = 150.0)) |
 | Synchrotron normalization [$\mathrm{K}\,(\mu\mathrm{G})^{-(p+1)/2}\,\mathrm{pc}^{-1}$] | $(@bind moose_synchrotron_norm PlutoUI.NumberField(default = 1.0)) |
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
@@ -7560,7 +7600,7 @@ Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
 | First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = true)) |
+| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = false)) |
 | Faraday-spectrum amplitude | $(@bind show_moose_F_abs PlutoUI.CheckBox(default = true)) |
 | $\Re F(\phi)$ spectrum | $(@bind show_moose_F_real PlutoUI.CheckBox(default = true)) |
 | $\Im F(\phi)$ spectrum | $(@bind show_moose_F_imag PlutoUI.CheckBox(default = true)) |
@@ -7568,13 +7608,62 @@ Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis
 
 # ╔═╡ 0e8d9cab-aef2-42cd-959d-973764340f08
 begin
-    moose_ne = if moose_electron_model == "Constant ionization fraction"
-        Float64(moose_constant_xe) .* number_density_cells
-    else
-        ionization_fraction = ifelse.(T .< Float64(moose_transition_T),
-            Float64(moose_cnm_xe), Float64(moose_wnm_xe))
-        ionization_fraction .* number_density_cells
+    """
+    Electron-density proxy used for the MOOSE Faraday products.
+
+    For T <= T_ion this is Eq. (6) of Bracco et al. (2022), following
+    Wolfire et al. (2003) and Bellomi et al. (2020). Hotter gas is treated as
+    fully collisionally ionized, ne = nH.
+    """
+    function wolfire_bellomi_electron_density(nH, temperature;
+            ionization_rate, radiation_field, pah_recombination,
+            ionized_carbon_abundance, fully_ionized_temperature)
+        zeta = Float64(ionization_rate)
+        geff = Float64(radiation_field)
+        omega_pah = Float64(pah_recombination)
+        carbon_abundance = Float64(ionized_carbon_abundance)
+        hot_threshold = Float64(fully_ionized_temperature)
+        zeta > 0 || error("The Wolfire ionization rate must be positive.")
+        geff >= 0 || error("The effective radiation field must be non-negative.")
+        omega_pah > 0 || error("The PAH recombination parameter must be positive.")
+        carbon_abundance >= 0 || error("The C+ abundance must be non-negative.")
+        hot_threshold > 0 || error("The fully ionized temperature must be positive.")
+
+        neutral_prefactor = 2.4e-3 * sqrt(zeta / 1.0e-16) *
+            sqrt(geff) / omega_pah
+        electron_density = Array{Float64}(undef, size(nH))
+        @inbounds for index in eachindex(nH, temperature)
+            density = Float64(nH[index])
+            thermal = Float64(temperature[index])
+            if !isfinite(density) || density < 0 || !isfinite(thermal) || thermal < 0
+                electron_density[index] = NaN
+            elseif thermal > hot_threshold
+                electron_density[index] = density
+            else
+                electron_density[index] = neutral_prefactor *
+                    (thermal / 100.0)^0.25 + density * carbon_abundance
+            end
+        end
+        electron_density
     end
+
+    function moose_electron_density(nH, temperature)
+        if moose_electron_model == "Constant ionization fraction"
+            return Float64(moose_constant_xe) .* nH
+        elseif moose_electron_model == "Two-phase ionization (legacy)"
+            ionization_fraction = ifelse.(temperature .< Float64(moose_transition_T),
+                Float64(moose_cnm_xe), Float64(moose_wnm_xe))
+            return ionization_fraction .* nH
+        end
+        wolfire_bellomi_electron_density(nH, temperature;
+            ionization_rate = moose_ionization_rate,
+            radiation_field = moose_effective_radiation_field,
+            pah_recombination = moose_pah_recombination,
+            ionized_carbon_abundance = moose_ionized_carbon_abundance,
+            fully_ionized_temperature = moose_fully_ionized_temperature)
+    end
+
+    moose_ne = moose_electron_density(number_density_cells, T)
 
     moose_Blos_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[los_dim]
     moose_Bsky1_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[1]]
@@ -7925,8 +8014,10 @@ md"""
 
 Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 
-**Display SHINE H I maps:** $(@bind display_shine PlutoUI.CheckBox(default = true))  
-**Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))  
+**Display SHINE H I maps:** $(@bind display_shine PlutoUI.CheckBox(default = true))
+
+**Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))
+
 **Display the spatial power spectra:** $(@bind display_shine_power_spectra PlutoUI.CheckBox(default = true))
 **Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
 **Display the H I--Faraday HOG comparison:** $(@bind display_hi_faraday_hog PlutoUI.CheckBox(default = true))
@@ -8265,16 +8356,7 @@ begin
         hi_cube = apply_observational_beam_cube(hi_cube, c, sky_dims)
 
         local_number_density = number_density(c.rho)
-        local_ne = if moose_electron_model == "Constant ionization fraction"
-            Float64(moose_constant_xe) .* local_number_density
-        else
-            local_xe = ifelse.(
-                local_temperature .< Float64(moose_transition_T),
-                Float64(moose_cnm_xe),
-                Float64(moose_wnm_xe),
-            )
-            local_xe .* local_number_density
-        end
+        local_ne = moose_electron_density(local_number_density, local_temperature)
         components = (c.bx, c.by, c.bz)
         local_blos = GAUSS_TO_MICROGAUSS .* components[los_dim]
         local_bsky1 = GAUSS_TO_MICROGAUSS .* components[sky_dims[1]]
@@ -8512,6 +8594,11 @@ begin
         last(shine_velocity_axis),
         length(shine_velocity_axis),
         String(moose_electron_model),
+        Float64(moose_ionization_rate),
+        Float64(moose_effective_radiation_field),
+        Float64(moose_pah_recombination),
+        Float64(moose_ionized_carbon_abundance),
+        Float64(moose_fully_ionized_temperature),
         Float64(moose_constant_xe),
         Float64(moose_cnm_xe),
         Float64(moose_wnm_xe),

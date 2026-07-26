@@ -2875,6 +2875,466 @@ begin
     normalized_B_pdfs = pdf_products.normalized_B
 end
 
+# ╔═╡ fa155a62-da75-4530-b5e9-215fd4f66412
+md"""
+---
+
+## 4. Thermodynamic phase diagram
+
+This comparative figure shows one joint distribution of number density $n$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. The plotted coordinates are $\log_{10}n$ and $\log_{10}(P/k_{\mathrm B})$; empty probability bins are masked and all panels share one color scale.
+
+The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curves satisfy $n\Lambda(T,Z)=\Gamma$ with $P/k_{\mathrm B}=nT$. In this illustrative metallicity extension, the low-temperature metal-line cooling term scales linearly with $Z/Z_\odot$, while the hydrogen cooling term and the heating rate remain fixed. These curves compare cooling multiplicities; they are not a substitute for a self-consistent chemical network.
+
+**Display the pressure-density phase diagram:** $(@bind display_phase_diagram PlutoUI.CheckBox(default = true))
+
+| Phase-diagram setting | Control |
+|:--|:--|
+| Bins per axis | $(@bind phase_bins PlutoUI.Slider(20:5:120; default = 60, show_value = true)) |
+| Thermal-equilibrium curve | $(@bind show_phase_equilibrium PlutoUI.CheckBox(default = true)) |
+| Equilibrium metallicities $Z/Z_\odot$ | $(@bind phase_equilibrium_metallicities PlutoUI.MultiSelect([0.1, 0.3, 1.0, 2.0]; default = [0.1, 0.3, 1.0, 2.0])) |
+"""
+
+# ╔═╡ 9da572fe-21f2-43df-9320-b8742fd64773
+begin
+    function phase_histogram(logn, logpk, weights, bins)
+        valid = isfinite.(logn) .& isfinite.(logpk) .& isfinite.(weights) .& (weights .>= 0)
+        x, y, w = logn[valid], logpk[valid], weights[valid]
+        isempty(x) && error("No finite positive cells are available for the phase diagram.")
+        xlo, xhi = quantile(x, (0.001, 0.999))
+        ylo, yhi = quantile(y, (0.001, 0.999))
+        xlo == xhi && ((xlo, xhi) = (xlo - 0.5, xhi + 0.5))
+        ylo == yhi && ((ylo, yhi) = (ylo - 0.5, yhi + 0.5))
+        xedges = range(xlo, xhi; length = bins + 1)
+        yedges = range(ylo, yhi; length = bins + 1)
+        histogram = zeros(Float64, bins, bins)
+        for index in eachindex(x)
+            ix = searchsortedlast(xedges, x[index])
+            iy = searchsortedlast(yedges, y[index])
+            1 <= ix <= bins && 1 <= iy <= bins || continue
+            histogram[ix, iy] += w[index]
+        end
+        dx, dy = step(xedges), step(yedges)
+        probability = histogram ./ max(sum(histogram) * dx * dy, eps())
+        log_probability = map(value -> value > 0 ? log10(value) : NaN, probability)
+        xcenters = (xedges[1:end-1] .+ xedges[2:end]) ./ 2
+        ycenters = (yedges[1:end-1] .+ yedges[2:end]) ./ 2
+        (; xcenters, ycenters, log_probability)
+    end
+
+    function koyama_inutsuka_equilibrium(metallicity; temperature_min = 10.0,
+            temperature_max = 1.0e5, samples = 2400)
+        metallicity_value = Float64(metallicity)
+        metallicity_value > 0 || error("Metallicity must be positive.")
+        temperature_K = 10.0 .^ range(log10(temperature_min), log10(temperature_max);
+            length = samples)
+        hydrogen_cooling_over_heating_cm3 =
+            1.0e7 .* exp.(-1.184e5 ./ (temperature_K .+ 1000.0))
+        metal_cooling_over_heating_cm3 =
+            1.4e-2 .* sqrt.(temperature_K) .* exp.(-92.0 ./ temperature_K)
+        cooling_over_heating_cm3 = hydrogen_cooling_over_heating_cm3 .+
+            metallicity_value .* metal_cooling_over_heating_cm3
+        equilibrium_density_cm3 = 1.0 ./ cooling_over_heating_cm3
+        equilibrium_pressure_over_k = equilibrium_density_cm3 .* temperature_K
+        valid = isfinite.(equilibrium_density_cm3) .&
+            isfinite.(equilibrium_pressure_over_k) .&
+            (equilibrium_density_cm3 .> 0) .& (equilibrium_pressure_over_k .> 0)
+        (
+            logn = safe_log10.(equilibrium_density_cm3[valid]),
+            logpk = safe_log10.(equilibrium_pressure_over_k[valid]),
+        )
+    end
+
+    phase_data_by_run = Dict(label => cached_scientific_product((
+            :phase_diagram,
+            cube_signature(run_files[label][comparison_snapshot_indices[label]]),
+            Float64(mean_molecular_weight),
+            String(pdf_weighting),
+            Int(phase_bins),
+        )) do
+            local_cube = comparison_cube(label)
+            local_logn = vec(safe_log10.(number_density(local_cube.rho)))
+            local_logpk = vec(safe_log10.(local_cube.P ./ K_B_CGS))
+            local_weights = pdf_weighting == "mass" ?
+                vec(Float64.(local_cube.rho)) : ones(length(local_cube.rho))
+            phase_histogram(local_logn, local_logpk, local_weights, phase_bins)
+        end for label in comparison_run_labels)
+    phase_metallicities = sort(unique(Float64.(phase_equilibrium_metallicities)))
+    phase_equilibria = [(
+        metallicity = metallicity,
+        curve = koyama_inutsuka_equilibrium(metallicity),
+    ) for metallicity in phase_metallicities]
+end
+
+# ╔═╡ 41b4eb12-889d-43b3-87c2-fc7cccf8679f
+begin
+    phase_panel_count = length(comparison_run_labels)
+    fig_phase = Figure(size = (560phase_panel_count + 80, 620))
+    phase_equilibrium_colors = [
+        MHD_COLORS[mod1(index, length(MHD_COLORS))]
+        for index in eachindex(phase_equilibria)
+    ]
+    combined_phase_probability = vcat([
+        finite_values(phase_data_by_run[label].log_probability)
+        for label in comparison_run_labels]...)
+    phase_range = robust_colorrange(combined_phase_probability, 99.0)
+    phase_heatmap = nothing
+    for (panel_index, label) in enumerate(comparison_run_labels)
+        phase_data = phase_data_by_run[label]
+        phase_axis = latex_axis(fig_phase[1, panel_index],
+            xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
+            ylabel = L"\log_{10}\!\left[(P/k_B)/(\mathrm{K\,cm}^{-3})\right]",
+            title = latex_run_label(label))
+        phase_heatmap = heatmap!(phase_axis, phase_data.xcenters, phase_data.ycenters,
+            phase_data.log_probability; colormap = :magma, colorrange = phase_range)
+        if show_phase_equilibrium && !isempty(phase_equilibria)
+            for (curve_index, equilibrium) in enumerate(phase_equilibria)
+                curve_color = phase_equilibrium_colors[curve_index]
+                curve_width = isapprox(equilibrium.metallicity, 1.0) ? 3.2 : 2.4
+                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                    color = (:black, 0.72), linewidth = curve_width + 2.0)
+                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                    color = curve_color, linewidth = curve_width,
+                    label = latexstring("Z/Z_{\\odot}=",
+                        @sprintf("%.2g", equilibrium.metallicity)))
+            end
+        end
+        phase_dx = length(phase_data.xcenters) > 1 ?
+            phase_data.xcenters[2] - phase_data.xcenters[1] : 1.0
+        phase_dy = length(phase_data.ycenters) > 1 ?
+            phase_data.ycenters[2] - phase_data.ycenters[1] : 1.0
+        xlims!(phase_axis, first(phase_data.xcenters) - phase_dx / 2,
+            last(phase_data.xcenters) + phase_dx / 2)
+        ylims!(phase_axis, first(phase_data.ycenters) - phase_dy / 2,
+            last(phase_data.ycenters) + phase_dy / 2)
+    end
+    latex_colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
+        label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)
+    colsize!(fig_phase.layout, phase_panel_count + 1, 22)
+    if show_phase_equilibrium && !isempty(phase_equilibria)
+        Legend(fig_phase[2, 1:phase_panel_count], [
+                LineElement(color = color, linewidth =
+                    isapprox(equilibrium.metallicity, 1.0) ? 3.2 : 2.4)
+                for (color, equilibrium) in zip(
+                    phase_equilibrium_colors, phase_equilibria)
+            ], [
+                latexstring("Z/Z_{\\odot}=",
+                    @sprintf("%.2g", equilibrium.metallicity))
+                for equilibrium in phase_equilibria
+            ], L"n\Lambda(T,Z)=\Gamma";
+            orientation = :horizontal, nbanks = 2,
+            tellheight = true, framevisible = false, labelsize = 14)
+    end
+    display_phase_diagram ? fig_phase : nothing
+end
+
+# ╔═╡ 5a0d1b1b-fa59-4e7c-8c51-a98592c0c62e
+begin
+    temporal_series_requested = display_global_evolution ||
+        display_gamma_relations || display_normalized_B_relations ||
+        display_growth_fit || display_phase_B_time || display_energy_time ||
+        display_polarization_time
+
+    function metadata_only_series(label)
+        [(
+            t = Float64(time_unit_Myr) * Float64(time),
+            vrms = NaN, mach = NaN, mach_alfven = NaN, Bmean = NaN, Brms = NaN,
+            energy_ratio = NaN, kin_mag = NaN, therm_mag = NaN,
+            kin_therm = NaN,
+        ) for time in run_times[label]]
+    end
+
+    metric_series_by_run = temporal_series_requested ? Dict(
+            label => run_metric_series(run_files[label], Float64(gamma),
+                Float64(mean_molecular_weight), Float64(phase_cold_boundary_K),
+                Float64(phase_warm_boundary_K), String(phase_B_weighting),
+                display_phase_B_time && label in comparison_run_labels)
+            for label in analysis_series_labels
+        ) : Dict(
+            label => (bulk = metadata_only_series(label), phase = nothing)
+            for label in analysis_series_labels
+        )
+
+    all_series = Dict(label => metric_series_by_run[label].bulk
+        for label in analysis_series_labels)
+
+    phase_B_series_by_run = display_phase_B_time ? Dict(
+        label => metric_series_by_run[label].phase
+        for label in comparison_run_labels
+    ) : Dict{String, Any}()
+end
+
+# ╔═╡ 36aef377-3de7-435a-af83-3a90421e3159
+md"""
+---
+
+## 5. Magnetic amplification and growth-rate fit
+
+The fitted physical model is $B(t)=A\exp[\Gamma_B(t-t_0)]$, where $t_0$ is the first valid snapshot time and both $A$ and $\Gamma_B$ are inferred from the snapshots in the **Fit window**. Equivalently, the regression is $\ln B=a+\Gamma_B(t-t_0)$ with a free intercept. In automatic mode, contiguous windows containing 4--8 snapshots are compared using their $R^2$, measured logarithmic amplification, and position in the growing part of the series. The shaded interval marks the retained range. Manual mode remains available for a physically prescribed interval.
+
+The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measured field used only as a plotting normalization. The reported $R^2$ uses the usual mean-centred total sum of squares appropriate to this intercept fit. The central fit and its $\Gamma_B\pm\sigma_{\Gamma_B}$ slope envelope are drawn only inside the fitted interval, so no straight line is extrapolated into the saturated regime. Because $E_{\mathrm B}\propto B^2$, magnetic energy grows at rate $2\Gamma_B$.
+
+The optional Kazantsev reference uses the high-magnetic-Prandtl-number prediction
+$\Gamma_{\mathrm K}=[(163-304\vartheta)/60](v_{\mathrm rms}/L_{\mathrm f})\,Re_{\mathrm eff}^{(1-\vartheta)/(1+\vartheta)}$. Here $L_{\mathrm f}=50\,\mathrm{pc}$ (forcing mode 2), $v_{\mathrm rms}$ is the median value inside the fitted interval, and—because these implicit-LES cubes contain no explicit viscosity—$Re_{\mathrm eff}$ is a resolution estimate obtained by identifying the dissipation scale with $2\Delta x$. The predicted line is anchored to the fitted curve at the centre of the retained interval: its normalization is therefore not fitted, and only its slope is being compared.
+
+**Display the magnetic growth-rate fit:** $(@bind display_growth_fit PlutoUI.CheckBox(default = false))
+
+| Setting | Control |
+|:--|:--|
+| Fitted field | $(@bind growth_fit_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
+| Fit-window selection | $(@bind growth_fit_mode PlutoUI.Select(["Automatic", "Manual"]; default = "Automatic")) |
+| Manual fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(run_files[selected_run]); default = min(2, length(run_files[selected_run])):min(8, length(run_files[selected_run])), show_value = true)) |
+| Data and fitted exponential panel | $(@bind show_growth_fit_panel PlutoUI.CheckBox(default = true)) |
+| Kazantsev and fit-uncertainty comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
+| Display fitted curve | $(@bind show_growth_fit PlutoUI.CheckBox(default = true)) |
+| Display Kazantsev prediction | $(@bind show_kazantsev_prediction PlutoUI.CheckBox(default = true)) |
+| Kazantsev turbulence model | $(@bind kazantsev_turbulence_model PlutoUI.Select(["Kolmogorov (θ = 1/3)", "Burgers (θ = 1/2)"]; default = "Kolmogorov (θ = 1/3)")) |
+| Logarithmic $B(t)$ axis in section 6 | $(@bind log_B_time PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 89c33295-34e7-49ec-8d04-52b2aac29cff
+begin
+    growth_series = all_series[selected_run]
+    growth_times = Float64.(getfield.(growth_series, :t))
+    growth_vrms = Float64.(getfield.(growth_series, :vrms))
+    growth_B = growth_fit_field == "Mean field ⟨B⟩" ?
+        Float64.(getfield.(growth_series, :Bmean)) :
+        Float64.(getfield.(growth_series, :Brms))
+    growth_reference_index = findfirst(i -> isfinite(growth_times[i]) &&
+        isfinite(growth_B[i]) && growth_B[i] > 0, eachindex(growth_B))
+    growth_B0 = isnothing(growth_reference_index) ? NaN : growth_B[growth_reference_index]
+    growth_t0 = isnothing(growth_reference_index) ? NaN : growth_times[growth_reference_index]
+    growth_log_B = map(growth_B) do value
+        isfinite(value) && value > 0 ? log(value) : NaN
+    end
+    growth_elapsed_time = growth_times .- growth_t0
+
+    function exponential_growth_fit(elapsed_time, log_field, indices)
+        if length(indices) < 2
+            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN,
+                r2 = NaN, ssres = Inf)
+        end
+        xfit, yfit = elapsed_time[indices], log_field[indices]
+        xmean, ymean = mean(xfit), mean(yfit)
+        centered_x = xfit .- xmean
+        sxx = sum(abs2, centered_x)
+        if sxx <= 0
+            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN,
+                r2 = NaN, ssres = Inf)
+        end
+        gamma_fit = sum(centered_x .* (yfit .- ymean)) / sxx
+        log_amplitude = ymean - gamma_fit * xmean
+        residuals = yfit .- (log_amplitude .+ gamma_fit .* xfit)
+        ssres = sum(abs2, residuals)
+        sstot = sum(abs2, yfit .- mean(yfit))
+        r2 = sstot > 0 ? 1 - ssres / sstot : NaN
+        gamma_error = length(indices) > 2 ?
+            sqrt((ssres / (length(indices) - 2)) / sxx) : NaN
+        (; log_amplitude, gamma = gamma_fit, gamma_error, r2, ssres)
+    end
+
+    """
+    Select a contiguous kinematic-growth interval without extrapolating through
+    the saturated tail. Candidate windows contain 4--8 valid snapshots. The
+    score rewards linearity and resolved amplification while mildly preferring
+    earlier windows when otherwise equivalent.
+    """
+    function automatic_growth_fit_window(elapsed_time, log_field)
+        valid = filter(eachindex(elapsed_time)) do index
+            isfinite(elapsed_time[index]) && isfinite(log_field[index])
+        end
+        length(valid) < 4 && return valid
+        best_indices = valid[1:min(4, length(valid))]
+        best_score = -Inf
+        maximum_points = min(8, length(valid))
+        for point_count in 4:maximum_points
+            for first_position in 1:(length(valid) - point_count + 1)
+                indices = valid[first_position:(first_position + point_count - 1)]
+                all(diff(elapsed_time[indices]) .> 0) || continue
+                fit = exponential_growth_fit(elapsed_time, log_field, indices)
+                isfinite(fit.gamma) && fit.gamma > 0 && isfinite(fit.r2) || continue
+                amplification = fit.gamma *
+                    (elapsed_time[last(indices)] - elapsed_time[first(indices)])
+                amplification > 0.15 || continue
+                score = fit.r2 + 0.10min(amplification, 2.0) +
+                    0.015point_count - 0.012(first_position - 1)
+                if score > best_score
+                    best_score = score
+                    best_indices = indices
+                end
+            end
+        end
+        best_indices
+    end
+
+    manual_growth_indices = filter(i -> 1 <= i <= length(growth_times) &&
+        isfinite(growth_times[i]) && isfinite(growth_elapsed_time[i]) &&
+        isfinite(growth_log_B[i]), collect(growth_fit_window))
+    growth_indices = growth_fit_mode == "Automatic" ?
+        automatic_growth_fit_window(growth_elapsed_time, growth_log_B) :
+        manual_growth_indices
+    growth_fit = exponential_growth_fit(growth_elapsed_time, growth_log_B, growth_indices)
+    growth_gamma_uncertainty = isfinite(growth_fit.gamma_error) ?
+        growth_fit.gamma_error : 0.0
+    theory_gammas = growth_fit.gamma .+
+        growth_gamma_uncertainty .* [-1.0, 1.0]
+    fitted_B_curve = exp.(growth_fit.log_amplitude .+ growth_fit.gamma .* growth_elapsed_time)
+    fitted_ratio_curve = fitted_B_curve ./ growth_B0
+    growth_fit_center_time = isempty(growth_indices) ? NaN :
+        mean(growth_elapsed_time[growth_indices])
+    growth_fit_center_log_B = growth_fit.log_amplitude +
+        growth_fit.gamma * growth_fit_center_time
+    theory_B_curves = [
+        exp.(growth_fit_center_log_B .+
+            Γ .* (growth_elapsed_time .- growth_fit_center_time))
+        for Γ in theory_gammas
+    ]
+
+    # High-Pm Kazantsev prediction (Schober et al. 2012). These simulations are
+    # implicit LES, so Re_eff is a resolution estimate rather than a measured
+    # physical Reynolds number. With l_d = 2dx and v(l) proportional to l^theta,
+    # Re_eff = (L_f/l_d)^(1+theta).
+    kazantsev_theta = kazantsev_turbulence_model == "Burgers (θ = 1/2)" ? 0.5 : 1 / 3
+    kazantsev_model_name = kazantsev_theta == 0.5 ? "Burgers" : "Kolmogorov"
+    kazantsev_forcing_scale_pc = PHYSICAL_BOX_LENGTH_PC / 2
+    kazantsev_dissipation_cells = 2.0
+    kazantsev_dx_pc = PHYSICAL_BOX_LENGTH_PC / minimum(size(cube.rho))
+    kazantsev_dissipation_scale_pc = kazantsev_dissipation_cells * kazantsev_dx_pc
+    kazantsev_effective_reynolds =
+        (kazantsev_forcing_scale_pc / kazantsev_dissipation_scale_pc) ^
+        (1 + kazantsev_theta)
+    kazantsev_velocity_indices = filter(growth_indices) do index
+        1 <= index <= length(growth_vrms) && isfinite(growth_vrms[index]) &&
+            growth_vrms[index] > 0
+    end
+    kazantsev_vrms_kms = isempty(kazantsev_velocity_indices) ? NaN :
+        median(growth_vrms[kazantsev_velocity_indices])
+    kazantsev_vrms_pc_myr = kazantsev_vrms_kms * KM_CM * MYR_S / PC_CM
+    kazantsev_prefactor = (163 - 304kazantsev_theta) / 60
+    kazantsev_gamma = kazantsev_prefactor *
+        (kazantsev_vrms_pc_myr / kazantsev_forcing_scale_pc) *
+        kazantsev_effective_reynolds ^
+        ((1 - kazantsev_theta) / (1 + kazantsev_theta))
+    kazantsev_log_ratio_curve = growth_fit_center_log_B - log(growth_B0) .+
+        kazantsev_gamma .* (growth_elapsed_time .- growth_fit_center_time)
+    kazantsev_is_valid = !isempty(growth_indices) && isfinite(kazantsev_gamma) &&
+        kazantsev_gamma > 0 && all(isfinite, (
+            kazantsev_effective_reynolds, kazantsev_vrms_kms,
+            growth_fit_center_log_B, growth_B0))
+    growth_has_interval = !isempty(growth_indices)
+    growth_first_index = growth_has_interval ? first(growth_indices) : missing
+    growth_last_index = growth_has_interval ? last(growth_indices) : missing
+    growth_gamma_text = string(round(growth_fit.gamma; sigdigits = 5))
+    growth_error_text = string(round(growth_fit.gamma_error; sigdigits = 3))
+    growth_r2_text = string(round(growth_fit.r2; sigdigits = 4))
+    growth_amplitude_text = string(round(exp(growth_fit.log_amplitude); sigdigits = 5))
+    growth_energy_gamma_text = string(round(2 * growth_fit.gamma; sigdigits = 5))
+    kazantsev_gamma_text = string(round(kazantsev_gamma; sigdigits = 5))
+    kazantsev_reynolds_text = string(round(kazantsev_effective_reynolds; sigdigits = 4))
+    kazantsev_velocity_text = string(round(kazantsev_vrms_kms; sigdigits = 4))
+    kazantsev_ratio_text = string(round(growth_fit.gamma / kazantsev_gamma; sigdigits = 4))
+end
+
+# ╔═╡ 71c8ea26-d2ad-4430-9265-0b28d45bba1c
+md"""
+### Interval magnetic-growth rate
+
+The local magnetic-growth rate is evaluated between consecutive snapshots rather than with one fit over the complete selected window:
+
+```math
+\Gamma_{B,i+1/2}
+=\frac{\ln B_{i+1}-\ln B_i}{t_{i+1}-t_i}.
+```
+
+Time, sonic Mach number, and Alfvénic Mach number are assigned their midpoint values over the same interval. Positive $\Gamma_B$ indicates magnetic amplification; negative $\Gamma_B$ indicates decay.
+
+**Display interval growth-rate relations:** $(@bind display_gamma_relations PlutoUI.CheckBox(default = false))
+
+| Growth-rate setting | Control |
+|:--|:--|
+| Magnetic field | $(@bind gamma_relation_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
+| Simulations | Global multi-selection in section 1 |
+| $\Gamma_B(t)$ | $(@bind show_gamma_time PlutoUI.CheckBox(default = true)) |
+| $\Gamma_B(\mathcal{M})$ | $(@bind show_gamma_mach PlutoUI.CheckBox(default = true)) |
+| $\Gamma_B(\mathcal{M}_{\mathrm A})$ | $(@bind show_gamma_alfven_mach PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ cd7e037c-62f5-4682-92c2-92af7169d692
+md"""
+### Multi-snapshot normalized magnetic evolution
+
+Selected snapshots are superimposed in the same figure using
+
+```math
+\ln\!\left(\frac{B_i}{B_0}\right),
+```
+
+where $B_0$ is the first available snapshot of each run. Color identifies the run; every snapshot uses the same circular marker to keep temporal comparisons readable. All axes remain linear because the logarithm is applied to the magnetic-field ratio itself.
+
+**Display multi-snapshot normalized magnetic evolution:** $(@bind display_normalized_B_relations PlutoUI.CheckBox(default = false))
+
+| Normalized-field relation | Control |
+|:--|:--|
+| Magnetic field | $(@bind normalized_B_relation_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
+| Snapshots displayed | $(@bind normalized_B_snapshot_indices PlutoUI.MultiSelect(collect(1:maximum_snapshot_count); default = unique([1, cld(maximum_snapshot_count, 2), maximum_snapshot_count]))) |
+| Simulations displayed | Global multi-selection in section 1 |
+| $\ln(B/B_0)$ versus $t$ | $(@bind show_normalized_B_time PlutoUI.CheckBox(default = true)) |
+| $\ln(B/B_0)$ versus $\mathcal{M}$ | $(@bind show_normalized_B_mach PlutoUI.CheckBox(default = true)) |
+| $\ln(B/B_0)$ versus $\mathcal{M}_{\mathrm A}$ | $(@bind show_normalized_B_alfven_mach PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ dcc8f8f3-daaf-4d4b-92a3-4919ed5e36de
+md"""
+---
+
+## 6. Global time evolution
+
+Selected panels compare every discovered run as a function of physical time. Turbulent velocity is measured after subtracting the mass-weighted bulk motion.
+
+$\mathcal{M}=v_{\mathrm{rms}}/c_{s,\mathrm{rms}}$ measures compressibility, while $\mathcal{M}_{\mathrm A}=v_{\mathrm{rms}}/v_{\mathrm A,\mathrm{rms}}$ compares turbulence with Alfvén-wave propagation. Values above unity are supersonic or super-Alfvénic, respectively. Dotted magnetic-field curves show the theoretical exponentials selected in section 5.
+
+**Display global time evolution:** $(@bind display_global_evolution PlutoUI.CheckBox(default = false))
+
+| Time-evolution panel | Display |
+|:--|:--:|
+| Sonic Mach number | $(@bind show_time_mach PlutoUI.CheckBox(default = true)) |
+| Alfvénic Mach number | $(@bind show_time_alfven PlutoUI.CheckBox(default = true)) |
+| Magnetic field | $(@bind show_time_magnetic PlutoUI.CheckBox(default = true)) |
+| Magnetic-to-kinetic energy ratio | $(@bind show_time_energy_ratio PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 62bb58f1-37c3-4adb-a7fc-939f71a56635
+md"""
+### Magnetic field by thermal phase
+
+This diagnostic follows the magnetic-field strength after dividing every snapshot into three temperature phases. The phase boundaries are adjustable. **Volume average** assigns the same weight to every cell, while **Density-weighted average** uses $w_i=\rho_i$. The displayed phase mean and RMS are
+
+```math
+\langle |B|\rangle_{w,\phi}=\frac{\sum_{i\in\phi}w_i|B_i|}{\sum_{i\in\phi}w_i},\qquad
+B_{\mathrm{rms},w,\phi}=\left(\frac{\sum_{i\in\phi}w_iB_i^2}{\sum_{i\in\phi}w_i}\right)^{1/2},
+```
+
+with $w_i=1$ for volume normalization or $w_i=\rho_i$ for density normalization. Values are shown in $\mu\mathrm G$; no additional normalization by a global $B_0$ is applied in this phase diagnostic.
+
+```math
+\mathrm{CNM}:\ T<T_{\mathrm C},\qquad
+\mathrm{LNM}:\ T_{\mathrm C}\leq T<T_{\mathrm W},\qquad
+\mathrm{WNM}:\ T\geq T_{\mathrm W}.
+```
+
+**Display magnetic field by phase:** $(@bind display_phase_B_time PlutoUI.CheckBox(default = false))
+
+| Phase-field setting | Control |
+|:--|:--|
+| Cold/Lukewarm boundary $T_{\mathrm C}$ [$\mathrm{K}$] | $(@bind phase_cold_boundary_K PlutoUI.NumberField(10.0:10.0:5000.0; default = 200.0)) |
+| Lukewarm/Warm boundary $T_{\mathrm W}$ [$\mathrm{K}$] | $(@bind phase_warm_boundary_K PlutoUI.NumberField(100.0:50.0:50000.0; default = 2000.0)) |
+| Magnetic statistic | $(@bind phase_B_statistic PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
+| Phase normalization | $(@bind phase_B_weighting PlutoUI.Select(["Volume average" => "volume", "Density-weighted average" => "density"]; default = "volume")) |
+| Logarithmic $B$ axis | $(@bind log_phase_B_time PlutoUI.CheckBox(default = true)) |
+| CNM curve | $(@bind show_phase_B_cold PlutoUI.CheckBox(default = true)) |
+| LNM curve | $(@bind show_phase_B_lukewarm PlutoUI.CheckBox(default = true)) |
+| WNM curve | $(@bind show_phase_B_warm PlutoUI.CheckBox(default = true)) |
+"""
+
 # ╔═╡ b1000006-6f8c-4d0c-9a10-000000000006
 begin
     function hro_binned_summary(
@@ -3008,6 +3468,34 @@ begin
         string(@sprintf("%.3g", mantissa), raw"\times10^{", exponent, "}")
     end
 end
+
+# ╔═╡ 298bd579-bb28-48b7-8c55-ea74804b9837
+md"""
+---
+
+## 8. Energy partition by density and time
+
+### Density-binned energy ratios
+
+The figure compares three energy ratios as functions of physical number density. Color identifies the simulation run and line style identifies the snapshot. The horizontal reference at unity marks equal energies; values above unity indicate that the numerator dominates.
+
+Each point is a ratio of energies summed within one density bin, rather than a mean of cell-by-cell ratios. The CGS energy densities are $E_{\mathrm{kin}}=\rho|\delta\mathbf v|^2/2$, $E_{\mathrm{mag}}=B^2/(8\pi)$, and $E_{\mathrm{therm}}=P/(\gamma-1)$ in $\mathrm{erg\,cm}^{-3}$. For $\gamma=1$, the notebook adopts the isothermal convention $E_{\mathrm{therm}}=P$. Cubes selected for the comparative profiles are read and reduced to these per-cell quantities in a separate Pluto cell; changing $\gamma$ or the density bins therefore rebins the cached arrays without rereading the RAMSES files.
+
+**Display energy ratios by density:** $(@bind display_energy_ratios PlutoUI.CheckBox(default = true))
+
+**Display energy ratios versus time:** $(@bind display_energy_time PlutoUI.CheckBox(default = false))
+
+| Setting | Control |
+|:--|:--|
+| Snapshots shown in energy reports | $(@bind energy_snapshot_indices PlutoUI.MultiSelect(collect(1:maximum_snapshot_count); default = [min(Int(selected_snapshot), maximum_snapshot_count)])) |
+| $E_{\mathrm{kin}}/E_{\mathrm{mag}}$ | $(@bind show_energy_kin_mag PlutoUI.CheckBox(default = true)) |
+| $E_{\mathrm{therm}}/E_{\mathrm{mag}}$ | $(@bind show_energy_therm_mag PlutoUI.CheckBox(default = true)) |
+| $E_{\mathrm{kin}}/E_{\mathrm{therm}}$ | $(@bind show_energy_kin_therm PlutoUI.CheckBox(default = true)) |
+
+### Time evolution of the energy ratios
+
+The same ratio checkboxes select the time-evolution panels. Each curve uses energies integrated over the complete simulation volume. Color identifies the run, and the horizontal reference at unity marks equipartition.
+"""
 
 # ╔═╡ 3190e127-1d53-49f1-bfab-b9645910c2c6
 begin
@@ -3678,6 +4166,405 @@ begin
     end
 end
 
+# ╔═╡ d6a2f4b1-59ac-4e77-a10a-4b74c0d89231
+md"""
+---
+
+## 13. Thermal-dust polarization
+
+Optically thin thermal-dust Stokes emission. Statistical plots compare all selected simulations with shared bins.
+
+| Dust figure | Display |
+|:--|:--:|
+| Polarization maps | $(@bind display_dust_maps PlutoUI.CheckBox(default = true)) |
+| Polarization statistics | $(@bind display_dust_statistics PlutoUI.CheckBox(default = true)) |
+| Pixel $I_\nu$, $Q_\nu$, and $U_\nu$ spectra | $(@bind display_dust_pixel_spectrum PlutoUI.CheckBox(default = true)) |
+
+| Dust setting | Control |
+|:--|:--|
+| Observing frequency [$\mathrm{GHz}$] | $(@bind dust_frequency_GHz PlutoUI.NumberField(30.0:1.0:1200.0; default = 353.0)) |
+| Dust temperature [$\mathrm{K}$] | $(@bind dust_temperature_K PlutoUI.NumberField(2.8:0.1:100.0; default = 19.6)) |
+| Cross-section at $353\,\mathrm{GHz}$ [$\mathrm{cm^2\,H^{-1}}$] | $(@bind dust_sigma353_cm2 PlutoUI.NumberField(default = 1.0e-26)) |
+| Emissivity index $\beta_{\mathrm d}$ | $(@bind dust_beta PlutoUI.NumberField(0.0:0.05:4.0; default = 1.6)) |
+| Intrinsic polarization fraction $p_0$ | $(@bind dust_p0 PlutoUI.NumberField(0.0:0.005:0.5; default = 0.20)) |
+| Gas mass per H nucleon [$m_H$] | $(@bind dust_mu_H PlutoUI.NumberField(1.0:0.01:2.0; default = 1.4)) |
+| $I_\nu$ map | $(@bind show_dust_I PlutoUI.CheckBox(default = true)) |
+| $Q_\nu$ map | $(@bind show_dust_Q PlutoUI.CheckBox(default = false)) |
+| $U_\nu$ map | $(@bind show_dust_U PlutoUI.CheckBox(default = false)) |
+| Polarized intensity $P_\nu$ | $(@bind show_dust_P PlutoUI.CheckBox(default = true)) |
+| Polarization fraction $p$ | $(@bind show_dust_fraction PlutoUI.CheckBox(default = true)) |
+| Polarization angle $\psi$ | $(@bind show_dust_angle PlutoUI.CheckBox(default = false)) |
+| Logarithmic $I_\nu$ and $P_\nu$ | $(@bind log_dust_positive PlutoUI.CheckBox(default = true)) |
+| Symmetric-logarithmic $Q_\nu$ and $U_\nu$ | $(@bind log_dust_signed PlutoUI.CheckBox(default = false)) |
+| Polarization pseudo-vectors over $I_\nu$ | $(@bind show_dust_vectors PlutoUI.CheckBox(default = true)) |
+| Pseudo-vector stride | $(@bind dust_vector_stride PlutoUI.Slider(2:1:16; default = 5, show_value = true)) |
+| $p$ versus $N_{\mathrm H}$ relation | $(@bind show_dust_p_column PlutoUI.CheckBox(default = true)) |
+| Polarization-fraction PDF | $(@bind show_dust_p_pdf PlutoUI.CheckBox(default = true)) |
+
+### Stokes spectrum at one sky pixel
+
+The selected pixel is marked by a white cross on every dust map. The spectral panels evaluate the optically thin modified-blackbody model over the requested frequency interval. A vertical line and marker identify the **observing frequency** selected above. With the present single-temperature, single-$\beta_{\mathrm d}$ prescription, $I_\nu$, $Q_\nu$, and $U_\nu$ share the same frequency scaling while retaining their line-of-sight geometric amplitudes and signs.
+
+| Pixel-spectrum setting | Control |
+|:--|:--|
+| First sky-axis pixel | $(@bind dust_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
+| Second sky-axis pixel | $(@bind dust_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
+| Minimum spectral frequency [$\mathrm{GHz}$] | $(@bind dust_spectrum_min_GHz PlutoUI.NumberField(1.0:1.0:2000.0; default = 30.0)) |
+| Maximum spectral frequency [$\mathrm{GHz}$] | $(@bind dust_spectrum_max_GHz PlutoUI.NumberField(2.0:1.0:3000.0; default = 1200.0)) |
+| Number of frequency samples | $(@bind dust_spectrum_samples PlutoUI.Select([64, 128, 256, 512]; default = 256)) |
+| Logarithmic frequency axis | $(@bind log_dust_frequency_axis PlutoUI.CheckBox(default = true)) |
+| $I_\nu$ spectrum | $(@bind show_dust_I_spectrum PlutoUI.CheckBox(default = true)) |
+| $Q_\nu$ spectrum | $(@bind show_dust_Q_spectrum PlutoUI.CheckBox(default = true)) |
+| $U_\nu$ spectrum | $(@bind show_dust_U_spectrum PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 6f4e2d11-2a88-41f4-93dc-01b51d86fb4f
+md"""
+---
+
+## 14. Dichroic starlight polarization
+
+Cell-by-cell dichroic Mueller propagation toward background stars at the selected distance.
+
+| Starlight figure | Display |
+|:--|:--:|
+| Final Stokes and polarization maps | $(@bind display_starlight_maps PlutoUI.CheckBox(default = true)) |
+| Selected sight-line profiles | $(@bind display_starlight_profiles PlutoUI.CheckBox(default = true)) |
+| Polarization fraction versus $N_{\rm H}$ | $(@bind display_starlight_p_column PlutoUI.CheckBox(default = true)) |
+
+| Physical setting | Control |
+|:--|:--|
+| Star distance [$\mathrm{pc}$] | $(@bind starlight_star_distance_pc PlutoUI.NumberField(default = cube.L[los_dim])) |
+| Intrinsic dichroic polarization $p_0$ | $(@bind starlight_p0 PlutoUI.NumberField(0.0:0.005:0.95; default = 0.20)) |
+| $N_{\rm H}/A_V$ [$\mathrm{cm}^{-2}$] | $(@bind starlight_nh_per_av PlutoUI.NumberField(default = 1.8e21)) |
+| Gas mass per H nucleon [$m_{\rm H}$] | $(@bind starlight_mu_H PlutoUI.NumberField(1.0:0.01:2.0; default = 1.4)) |
+| Incident $I_0$ | $(@bind starlight_initial_I PlutoUI.NumberField(default = 1.0)) |
+| Incident $Q_0$ | $(@bind starlight_initial_Q PlutoUI.NumberField(default = 0.0)) |
+| Incident $U_0$ | $(@bind starlight_initial_U PlutoUI.NumberField(default = 0.0)) |
+| Incident $V_0$ | $(@bind starlight_initial_V PlutoUI.NumberField(default = 0.0)) |
+| First sky-axis pixel | $(@bind starlight_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
+| Second sky-axis pixel | $(@bind starlight_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
+
+| Final map | Display |
+|:--|:--:|
+| Transmitted intensity $I/I_0$ | $(@bind show_starlight_I_map PlutoUI.CheckBox(default = true)) |
+| Stokes $Q/I_0$ | $(@bind show_starlight_Q_map PlutoUI.CheckBox(default = false)) |
+| Stokes $U/I_0$ | $(@bind show_starlight_U_map PlutoUI.CheckBox(default = false)) |
+| Polarization fraction $p_\star$ | $(@bind show_starlight_p_map PlutoUI.CheckBox(default = true)) |
+| Polarization angle $\psi_\star$ | $(@bind show_starlight_angle_map PlutoUI.CheckBox(default = true)) |
+| Effective optical depth $\tau_V$ | $(@bind show_starlight_tau_map PlutoUI.CheckBox(default = true)) |
+| Density-weighted $B_{\rm LOS}$ | $(@bind show_starlight_blos_map PlutoUI.CheckBox(default = false)) |
+
+| Selected-pixel profile | Display |
+|:--|:--:|
+| $I/I_0$ | $(@bind show_starlight_I_profile PlutoUI.CheckBox(default = true)) |
+| $Q/I_0$ | $(@bind show_starlight_Q_profile PlutoUI.CheckBox(default = true)) |
+| $U/I_0$ | $(@bind show_starlight_U_profile PlutoUI.CheckBox(default = true)) |
+| $p_\star$ | $(@bind show_starlight_p_profile PlutoUI.CheckBox(default = true)) |
+| $\psi_\star$ | $(@bind show_starlight_angle_profile PlutoUI.CheckBox(default = true)) |
+| Cumulative $\tau_V$ | $(@bind show_starlight_tau_profile PlutoUI.CheckBox(default = true)) |
+| Local $B_{\rm LOS}$ | $(@bind show_starlight_blos_profile PlutoUI.CheckBox(default = false)) |
+| Local magnetic inclination $\gamma_B$ | $(@bind show_starlight_gamma_profile PlutoUI.CheckBox(default = false)) |
+"""
+
+# ╔═╡ a2d5319b-06f4-4efc-b3d7-3a9719292305
+begin
+    function starlight_mueller_step(I, Q, U, V, tau, psi, p0)
+        delta_tau_factor = log((1 + p0) / (1 - p0))
+        delta_tau = tau .* delta_tau_factor
+        qtrans = exp.(-(tau .+ delta_tau))
+        rtrans = exp.(-(tau .- delta_tau))
+        sin2psi = sin.(2 .* psi)
+        cos2psi = cos.(2 .* psi)
+        qplus = qtrans .+ rtrans
+        qminus = qtrans .- rtrans
+        root = sqrt.(max.(qtrans .* rtrans, 0.0))
+        cross = cos2psi .* sin2psi
+        Inew = 0.5 .* (qplus .* I .+ qminus .* cos2psi .* Q .+
+            qminus .* sin2psi .* U)
+        Qnew = 0.5 .* (qminus .* cos2psi .* I .+
+            (qplus .* cos2psi .^ 2 .+ 2 .* root .* sin2psi .^ 2) .* Q .+
+            (qplus .- 2 .* root) .* cross .* U)
+        Unew = 0.5 .* (qminus .* sin2psi .* I .+
+            (qplus .- 2 .* root) .* cross .* Q .+
+            (qplus .* sin2psi .^ 2 .+ 2 .* root .* cos2psi .^ 2) .* U)
+        Vnew = root .* V
+        Inew, Qnew, Unew, Vnew
+    end
+
+    starlight_nlos = size(cube.rho, los_dim)
+    starlight_dx_pc = cube.L[los_dim] / starlight_nlos
+    starlight_requested_distance_pc = clamp(Float64(starlight_star_distance_pc),
+        starlight_dx_pc, cube.L[los_dim])
+    starlight_cell_count = clamp(ceil(Int,
+        starlight_requested_distance_pc / starlight_dx_pc), 1, starlight_nlos)
+    starlight_distance_pc = collect(1:starlight_cell_count) .* starlight_dx_pc
+    starlight_actual_distance_pc = last(starlight_distance_pc)
+    starlight_shape = size(selectdim(cube.rho, los_dim, 1))
+    starlight_I0 = Float64(starlight_initial_I)
+    starlight_I0 > 0 || error("Incident starlight intensity I0 must be positive.")
+    starlight_Q0 = Float64(starlight_initial_Q)
+    starlight_U0 = Float64(starlight_initial_U)
+    starlight_V0 = Float64(starlight_initial_V)
+    starlight_p0_value = clamp(Float64(starlight_p0), 0.0, 1 - eps(Float64))
+    starlight_nh_av = max(Float64(starlight_nh_per_av), eps(Float64))
+    starlight_I_map = fill(starlight_I0, starlight_shape)
+    starlight_Q_map = fill(starlight_Q0, starlight_shape)
+    starlight_U_map = fill(starlight_U0, starlight_shape)
+    starlight_V_map = fill(starlight_V0, starlight_shape)
+    starlight_tau_map = zeros(Float64, starlight_shape)
+    starlight_blos_numerator = zeros(Float64, starlight_shape)
+    starlight_column = zeros(Float64, starlight_shape)
+    starlight_pixel_index = (Int(starlight_sky_i), Int(starlight_sky_j))
+    starlight_I_profile = Float64[]
+    starlight_Q_profile = Float64[]
+    starlight_U_profile = Float64[]
+    starlight_V_profile = Float64[]
+    starlight_tau_profile = Float64[]
+    starlight_blos_profile = Float64[]
+    starlight_gamma_profile_deg = Float64[]
+    starlight_local_psi_deg = Float64[]
+    starlight_east_component = Bcomponents[sky_dims[1]]
+    starlight_north_component = Bcomponents[sky_dims[2]]
+
+    for cell_index in 1:starlight_cell_count
+        density_slice = selectdim(cube.rho, los_dim, cell_index) ./
+            (max(Float64(starlight_mu_H), eps(Float64)) * M_H_CGS)
+        blos_slice = selectdim(Bcomponents[los_dim], los_dim, cell_index)
+        beast_slice = selectdim(starlight_east_component, los_dim, cell_index)
+        bnorth_slice = selectdim(starlight_north_component, los_dim, cell_index)
+        bnorm_slice = sqrt.(blos_slice .^ 2 .+ beast_slice .^ 2 .+ bnorth_slice .^ 2)
+        psi_slice = atan.(beast_slice, bnorth_slice)
+        tau_slice = density_slice .* (starlight_dx_pc * PC_CM) ./ starlight_nh_av
+        next_I_map, next_Q_map, next_U_map, next_V_map =
+            starlight_mueller_step(starlight_I_map, starlight_Q_map,
+                starlight_U_map, starlight_V_map, tau_slice, psi_slice,
+                starlight_p0_value)
+        starlight_I_map .= next_I_map
+        starlight_Q_map .= next_Q_map
+        starlight_U_map .= next_U_map
+        starlight_V_map .= next_V_map
+        starlight_tau_map .+= tau_slice
+        starlight_blos_numerator .+= density_slice .* blos_slice
+        starlight_column .+= density_slice
+        push!(starlight_I_profile, starlight_I_map[starlight_pixel_index...])
+        push!(starlight_Q_profile, starlight_Q_map[starlight_pixel_index...])
+        push!(starlight_U_profile, starlight_U_map[starlight_pixel_index...])
+        push!(starlight_V_profile, starlight_V_map[starlight_pixel_index...])
+        push!(starlight_tau_profile, starlight_tau_map[starlight_pixel_index...])
+        push!(starlight_blos_profile,
+            GAUSS_TO_MICROGAUSS * blos_slice[starlight_pixel_index...])
+        local_B = bnorm_slice[starlight_pixel_index...]
+        local_blos = blos_slice[starlight_pixel_index...]
+        push!(starlight_gamma_profile_deg, local_B > 0 ?
+            rad2deg(acos(clamp(local_blos / local_B, -1.0, 1.0))) : NaN)
+        push!(starlight_local_psi_deg,
+            rad2deg(psi_slice[starlight_pixel_index...]))
+    end
+
+    starlight_I_map = apply_observational_beam_2d(starlight_I_map, cube, sky_dims)
+    starlight_Q_map = apply_observational_beam_2d(starlight_Q_map, cube, sky_dims)
+    starlight_U_map = apply_observational_beam_2d(starlight_U_map, cube, sky_dims)
+    starlight_V_map = apply_observational_beam_2d(starlight_V_map, cube, sky_dims)
+    starlight_I_normalized = starlight_I_map ./ starlight_I0
+    starlight_Q_normalized = starlight_Q_map ./ starlight_I0
+    starlight_U_normalized = starlight_U_map ./ starlight_I0
+    starlight_p_map = clamp.(sqrt.(starlight_Q_map .^ 2 .+
+        starlight_U_map .^ 2) ./ max.(abs.(starlight_I_map), eps(Float64)), 0.0, 1.0)
+    starlight_angle_deg = rad2deg.(0.5 .* atan.(starlight_U_map, starlight_Q_map))
+    starlight_NH_map = starlight_column .* (starlight_dx_pc * PC_CM)
+    starlight_blos_map_uG = GAUSS_TO_MICROGAUSS .* starlight_blos_numerator ./
+        max.(starlight_column, eps(Float64))
+    starlight_I_profile_normalized = starlight_I_profile ./ starlight_I0
+    starlight_Q_profile_normalized = starlight_Q_profile ./ starlight_I0
+    starlight_U_profile_normalized = starlight_U_profile ./ starlight_I0
+    starlight_p_profile = clamp.(sqrt.(starlight_Q_profile .^ 2 .+
+        starlight_U_profile .^ 2) ./ max.(abs.(starlight_I_profile), eps(Float64)), 0.0, 1.0)
+    starlight_angle_profile_deg = rad2deg.(0.5 .* atan.(
+        starlight_U_profile, starlight_Q_profile))
+end
+
+# ╔═╡ 67f95c39-1888-4d23-a2c2-2ee3a6cd7f0f
+md"""
+---
+
+## 15. H I Zeeman splitting
+
+Weak-splitting $\mathrm{H\,I}$ Zeeman synthesis. Select a sky pixel to compare the true weighted field with the Stokes-$V$ fit.
+
+| Zeeman figure | Display |
+|:--|:--:|
+| Zeeman maps | $(@bind display_zeeman_maps PlutoUI.CheckBox(default = true)) |
+| Stokes spectra | $(@bind display_zeeman_spectra PlutoUI.CheckBox(default = true)) |
+| Circular-polarization fraction versus $N_{\rm HI}$ | $(@bind display_zeeman_p_column PlutoUI.CheckBox(default = true)) |
+
+| Zeeman setting | Control |
+|:--|:--|
+| Neutral $\mathrm{H\,I}$ fraction | $(@bind zeeman_neutral_fraction PlutoUI.NumberField(0.0:0.01:1.0; default = 1.0)) |
+| Rest frequency [$\mathrm{MHz}$] | $(@bind zeeman_frequency_MHz PlutoUI.NumberField(default = 1420.40575177)) |
+| Splitting coefficient [$\mathrm{Hz}\,\mu\mathrm{G}^{-1}$] | $(@bind zeeman_coefficient_Hz_uG PlutoUI.NumberField(0.0:0.01:10.0; default = 2.80)) |
+| Non-thermal line width [$\mathrm{km\,s}^{-1}$] | $(@bind zeeman_microturbulence_kms PlutoUI.NumberField(0.05:0.05:20.0; default = 0.8)) |
+| Velocity padding [$\mathrm{km\,s}^{-1}$] | $(@bind zeeman_velocity_padding_kms PlutoUI.NumberField(1.0:0.5:50.0; default = 5.0)) |
+| Number of channels | $(@bind zeeman_channel_count PlutoUI.Select([101, 201, 301, 401]; default = 201)) |
+| First sky-axis pixel | $(@bind zeeman_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
+| Second sky-axis pixel | $(@bind zeeman_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
+| $\mathrm{H\,I}$-weighted $B_{\mathrm{LOS}}$ map | $(@bind show_zeeman_Bmap PlutoUI.CheckBox(default = true)) |
+| Frequency-splitting map | $(@bind show_zeeman_split_map PlutoUI.CheckBox(default = true)) |
+| Stokes-$I$ spectrum | $(@bind show_zeeman_I_spectrum PlutoUI.CheckBox(default = true)) |
+| Stokes-$V$ spectrum | $(@bind show_zeeman_V_spectrum PlutoUI.CheckBox(default = true)) |
+| Derivative-fit model | $(@bind show_zeeman_fit PlutoUI.CheckBox(default = true)) |
+"""
+
+# ╔═╡ 76b9cf43-a13e-44c8-97d6-4760cc3aa486
+begin
+    function extract_sightline(A, i, j, line_dim, plane_dims)
+        indices = Any[Colon(), Colon(), Colon()]
+        indices[plane_dims[1]] = i
+        indices[plane_dims[2]] = j
+        vec(view(A, indices...))
+    end
+
+    zeeman_nHI = Float64(zeeman_neutral_fraction) .* cube.rho ./ (1.4M_H_CGS)
+    zeeman_Blos_uG_cube = GAUSS_TO_MICROGAUSS .* Bcomponents[los_dim]
+    zeeman_valid_cube = isfinite.(zeeman_nHI) .& isfinite.(zeeman_Blos_uG_cube) .&
+        (zeeman_nHI .> 0)
+    zeeman_weight_sum = finite_sum_dims(ifelse.(zeeman_valid_cube, zeeman_nHI, NaN), los_dim)
+    zeeman_B_numerator = finite_sum_dims(ifelse.(zeeman_valid_cube,
+        zeeman_nHI .* zeeman_Blos_uG_cube, NaN), los_dim)
+    zeeman_weight_sum = apply_observational_beam_2d(zeeman_weight_sum, cube, sky_dims)
+    zeeman_B_numerator = apply_observational_beam_2d(
+        zeeman_B_numerator, cube, sky_dims)
+    zeeman_Bmap_uG = zeeman_B_numerator ./ max.(zeeman_weight_sum, eps(Float64))
+    zeeman_z = Float64(zeeman_coefficient_Hz_uG)
+    zeeman_split_map_Hz = zeeman_z .* zeeman_Bmap_uG
+
+    zeeman_i, zeeman_j = Int(zeeman_sky_i), Int(zeeman_sky_j)
+    zeeman_v_components = (cube.vx, cube.vy, cube.vz)
+    zeeman_vlos = extract_sightline(zeeman_v_components[los_dim], zeeman_i, zeeman_j, los_dim, sky_dims)
+    zeeman_Tline = extract_sightline(T, zeeman_i, zeeman_j, los_dim, sky_dims)
+    zeeman_nline = extract_sightline(zeeman_nHI, zeeman_i, zeeman_j, los_dim, sky_dims)
+    zeeman_Bline_uG = extract_sightline(zeeman_Blos_uG_cube, zeeman_i, zeeman_j, los_dim, sky_dims)
+    zeeman_sigma_thermal = sqrt.(K_B_CGS .* max.(zeeman_Tline, 0.0) ./ M_H_CGS) ./ KM_CM
+    zeeman_sigma_kms = sqrt.(zeeman_sigma_thermal .^ 2 .+ Float64(zeeman_microturbulence_kms)^2)
+    zeeman_Ncell = zeeman_nline .* dx_los_cm
+    zeeman_line_valid = isfinite.(zeeman_vlos) .& isfinite.(zeeman_sigma_kms) .&
+        isfinite.(zeeman_Ncell) .& isfinite.(zeeman_Bline_uG) .&
+        (zeeman_sigma_kms .> 0) .& (zeeman_Ncell .>= 0)
+    zeeman_vlos = zeeman_vlos[zeeman_line_valid]
+    zeeman_sigma_kms = zeeman_sigma_kms[zeeman_line_valid]
+    zeeman_Ncell = zeeman_Ncell[zeeman_line_valid]
+    zeeman_Bline_uG = zeeman_Bline_uG[zeeman_line_valid]
+    if isempty(zeeman_vlos)
+        zeeman_vlos = [0.0]
+        zeeman_sigma_kms = [max(Float64(zeeman_microturbulence_kms), eps(Float64))]
+        zeeman_Ncell = [0.0]
+        zeeman_Bline_uG = [0.0]
+    end
+    zeeman_padding = Float64(zeeman_velocity_padding_kms)
+    zeeman_vmin = minimum(zeeman_vlos .- 4 .* zeeman_sigma_kms) - zeeman_padding
+    zeeman_vmax = maximum(zeeman_vlos .+ 4 .* zeeman_sigma_kms) + zeeman_padding
+    zeeman_velocity_axis = collect(range(zeeman_vmin, zeeman_vmax; length = Int(zeeman_channel_count)))
+    zeeman_amplitudes = zeeman_Ncell ./
+        (1.823e18 .* sqrt(2pi) .* max.(zeeman_sigma_kms, eps(Float64)))
+    zeeman_profiles = [zeeman_amplitudes[cell] *
+        exp(-0.5 * ((velocity - zeeman_vlos[cell]) / zeeman_sigma_kms[cell])^2)
+        for velocity in zeeman_velocity_axis, cell in eachindex(zeeman_vlos)]
+    zeeman_I_K = vec(sum(zeeman_profiles; dims = 2))
+    zeeman_nu0_Hz = Float64(zeeman_frequency_MHz) * 1.0e6
+    zeeman_dIdnu_profiles = [zeeman_profiles[channel, cell] *
+        (zeeman_velocity_axis[channel] - zeeman_vlos[cell]) / zeeman_sigma_kms[cell]^2 *
+        C_LIGHT_KMS / zeeman_nu0_Hz
+        for channel in eachindex(zeeman_velocity_axis), cell in eachindex(zeeman_vlos)]
+    zeeman_dIdnu = vec(sum(zeeman_dIdnu_profiles; dims = 2))
+    zeeman_V_K = 0.5zeeman_z .* vec(zeeman_dIdnu_profiles * zeeman_Bline_uG)
+    zeeman_fit_denominator = zeeman_z * sum(abs2, zeeman_dIdnu)
+    zeeman_Bfit_uG = zeeman_fit_denominator > 0 ?
+        2sum(zeeman_dIdnu .* zeeman_V_K) / zeeman_fit_denominator : NaN
+    zeeman_Vfit_K = 0.5zeeman_z * zeeman_Bfit_uG .* zeeman_dIdnu
+    zeeman_Btrue_uG = sum(zeeman_Ncell .* zeeman_Bline_uG) / max(sum(zeeman_Ncell), eps(Float64))
+
+    zeeman_map_specs = NamedTuple[]
+    show_zeeman_Bmap && push!(zeeman_map_specs, (data = zeeman_Bmap_uG,
+        label = L"\langle B_{\mathrm{LOS}}\rangle_{\mathrm{HI}}\;[\mu\mathrm{G}]", colormap = :balance))
+    show_zeeman_split_map && push!(zeeman_map_specs, (data = zeeman_split_map_Hz,
+        label = L"\Delta\nu_Z\;[\mathrm{Hz}]", colormap = :balance))
+    if isempty(zeeman_map_specs)
+        fig_zeeman_maps = Figure(size = (900, 180))
+        Label(fig_zeeman_maps[1, 1], L"\mathrm{Select\ at\ least\ one\ Zeeman\ map.}", fontsize = 20)
+    else
+        fig_zeeman_maps = Figure(size = (540length(zeeman_map_specs), 410))
+        for (index, spec) in enumerate(zeeman_map_specs)
+            panel = fig_zeeman_maps[1, index] = GridLayout()
+            ax = physical_map_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
+                ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
+            hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], spec.data;
+                colormap = spec.colormap,
+                colorrange = robust_colorrange(spec.data, color_percentile; diverging = true))
+            scatter!(ax, [sky_coordinates[1][zeeman_i]], [sky_coordinates[2][zeeman_j]];
+                marker = :cross, markersize = 20, strokewidth = 3, color = :white)
+            latex_colorbar(panel[1, 2], hm; label = as_latex(spec.label), tickformat = latex_ticklabels)
+            colsize!(panel, 2, 22)
+        end
+    end
+    display_zeeman_maps ? fig_zeeman_maps : nothing
+end
+
+# ╔═╡ 8f9e5bd2-8c7f-45b9-a92c-ad4b20d9ef21
+begin
+    function zeeman_fraction_maps(nHI, vlos_cube, temperature_cube, Blos_uG_cube,
+            line_dim, plane_dims, dx_cm, microturbulence_kms,
+            rest_frequency_Hz, splitting_coefficient, channel_count)
+        map_shape = size(selectdim(nHI, line_dim, 1))
+        NHI_map = zeros(Float64, map_shape)
+        pV_map = zeros(Float64, map_shape)
+        Ipeak_map = zeros(Float64, map_shape)
+        for pixel in CartesianIndices(map_shape)
+            i, j = Tuple(pixel)
+            nline = extract_sightline(nHI, i, j, line_dim, plane_dims)
+            vline = extract_sightline(vlos_cube, i, j, line_dim, plane_dims)
+            Tline = extract_sightline(temperature_cube, i, j, line_dim, plane_dims)
+            Bline = extract_sightline(Blos_uG_cube, i, j, line_dim, plane_dims)
+            sigma = sqrt.(K_B_CGS .* max.(Tline, 0.0) ./ M_H_CGS) ./ KM_CM
+            sigma = sqrt.(sigma .^ 2 .+ microturbulence_kms^2)
+            Ncell = nline .* dx_cm
+            NHI_map[pixel] = sum(Ncell)
+            amplitudes = Ncell ./
+                (1.823e18 .* sqrt(2pi) .* max.(sigma, eps(Float64)))
+            velocity = range(minimum(vline .- 5 .* sigma),
+                maximum(vline .+ 5 .* sigma); length = channel_count)
+            Iprofile = zeros(Float64, channel_count)
+            Vprofile = zeros(Float64, channel_count)
+            for cell in eachindex(vline)
+                profile = @. amplitudes[cell] *
+                    exp(-0.5 * ((velocity - vline[cell]) / sigma[cell])^2)
+                derivative = @. profile * (velocity - vline[cell]) / sigma[cell]^2 *
+                    C_LIGHT_KMS / rest_frequency_Hz
+                Iprofile .+= profile
+                Vprofile .+= 0.5splitting_coefficient .* Bline[cell] .* derivative
+            end
+            Ipeak_map[pixel] = maximum(Iprofile)
+            pV_map[pixel] = maximum(abs, Vprofile) /
+                max(Ipeak_map[pixel], eps(Float64))
+        end
+        NHI_map, pV_map, Ipeak_map
+    end
+
+    zeeman_NHI_map, zeeman_pV_map, zeeman_Ipeak_map_K = zeeman_fraction_maps(
+        zeeman_nHI, zeeman_v_components[los_dim], T, zeeman_Blos_uG_cube,
+        los_dim, sky_dims, dx_los_cm, Float64(zeeman_microturbulence_kms),
+        zeeman_nu0_Hz, zeeman_z, Int(zeeman_channel_count))
+    zeeman_pV_numerator = apply_observational_beam_2d(
+        zeeman_pV_map .* zeeman_Ipeak_map_K, cube, sky_dims)
+    zeeman_Ipeak_map_K = apply_observational_beam_2d(
+        zeeman_Ipeak_map_K, cube, sky_dims)
+    zeeman_NHI_map = apply_observational_beam_2d(zeeman_NHI_map, cube, sky_dims)
+    zeeman_pV_map = zeeman_pV_numerator ./ max.(zeeman_Ipeak_map_K, eps(Float64))
+    fig_zeeman_p_column = polarization_column_figure(
+        zeeman_NHI_map, zeeman_pV_map,
+        L"100p_V\;[\%]", MHD_COLORS[2])
+    display_zeeman_p_column ? fig_zeeman_p_column : nothing
+end
+
 # ╔═╡ 62b61ef2-8e5d-4fe9-a435-e18fb5be9461
 md"""
 ---
@@ -3685,22 +4572,30 @@ md"""
 ## 16. MOOSE Faraday post-processing
 
 Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis.
+The default MOOSE output is restricted to Faraday-depth space: the local
+$F(\phi)$ spectrum and the H I--Faraday HOG in $(u,\phi)$. Batch calculations
+use all physical and instrumental defaults listed below.
 
 | MOOSE figure | Display |
 |:--|:--:|
-| Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = true)) |
+| Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = false)) |
 | Faraday tomography | $(@bind display_moose_tomography PlutoUI.CheckBox(default = true)) |
-| Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = true)) |
-| Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = true)) |
+| Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = false)) |
+| Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = false)) |
 
 | MOOSE setting | Control |
 |:--|:--|
-| Electron prescription | $(@bind moose_electron_model PlutoUI.Select(["Two-phase ionization", "Constant ionization fraction"]; default = "Two-phase ionization")) |
+| Electron prescription | $(@bind moose_electron_model PlutoUI.Select(["Wolfire–Bellomi equilibrium", "Two-phase ionization (legacy)", "Constant ionization fraction"]; default = "Wolfire–Bellomi equilibrium")) |
+| Total H ionization rate $\zeta$ [$\mathrm{s}^{-1}$] | $(@bind moose_ionization_rate PlutoUI.NumberField(default = 2.5e-16)) |
+| Effective radiation field $G_{\rm eff}$ [Habing] | $(@bind moose_effective_radiation_field PlutoUI.NumberField(default = 1.7)) |
+| PAH recombination parameter $\omega_{\rm PAH}$ | $(@bind moose_pah_recombination PlutoUI.NumberField(default = 0.5)) |
+| Ionized-carbon abundance $X_{\rm C^+}$ | $(@bind moose_ionized_carbon_abundance PlutoUI.NumberField(default = 1.4e-4)) |
+| Fully ionized threshold [$\mathrm{K}$] | $(@bind moose_fully_ionized_temperature PlutoUI.NumberField(default = 10.0^4.2)) |
 | Constant $x_e$ | $(@bind moose_constant_xe PlutoUI.NumberField(default = 0.01)) |
 | CNM $x_e$ | $(@bind moose_cnm_xe PlutoUI.NumberField(default = 1.0e-4)) |
 | WNM $x_e$ | $(@bind moose_wnm_xe PlutoUI.NumberField(default = 1.0e-2)) |
 | CNM/WNM transition temperature [$\mathrm{K}$] | $(@bind moose_transition_T PlutoUI.NumberField(default = 200.0)) |
-| Cosmic-ray electron index $p$ | $(@bind moose_cr_index PlutoUI.NumberField(1.0:0.1:5.0; default = 3.0)) |
+| Synchrotron cosmic-ray electron index $p$ | $(@bind moose_cr_index PlutoUI.NumberField(1.0:0.1:5.0; default = 3.0)) |
 | Observing frequency [$\mathrm{MHz}$] | $(@bind moose_frequency_MHz PlutoUI.NumberField(50.0:1.0:2000.0; default = 150.0)) |
 | Synchrotron normalization [$\mathrm{K}\,(\mu\mathrm{G})^{-(p+1)/2}\,\mathrm{pc}^{-1}$] | $(@bind moose_synchrotron_norm PlutoUI.NumberField(default = 1.0)) |
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
@@ -3722,7 +4617,7 @@ Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
 | First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = true)) |
+| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = false)) |
 | Faraday-spectrum amplitude | $(@bind show_moose_F_abs PlutoUI.CheckBox(default = true)) |
 | $\Re F(\phi)$ spectrum | $(@bind show_moose_F_real PlutoUI.CheckBox(default = true)) |
 | $\Im F(\phi)$ spectrum | $(@bind show_moose_F_imag PlutoUI.CheckBox(default = true)) |
@@ -3730,13 +4625,62 @@ Synchrotron emission, Faraday rotation, instrumental filtering, and RM synthesis
 
 # ╔═╡ 0e8d9cab-aef2-42cd-959d-973764340f08
 begin
-    moose_ne = if moose_electron_model == "Constant ionization fraction"
-        Float64(moose_constant_xe) .* number_density_cells
-    else
-        ionization_fraction = ifelse.(T .< Float64(moose_transition_T),
-            Float64(moose_cnm_xe), Float64(moose_wnm_xe))
-        ionization_fraction .* number_density_cells
+    """
+    Electron-density proxy used for the MOOSE Faraday products.
+
+    For T <= T_ion this is Eq. (6) of Bracco et al. (2022), following
+    Wolfire et al. (2003) and Bellomi et al. (2020). Hotter gas is treated as
+    fully collisionally ionized, ne = nH.
+    """
+    function wolfire_bellomi_electron_density(nH, temperature;
+            ionization_rate, radiation_field, pah_recombination,
+            ionized_carbon_abundance, fully_ionized_temperature)
+        zeta = Float64(ionization_rate)
+        geff = Float64(radiation_field)
+        omega_pah = Float64(pah_recombination)
+        carbon_abundance = Float64(ionized_carbon_abundance)
+        hot_threshold = Float64(fully_ionized_temperature)
+        zeta > 0 || error("The Wolfire ionization rate must be positive.")
+        geff >= 0 || error("The effective radiation field must be non-negative.")
+        omega_pah > 0 || error("The PAH recombination parameter must be positive.")
+        carbon_abundance >= 0 || error("The C+ abundance must be non-negative.")
+        hot_threshold > 0 || error("The fully ionized temperature must be positive.")
+
+        neutral_prefactor = 2.4e-3 * sqrt(zeta / 1.0e-16) *
+            sqrt(geff) / omega_pah
+        electron_density = Array{Float64}(undef, size(nH))
+        @inbounds for index in eachindex(nH, temperature)
+            density = Float64(nH[index])
+            thermal = Float64(temperature[index])
+            if !isfinite(density) || density < 0 || !isfinite(thermal) || thermal < 0
+                electron_density[index] = NaN
+            elseif thermal > hot_threshold
+                electron_density[index] = density
+            else
+                electron_density[index] = neutral_prefactor *
+                    (thermal / 100.0)^0.25 + density * carbon_abundance
+            end
+        end
+        electron_density
     end
+
+    function moose_electron_density(nH, temperature)
+        if moose_electron_model == "Constant ionization fraction"
+            return Float64(moose_constant_xe) .* nH
+        elseif moose_electron_model == "Two-phase ionization (legacy)"
+            ionization_fraction = ifelse.(temperature .< Float64(moose_transition_T),
+                Float64(moose_cnm_xe), Float64(moose_wnm_xe))
+            return ionization_fraction .* nH
+        end
+        wolfire_bellomi_electron_density(nH, temperature;
+            ionization_rate = moose_ionization_rate,
+            radiation_field = moose_effective_radiation_field,
+            pah_recombination = moose_pah_recombination,
+            ionized_carbon_abundance = moose_ionized_carbon_abundance,
+            fully_ionized_temperature = moose_fully_ionized_temperature)
+    end
+
+    moose_ne = moose_electron_density(number_density_cells, T)
 
     moose_Blos_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[los_dim]
     moose_Bsky1_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[1]]
@@ -3871,8 +4815,10 @@ md"""
 
 Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 
-**Display SHINE H I maps:** $(@bind display_shine PlutoUI.CheckBox(default = true))  
-**Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))  
+**Display SHINE H I maps:** $(@bind display_shine PlutoUI.CheckBox(default = true))
+
+**Display the selected H I spectrum:** $(@bind display_shine_spectrum PlutoUI.CheckBox(default = true))
+
 **Display the spatial power spectra:** $(@bind display_shine_power_spectra PlutoUI.CheckBox(default = true))
 **Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
 **Display the H I--Faraday HOG comparison:** $(@bind display_hi_faraday_hog PlutoUI.CheckBox(default = true))
@@ -4211,16 +5157,7 @@ begin
         hi_cube = apply_observational_beam_cube(hi_cube, c, sky_dims)
 
         local_number_density = number_density(c.rho)
-        local_ne = if moose_electron_model == "Constant ionization fraction"
-            Float64(moose_constant_xe) .* local_number_density
-        else
-            local_xe = ifelse.(
-                local_temperature .< Float64(moose_transition_T),
-                Float64(moose_cnm_xe),
-                Float64(moose_wnm_xe),
-            )
-            local_xe .* local_number_density
-        end
+        local_ne = moose_electron_density(local_number_density, local_temperature)
         components = (c.bx, c.by, c.bz)
         local_blos = GAUSS_TO_MICROGAUSS .* components[los_dim]
         local_bsky1 = GAUSS_TO_MICROGAUSS .* components[sky_dims[1]]
@@ -4458,6 +5395,11 @@ begin
         last(shine_velocity_axis),
         length(shine_velocity_axis),
         String(moose_electron_model),
+        Float64(moose_ionization_rate),
+        Float64(moose_effective_radiation_field),
+        Float64(moose_pah_recombination),
+        Float64(moose_ionized_carbon_abundance),
+        Float64(moose_fully_ionized_temperature),
         Float64(moose_constant_xe),
         Float64(moose_cnm_xe),
         Float64(moose_wnm_xe),
@@ -4648,19 +5590,327 @@ begin
     display_shine_power_spectra ? fig_shine_power_spectra : nothing
 end
 
+# ╔═╡ 14e7606a-3a13-4c8e-b860-e40dc63a6fa2
+md"""
+---
+
+## 19. Polarization fractions versus time
+
+Each panel follows one synthetic-observation polarization fraction through the selected simulations. The reported value is either the area-weighted sky mean,
+
+```math
+\langle p\rangle_A=\frac{1}{N_{\rm pix}}\sum_j p_j,
+```
+
+or the intensity-weighted mean,
+
+```math
+\langle p\rangle_I=\frac{\sum_j P_j}{\sum_j I_j}=\frac{\sum_j p_jI_j}{\sum_j I_j}.
+```
+
+The thick horizontal segments above every panel identify two time intervals for the active run: the exponential dynamo interval used to fit $\Gamma_B$ in section 5 and the user-selected statistically steady interval. Thin vertical guides mark the end of growth and the beginning of the steady regime.
+
+**Display polarization fractions versus time:** $(@bind display_polarization_time PlutoUI.CheckBox(default = false))
+
+| Temporal polarization diagnostic | Display |
+|:--|:--:|
+| Thermal dust | $(@bind show_polarization_time_dust PlutoUI.CheckBox(default = true)) |
+| Dichroic starlight | $(@bind show_polarization_time_starlight PlutoUI.CheckBox(default = true)) |
+| Faraday synchrotron | $(@bind show_polarization_time_faraday PlutoUI.CheckBox(default = true)) |
+| Zeeman circular polarization | $(@bind show_polarization_time_zeeman PlutoUI.CheckBox(default = true)) |
+
+| Temporal setting | Control |
+|:--|:--|
+| Sky averaging | $(@bind polarization_time_weighting PlutoUI.Select(["Intensity-weighted mean" => "intensity", "Area-weighted mean" => "area"]; default = "intensity")) |
+| Snapshot stride | $(@bind polarization_time_stride PlutoUI.Slider(1:maximum_snapshot_count; default = 1, show_value = true)) |
+| Zeeman velocity channels | $(@bind polarization_time_zeeman_channels PlutoUI.Select([31, 51, 81, 101]; default = 51)) |
+| Display growth and steady-state bars | $(@bind show_polarization_regime_bars PlutoUI.CheckBox(default = true)) |
+| Steady-state start snapshot | $(@bind polarization_steady_start PlutoUI.Slider(1:length(run_files[selected_run]); default = min(last(growth_fit_window) + 1, length(run_files[selected_run])), show_value = true)) |
+"""
+
+# ╔═╡ b37d82bc-7819-47f9-b0ab-4de2f124f3cc
+begin
+    fig_polarization_time = let
+    function polarization_sky_average(fraction, intensity, weighting)
+        p = vec(Float64.(fraction))
+        I = vec(Float64.(intensity))
+        valid = isfinite.(p) .& isfinite.(I) .& (p .>= 0) .& (I .>= 0)
+        any(valid) || return NaN
+        if weighting == "intensity"
+            normalization = sum(I[valid])
+            normalization > 0 || return NaN
+            return sum(p[valid] .* I[valid]) / normalization
+        end
+        mean(p[valid])
+    end
+
+    function temporal_dust_fraction(c, line_dim, plane_dims, weighting)
+        components = (c.bx, c.by, c.bz)
+        B2 = c.bx .^ 2 .+ c.by .^ 2 .+ c.bz .^ 2
+        B1, B2sky = components[plane_dims[1]], components[plane_dims[2]]
+        cos2gamma = clamp.((B1 .^ 2 .+ B2sky .^ 2) ./ max.(B2, eps(Float64)), 0.0, 1.0)
+        angle = atan.(B2sky, B1) .+ pi / 2
+        dx_cm = c.L[line_dim] / size(c.rho, line_dim) * PC_CM
+        nH = c.rho ./ (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
+        column_weight = dx_cm .* nH
+        p0 = Float64(dust_p0)
+        I = finite_sum_dims(column_weight .* (1 .- p0 .* (cos2gamma .- 2 / 3)),
+            line_dim)
+        Q = finite_sum_dims(column_weight .* p0 .* cos2gamma .* cos.(2 .* angle),
+            line_dim)
+        U = finite_sum_dims(column_weight .* p0 .* cos2gamma .* sin.(2 .* angle),
+            line_dim)
+        I = apply_observational_beam_2d(I, c, plane_dims)
+        Q = apply_observational_beam_2d(Q, c, plane_dims)
+        U = apply_observational_beam_2d(U, c, plane_dims)
+        P = sqrt.(Q .^ 2 .+ U .^ 2)
+        polarization_sky_average(P ./ max.(I, eps(Float64)), I, weighting)
+    end
+
+    function temporal_starlight_fraction(c, line_dim, plane_dims, weighting)
+        nlos = size(c.rho, line_dim)
+        dx_pc = c.L[line_dim] / nlos
+        cell_count = clamp(ceil(Int, clamp(Float64(starlight_star_distance_pc),
+            dx_pc, c.L[line_dim]) / dx_pc), 1, nlos)
+        map_shape = size(selectdim(c.rho, line_dim, 1))
+        I = fill(Float64(starlight_initial_I), map_shape)
+        Q = fill(Float64(starlight_initial_Q), map_shape)
+        U = fill(Float64(starlight_initial_U), map_shape)
+        V = fill(Float64(starlight_initial_V), map_shape)
+        components = (c.bx, c.by, c.bz)
+        p0 = clamp(Float64(starlight_p0), 0.0, 1 - eps(Float64))
+        nh_per_av = max(Float64(starlight_nh_per_av), eps(Float64))
+        for cell_index in 1:cell_count
+            density = selectdim(c.rho, line_dim, cell_index) ./
+                (max(Float64(starlight_mu_H), eps(Float64)) * M_H_CGS)
+            east = selectdim(components[plane_dims[1]], line_dim, cell_index)
+            north = selectdim(components[plane_dims[2]], line_dim, cell_index)
+            psi = atan.(east, north)
+            tau = density .* (dx_pc * PC_CM) ./ nh_per_av
+            I, Q, U, V = starlight_mueller_step(I, Q, U, V, tau, psi, p0)
+        end
+        I = apply_observational_beam_2d(I, c, plane_dims)
+        Q = apply_observational_beam_2d(Q, c, plane_dims)
+        U = apply_observational_beam_2d(U, c, plane_dims)
+        fraction = clamp.(sqrt.(Q .^ 2 .+ U .^ 2) ./
+            max.(abs.(I), eps(Float64)), 0.0, 1.0)
+        polarization_sky_average(fraction, abs.(I), weighting)
+    end
+
+    function temporal_faraday_fraction(c, line_dim, plane_dims, weighting)
+        components = (c.bx, c.by, c.bz)
+        B1 = GAUSS_TO_MICROGAUSS .* components[plane_dims[1]]
+        B2sky = GAUSS_TO_MICROGAUSS .* components[plane_dims[2]]
+        Blos = GAUSS_TO_MICROGAUSS .* components[line_dim]
+        Bperp = sqrt.(B1 .^ 2 .+ B2sky .^ 2)
+        temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        number_density_local = c.rho ./ (Float64(mean_molecular_weight) * M_H_CGS)
+        electron_density = if moose_electron_model == "Constant ionization fraction"
+            Float64(moose_constant_xe) .* number_density_local
+        else
+            ionization = ifelse.(temperature .< Float64(moose_transition_T),
+                Float64(moose_cnm_xe), Float64(moose_wnm_xe))
+            ionization .* number_density_local
+        end
+        dx_pc = c.L[line_dim] / size(c.rho, line_dim)
+        phi_increment = 0.812 .* electron_density .* Blos .* dx_pc
+        phi_to_cell = cumsum(phi_increment; dims = line_dim) .- 0.5 .* phi_increment
+        cr_index = Float64(moose_cr_index)
+        exponent = (cr_index + 1) / 2
+        spectral_index = -(cr_index + 3) / 2
+        frequency_scale = (Float64(moose_frequency_MHz) / 150.0)^spectral_index
+        emissivity = Float64(moose_synchrotron_norm) .* frequency_scale .* Bperp .^ exponent
+        intrinsic_angle = atan.(B2sky, B1) .+ pi / 2
+        lambda2 = (299_792_458.0 / (Float64(moose_frequency_MHz) * 1.0e6))^2
+        phase = 2 .* (intrinsic_angle .+ phi_to_cell .* lambda2)
+        I = finite_sum_dims(emissivity, line_dim) .* dx_pc
+        Q = finite_sum_dims(emissivity .* cos.(phase), line_dim) .* dx_pc
+        U = finite_sum_dims(emissivity .* sin.(phase), line_dim) .* dx_pc
+        transfer = moose_instrument_transfer(size(I), moose_largest_scale_pix,
+            moose_smallest_scale_pix)
+        if apply_moose_interferometer
+            I = apply_moose_interferometer_2d(I, transfer)
+            Q = apply_moose_interferometer_2d(Q, transfer)
+            U = apply_moose_interferometer_2d(U, transfer)
+        end
+        I = apply_observational_beam_2d(I, c, plane_dims)
+        Q = apply_observational_beam_2d(Q, c, plane_dims)
+        U = apply_observational_beam_2d(U, c, plane_dims)
+        if add_moose_noise
+            temporal_seed = Int(moose_instrument_seed) +
+                round(Int, 1000abs(Float64(c.t)))
+            add_moose_qu_noise!(Q, U, moose_instrument_snr,
+                MersenneTwister(temporal_seed))
+        end
+        P = sqrt.(Q .^ 2 .+ U .^ 2)
+        polarization_sky_average(P ./ max.(abs.(I), eps(Float64)), abs.(I), weighting)
+    end
+
+    function temporal_zeeman_fraction(c, line_dim, plane_dims, weighting, channel_count)
+        components = (c.vx, c.vy, c.vz)
+        magnetic_components = (c.bx, c.by, c.bz)
+        temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        nHI = Float64(zeeman_neutral_fraction) .* c.rho ./ (1.4M_H_CGS)
+        Blos = GAUSS_TO_MICROGAUSS .* magnetic_components[line_dim]
+        dx_cm = c.L[line_dim] / size(c.rho, line_dim) * PC_CM
+        _, fraction, Ipeak = zeeman_fraction_maps(nHI, components[line_dim],
+            temperature, Blos, line_dim, plane_dims, dx_cm,
+            Float64(zeeman_microturbulence_kms),
+            Float64(zeeman_frequency_MHz) * 1.0e6,
+            Float64(zeeman_coefficient_Hz_uG), channel_count)
+        polarized_peak = apply_observational_beam_2d(fraction .* Ipeak, c, plane_dims)
+        Ipeak = apply_observational_beam_2d(Ipeak, c, plane_dims)
+        fraction = polarized_peak ./ max.(Ipeak, eps(Float64))
+        polarization_sky_average(fraction, Ipeak, weighting)
+    end
+
+    polarization_time_panel_specs = NamedTuple[]
+    show_polarization_time_dust && push!(polarization_time_panel_specs,
+        (field = :dust, ylabel = L"100\langle p_{\mathrm d}\rangle\;[\%]"))
+    show_polarization_time_starlight && push!(polarization_time_panel_specs,
+        (field = :starlight, ylabel = L"100\langle p_{\star}\rangle\;[\%]"))
+    show_polarization_time_faraday && push!(polarization_time_panel_specs,
+        (field = :faraday, ylabel = L"100\langle p_{\mathrm F}\rangle\;[\%]"))
+    show_polarization_time_zeeman && push!(polarization_time_panel_specs,
+        (field = :zeeman, ylabel = L"100\langle p_V\rangle\;[\%]"))
+
+    polarization_time_series = Dict{String, Any}()
+    if display_polarization_time && !isempty(polarization_time_panel_specs)
+        stride = max(Int(polarization_time_stride), 1)
+        requested_fields = Set(getfield.(polarization_time_panel_specs, :field))
+        for label in comparison_run_labels
+            paths = run_files[label]
+            indices = unique(vcat(collect(1:stride:length(paths)), length(paths)))
+            values = NamedTuple[]
+            for snapshot_index in indices
+                local_cube = load_cube(paths[snapshot_index])
+                push!(values, (
+                    t = Float64(local_cube.t),
+                    dust = :dust in requested_fields ?
+                        temporal_dust_fraction(local_cube, los_dim, sky_dims,
+                            polarization_time_weighting) : NaN,
+                    starlight = :starlight in requested_fields ?
+                        temporal_starlight_fraction(local_cube, los_dim, sky_dims,
+                            polarization_time_weighting) : NaN,
+                    faraday = :faraday in requested_fields ?
+                        temporal_faraday_fraction(local_cube, los_dim, sky_dims,
+                            polarization_time_weighting) : NaN,
+                    zeeman = :zeeman in requested_fields ?
+                        temporal_zeeman_fraction(local_cube, los_dim, sky_dims,
+                            polarization_time_weighting,
+                            Int(polarization_time_zeeman_channels)) : NaN,
+                ))
+            end
+            polarization_time_series[label] = values
+        end
+    end
+
+    if isempty(polarization_time_panel_specs)
+        fig_polarization_time = Figure(size = (900, 180))
+        Label(fig_polarization_time[1, 1],
+            L"\mathrm{Select\ at\ least\ one\ temporal\ polarization\ diagnostic.}";
+            fontsize = 20)
+    elseif !display_polarization_time
+        fig_polarization_time = Figure(size = (900, 180))
+        Label(fig_polarization_time[1, 1],
+            L"\mathrm{Temporal\ polarization\ diagnostics\ are\ disabled.}";
+            fontsize = 20)
+    else
+        panel_columns = length(polarization_time_panel_specs) == 1 ? 1 : 2
+        panel_rows = cld(length(polarization_time_panel_specs), panel_columns)
+        fig_polarization_time = Figure(size = (560panel_columns, 400panel_rows + 95))
+        growth_start_time = growth_has_interval ? growth_times[growth_first_index] : NaN
+        growth_end_time = growth_has_interval ? growth_times[growth_last_index] : NaN
+        steady_index = clamp(Int(polarization_steady_start), 1, length(growth_times))
+        steady_start_time = growth_times[steady_index]
+        steady_end_time = last(growth_times)
+
+        for (panel_index, spec) in enumerate(polarization_time_panel_specs)
+            row, column = cld(panel_index, panel_columns), mod1(panel_index, panel_columns)
+            axis = latex_axis(fig_polarization_time[row, column],
+                xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel)
+            all_percentages = Float64[]
+            for label in comparison_run_labels
+                series = polarization_time_series[label]
+                times = Float64.(getfield.(series, :t))
+                percentages = 100 .* Float64.(getfield.(series, spec.field))
+                valid = isfinite.(times) .& isfinite.(percentages)
+                append!(all_percentages, percentages[valid])
+                lines!(axis, times[valid], percentages[valid];
+                    color = run_colors[label], linewidth = 2.4)
+                scatter!(axis, times[valid], percentages[valid];
+                    color = run_colors[label], markersize = 7)
+            end
+
+            if show_polarization_regime_bars && !isempty(all_percentages)
+                data_min, data_max = extrema(all_percentages)
+                span = max(data_max - data_min, max(abs(data_max), 1.0) * 0.08)
+                growth_bar_y = data_max + 0.12span
+                steady_bar_y = data_max + 0.28span
+                if growth_has_interval && isfinite(growth_start_time) && isfinite(growth_end_time)
+                    lines!(axis, [growth_start_time, growth_end_time],
+                        [growth_bar_y, growth_bar_y]; color = MHD_COLORS[2],
+                        linewidth = 7, linecap = :round)
+                    vlines!(axis, [growth_end_time]; color = (MHD_COLORS[2], 0.55),
+                        linewidth = 1.4, linestyle = :dash)
+                end
+                if steady_end_time >= steady_start_time
+                    lines!(axis, [steady_start_time, steady_end_time],
+                        [steady_bar_y, steady_bar_y]; color = MHD_COLORS[3],
+                        linewidth = 7, linecap = :round)
+                    vlines!(axis, [steady_start_time]; color = (MHD_COLORS[3], 0.55),
+                        linewidth = 1.4, linestyle = :dash)
+                end
+                ylims!(axis, data_min - 0.08span, data_max + 0.42span)
+            end
+        end
+
+        polarization_legend_layout =
+            GridLayout(fig_polarization_time[panel_rows + 1, 1:panel_columns])
+        Legend(polarization_legend_layout[1, 1],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true, framevisible = false,
+            labelsize = 14)
+        if show_polarization_regime_bars
+            Legend(polarization_legend_layout[1, 2], [
+                LineElement(color = MHD_COLORS[2], linewidth = 7),
+                LineElement(color = MHD_COLORS[3], linewidth = 7),
+            ], LaTeXString[L"\Gamma_B\ \mathrm{growth}", L"\mathrm{Steady\ state}"],
+                L"\mathrm{Time\ regime}";
+                orientation = :horizontal, tellheight = true, framevisible = false,
+                labelsize = 14)
+        end
+    end
+    fig_polarization_time
+    end
+    stable_pluto_figure(display_polarization_time, fig_polarization_time)
+end
+
 # ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001
 begin
     export_figure_options = [
+        "phase_diagram" => "Thermal-equilibrium curves by metallicity",
         "shine" => "SHINE H I maps",
         "shine_structure" => "SHINE observable structure functions",
+        "shine_power_spectra" => "SHINE spatial power spectra",
         "shine_rgb" => "SHINE velocity RGB composite",
         "shine_spectrum" => "SHINE H I spectrum",
+        "hi_faraday_hog" => "H I--Faraday HOG in velocity--Faraday space",
+        "polarization_time" => "Polarization fractions through time",
     ]
     export_figure_registry = Dict(
+        "phase_diagram" => fig_phase,
         "shine" => fig_shine,
         "shine_structure" => fig_shine_structure,
+        "shine_power_spectra" => fig_shine_power_spectra,
         "shine_rgb" => fig_shine_rgb,
         "shine_spectrum" => fig_shine_spectrum,
+        "hi_faraday_hog" => fig_hi_faraday_hog,
+        "polarization_time" => fig_polarization_time,
     )
     nothing
 end
@@ -4673,7 +5923,7 @@ md"""
 
 | Export setting | Control |
 |:--|:--|
-| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "shine")) |
+| Figure | $(@bind export_figure_key PlutoUI.Select(export_figure_options; default = "phase_diagram")) |
 | Format | $(@bind export_figure_format PlutoUI.Select(["PNG", "PDF"]; default = "PDF")) |
 """
 
@@ -6730,12 +7980,29 @@ version = "4.1.0+0"
 # ╟─94a0a0dc-baf6-4e62-a51e-dc6124d98fd4
 # ╟─c12d1f54-40b8-4865-9562-8dcb519f924a
 # ╟─496cbf2d-77a1-4a1a-b760-d4f8ea2ea9de
+# ╟─fa155a62-da75-4530-b5e9-215fd4f66412
+# ╟─9da572fe-21f2-43df-9320-b8742fd64773
+# ╠═41b4eb12-889d-43b3-87c2-fc7cccf8679f
+# ╟─5a0d1b1b-fa59-4e7c-8c51-a98592c0c62e
+# ╠═36aef377-3de7-435a-af83-3a90421e3159
+# ╟─89c33295-34e7-49ec-8d04-52b2aac29cff
+# ╟─71c8ea26-d2ad-4430-9265-0b28d45bba1c
+# ╟─cd7e037c-62f5-4682-92c2-92af7169d692
+# ╟─dcc8f8f3-daaf-4d4b-92a3-4919ed5e36de
+# ╟─62bb58f1-37c3-4adb-a7fc-939f71a56635
 # ╠═b1000006-6f8c-4d0c-9a10-000000000006
+# ╟─298bd579-bb28-48b7-8c55-ea74804b9837
 # ╟─3190e127-1d53-49f1-bfab-b9645910c2c6
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
 # ╟─3a731972-3404-478c-a572-00a05ab652b1
 # ╟─62440e86-b560-44ad-bb0a-43ae62e73fc3
 # ╠═47b786d6-c7b5-44f4-946a-b8c485ad6380
+# ╟─d6a2f4b1-59ac-4e77-a10a-4b74c0d89231
+# ╟─6f4e2d11-2a88-41f4-93dc-01b51d86fb4f
+# ╠═a2d5319b-06f4-4efc-b3d7-3a9719292305
+# ╟─67f95c39-1888-4d23-a2c2-2ee3a6cd7f0f
+# ╟─76b9cf43-a13e-44c8-97d6-4760cc3aa486
+# ╟─8f9e5bd2-8c7f-45b9-a92c-ad4b20d9ef21
 # ╟─62b61ef2-8e5d-4fe9-a435-e18fb5be9461
 # ╟─0e8d9cab-aef2-42cd-959d-973764340f08
 # ╟─c734b8e0-0bf7-42fc-bd26-0a451dd5f5f7
@@ -6746,6 +8013,8 @@ version = "4.1.0+0"
 # ╠═d5000001-6f8c-4d0c-9a10-000000000001
 # ╠═a0050005-6f8c-4d0c-9a10-000000000005
 # ╠═c3000001-6f8c-4d0c-9a10-000000000001
+# ╟─14e7606a-3a13-4c8e-b860-e40dc63a6fa2
+# ╟─b37d82bc-7819-47f9-b0ab-4de2f124f3cc
 # ╠═e1000001-6f8c-4d0c-9a10-000000000001
 # ╠═e1000002-6f8c-4d0c-9a10-000000000002
 # ╠═e1000003-6f8c-4d0c-9a10-000000000003

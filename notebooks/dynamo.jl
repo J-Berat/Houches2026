@@ -3093,7 +3093,7 @@ md"""
 
 This comparative figure shows one joint distribution of number density $n$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. The plotted coordinates are $\log_{10}n$ and $\log_{10}(P/k_{\mathrm B})$; empty probability bins are masked and all panels share one color scale.
 
-The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curve satisfies $n\Lambda(T)=\Gamma$ with $P/k_{\mathrm B}=nT$.
+The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curves satisfy $n\Lambda(T,Z)=\Gamma$ with $P/k_{\mathrm B}=nT$. In this illustrative metallicity extension, the low-temperature metal-line cooling term scales linearly with $Z/Z_\odot$, while the hydrogen cooling term and the heating rate remain fixed. These curves compare cooling multiplicities; they are not a substitute for a self-consistent chemical network.
 
 **Display the pressure-density phase diagram:** $(@bind display_phase_diagram PlutoUI.CheckBox(default = true))
 
@@ -3101,6 +3101,7 @@ The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H
 |:--|:--|
 | Bins per axis | $(@bind phase_bins PlutoUI.Slider(20:5:120; default = 60, show_value = true)) |
 | Thermal-equilibrium curve | $(@bind show_phase_equilibrium PlutoUI.CheckBox(default = true)) |
+| Equilibrium metallicities $Z/Z_\odot$ | $(@bind phase_equilibrium_metallicities PlutoUI.MultiSelect([0.1, 0.3, 1.0, 2.0]; default = [0.1, 0.3, 1.0, 2.0])) |
 """
 
 # ╔═╡ 9da572fe-21f2-43df-9320-b8742fd64773
@@ -3130,13 +3131,18 @@ begin
         (; xcenters, ycenters, log_probability)
     end
 
-    function koyama_inutsuka_equilibrium(; temperature_min = 10.0,
+    function koyama_inutsuka_equilibrium(metallicity; temperature_min = 10.0,
             temperature_max = 1.0e5, samples = 2400)
+        metallicity_value = Float64(metallicity)
+        metallicity_value > 0 || error("Metallicity must be positive.")
         temperature_K = 10.0 .^ range(log10(temperature_min), log10(temperature_max);
             length = samples)
-        cooling_over_heating_cm3 =
-            1.0e7 .* exp.(-1.184e5 ./ (temperature_K .+ 1000.0)) .+
+        hydrogen_cooling_over_heating_cm3 =
+            1.0e7 .* exp.(-1.184e5 ./ (temperature_K .+ 1000.0))
+        metal_cooling_over_heating_cm3 =
             1.4e-2 .* sqrt.(temperature_K) .* exp.(-92.0 ./ temperature_K)
+        cooling_over_heating_cm3 = hydrogen_cooling_over_heating_cm3 .+
+            metallicity_value .* metal_cooling_over_heating_cm3
         equilibrium_density_cm3 = 1.0 ./ cooling_over_heating_cm3
         equilibrium_pressure_over_k = equilibrium_density_cm3 .* temperature_K
         valid = isfinite.(equilibrium_density_cm3) .&
@@ -3162,13 +3168,21 @@ begin
                 vec(Float64.(local_cube.rho)) : ones(length(local_cube.rho))
             phase_histogram(local_logn, local_logpk, local_weights, phase_bins)
         end for label in comparison_run_labels)
-    phase_equilibrium = koyama_inutsuka_equilibrium()
+    phase_metallicities = sort(unique(Float64.(phase_equilibrium_metallicities)))
+    phase_equilibria = [(
+        metallicity = metallicity,
+        curve = koyama_inutsuka_equilibrium(metallicity),
+    ) for metallicity in phase_metallicities]
 end
 
 # ╔═╡ 41b4eb12-889d-43b3-87c2-fc7cccf8679f
 begin
     phase_panel_count = length(comparison_run_labels)
-    fig_phase = Figure(size = (560phase_panel_count + 80, 520))
+    fig_phase = Figure(size = (560phase_panel_count + 80, 620))
+    phase_equilibrium_colors = [
+        MHD_COLORS[mod1(index, length(MHD_COLORS))]
+        for index in eachindex(phase_equilibria)
+    ]
     combined_phase_probability = vcat([
         finite_values(phase_data_by_run[label].log_probability)
         for label in comparison_run_labels]...)
@@ -3182,13 +3196,17 @@ begin
             title = latex_run_label(label))
         phase_heatmap = heatmap!(phase_axis, phase_data.xcenters, phase_data.ycenters,
             phase_data.log_probability; colormap = :magma, colorrange = phase_range)
-        if show_phase_equilibrium
-            lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
-                color = :black, linewidth = 4.5)
-            lines!(phase_axis, phase_equilibrium.logn, phase_equilibrium.logpk;
-                color = :white, linewidth = 2.5,
-                label = L"n\Lambda(T)=\Gamma")
-            panel_index == 1 && axislegend(phase_axis; position = :rt, labelsize = 14)
+        if show_phase_equilibrium && !isempty(phase_equilibria)
+            for (curve_index, equilibrium) in enumerate(phase_equilibria)
+                curve_color = phase_equilibrium_colors[curve_index]
+                curve_width = isapprox(equilibrium.metallicity, 1.0) ? 3.2 : 2.4
+                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                    color = (:black, 0.72), linewidth = curve_width + 2.0)
+                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                    color = curve_color, linewidth = curve_width,
+                    label = latexstring("Z/Z_{\\odot}=",
+                        @sprintf("%.2g", equilibrium.metallicity)))
+            end
         end
         phase_dx = length(phase_data.xcenters) > 1 ?
             phase_data.xcenters[2] - phase_data.xcenters[1] : 1.0
@@ -3202,6 +3220,20 @@ begin
     latex_colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
         label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)
     colsize!(fig_phase.layout, phase_panel_count + 1, 22)
+    if show_phase_equilibrium && !isempty(phase_equilibria)
+        Legend(fig_phase[2, 1:phase_panel_count], [
+                LineElement(color = color, linewidth =
+                    isapprox(equilibrium.metallicity, 1.0) ? 3.2 : 2.4)
+                for (color, equilibrium) in zip(
+                    phase_equilibrium_colors, phase_equilibria)
+            ], [
+                latexstring("Z/Z_{\\odot}=",
+                    @sprintf("%.2g", equilibrium.metallicity))
+                for equilibrium in phase_equilibria
+            ], L"n\Lambda(T,Z)=\Gamma";
+            orientation = :horizontal, nbanks = 2,
+            tellheight = true, framevisible = false, labelsize = 14)
+    end
     display_phase_diagram ? fig_phase : nothing
 end
 
@@ -6310,13 +6342,16 @@ begin
         "normalized_magnetic_field" => "Normalized magnetic-field distribution",
         "magnetic_density" => "Magnetic field versus density",
         "hro" => "Histogram of relative orientations",
+        "hro_2d" => "Projected histogram of relative orientations",
         "hog" => "Histogram of oriented gradients",
         "energy_ratios" => "Energy ratios by density",
         "energy_time" => "Energy ratios versus time",
         "vorticity" => "Vorticity map",
         "enstrophy_density" => "Enstrophy by density",
         "power_spectra" => "Power spectra",
+        "magnetic_spectra_time" => "Magnetic power spectra through time",
         "structure_functions" => "Structure functions",
+        "summary" => "Dynamo summary",
     ]
     export_figure_registry = Dict(
         "heatmaps" => fig_maps,
@@ -6330,13 +6365,16 @@ begin
         "normalized_magnetic_field" => fig_logB,
         "magnetic_density" => fig_bn,
         "hro" => fig_hro,
+        "hro_2d" => fig_hro_2d,
         "hog" => fig_hog,
         "energy_ratios" => fig_energy,
         "energy_time" => fig_energy_time,
         "vorticity" => fig_vorticity,
         "enstrophy_density" => fig_enstrophy_density,
         "power_spectra" => fig_spectra,
+        "magnetic_spectra_time" => fig_magnetic_spectra_time,
         "structure_functions" => fig_structure,
+        "summary" => fig_summary,
     )
     nothing
 end

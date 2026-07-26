@@ -33,6 +33,8 @@ const BATCH_DISPLAY_FLAGS = Dict(
     "normalized_magnetic_relations" => :display_normalized_B_relations,
     "energy_time" => :display_energy_time,
     "summary" => :display_phase_B_time,
+    "polarization_intensity" => :display_polarization_intensity_histograms,
+    "polarization_time" => :display_polarization_time,
 )
 
 Base.@kwdef struct BatchConfig

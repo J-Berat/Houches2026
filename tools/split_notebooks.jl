@@ -28,13 +28,16 @@ const NOTEBOOK_SPECS = [
             ("normalized_magnetic_field", "Normalized magnetic-field distribution", :fig_logB),
             ("magnetic_density", "Magnetic field versus density", :fig_bn),
             ("hro", "Histogram of relative orientations", :fig_hro),
+            ("hro_2d", "Projected histogram of relative orientations", :fig_hro_2d),
             ("hog", "Histogram of oriented gradients", :fig_hog),
             ("energy_ratios", "Energy ratios by density", :fig_energy),
             ("energy_time", "Energy ratios versus time", :fig_energy_time),
             ("vorticity", "Vorticity map", :fig_vorticity),
             ("enstrophy_density", "Enstrophy by density", :fig_enstrophy_density),
             ("power_spectra", "Power spectra", :fig_spectra),
+            ("magnetic_spectra_time", "Magnetic power spectra through time", :fig_magnetic_spectra_time),
             ("structure_functions", "Structure functions", :fig_structure),
+            ("summary", "Dynamo summary", :fig_summary),
         ],
     ),
     (
@@ -49,6 +52,7 @@ const NOTEBOOK_SPECS = [
             ("dust_pixel_spectrum", "Dust Stokes spectrum", :fig_dust_pixel_spectrum),
             ("dust_statistics", "Dust comparative statistics", :fig_dust_statistics),
             ("dust_p_column", "Dust polarization versus column density", :fig_dust_p_column),
+            ("polarization_intensity", "Polarization fraction versus intensity", :fig_polarization_intensity),
         ],
     ),
     (
@@ -58,10 +62,8 @@ const NOTEBOOK_SPECS = [
         start_heading = "## 16. MOOSE Faraday post-processing",
         stop_heading = "## 17. Polarization fraction versus intensity",
         figures = [
-            ("moose", "MOOSE maps", :fig_moose),
-            ("moose_structure", "MOOSE observable structure functions", :fig_moose_structure),
             ("moose_tomography", "MOOSE Faraday tomography", :fig_moose_tomography),
-            ("moose_p_column", "Faraday polarization versus column density", :fig_moose_p_column),
+            ("hi_faraday_hog", "H I--Faraday HOG in velocity--Faraday space", :fig_hi_faraday_hog),
         ],
     ),
     (
@@ -71,10 +73,14 @@ const NOTEBOOK_SPECS = [
         start_heading = "## 18. SHINE H I post-processing",
         stop_heading = "## 19. Polarization fractions versus time",
         figures = [
+            ("phase_diagram", "Thermal-equilibrium curves by metallicity", :fig_phase),
             ("shine", "SHINE H I maps", :fig_shine),
             ("shine_structure", "SHINE observable structure functions", :fig_shine_structure),
+            ("shine_power_spectra", "SHINE spatial power spectra", :fig_shine_power_spectra),
             ("shine_rgb", "SHINE velocity RGB composite", :fig_shine_rgb),
             ("shine_spectrum", "SHINE H I spectrum", :fig_shine_spectrum),
+            ("hi_faraday_hog", "H I--Faraday HOG in velocity--Faraday space", :fig_hi_faraday_hog),
+            ("polarization_time", "Polarization fractions through time", :fig_polarization_time),
         ],
     ),
     (
@@ -197,6 +203,12 @@ function build_notebook(source, spec)
 
     seeds = cells[start_index:(stop_index - 1)]
     selected = dependency_closure(source.topology, seeds)
+
+    # A thematic notebook may export a shared figure defined outside its
+    # narrative section (for example the phase diagram reused by SHINE).
+    exported_symbols = Set(last.(spec.figures))
+    exported_cells = collect(Pluto.where_assigned(source.topology, exported_symbols))
+    union!(selected, dependency_closure(source.topology, exported_cells))
 
     if spec.filename == "dynamo.jl"
         beam_start = first_cell_containing(cells, "## 12. Shared observational beam")

@@ -38,19 +38,20 @@ const FIGURE_REGISTRY = Dict(
     "moose_power_spectra" => :fig_moose_power_spectra,
     "moose_tomography" => :fig_moose_tomography,
     "moose_p_column" => :fig_moose_p_column,
+    "polarization_intensity" => :fig_polarization_intensity,
     "shine" => :fig_shine,
     "shine_structure" => :fig_shine_structure,
     "shine_power_spectra" => :fig_shine_power_spectra,
     "shine_rgb" => :fig_shine_rgb,
     "shine_spectrum" => :fig_shine_spectrum,
     "hi_faraday_hog" => :fig_hi_faraday_hog,
+    "polarization_time" => :fig_polarization_time,
 )
 
 const NOTEBOOK_FIGURES = Dict(
     "dynamo" => [
         "heatmaps",
         "pdfs",
-        "phase_diagram",
         "time_evolution",
         "phase_magnetic_time",
         "magnetic_fit",
@@ -76,6 +77,7 @@ const NOTEBOOK_FIGURES = Dict(
         "dust_pixel_spectrum",
         "dust_statistics",
         "dust_p_column",
+        "polarization_intensity",
     ],
     "starlightpol" => [
         "starlight_maps",
@@ -90,20 +92,18 @@ const NOTEBOOK_FIGURES = Dict(
         "zeeman_p_column",
     ],
     "moose" => [
-        "moose",
-        "moose_structure",
-        "moose_power_spectra",
         "moose_tomography",
-        "moose_p_column",
         "hi_faraday_hog",
     ],
     "shine" => [
+        "phase_diagram",
         "shine",
         "shine_structure",
         "shine_power_spectra",
         "shine_rgb",
         "shine_spectrum",
         "hi_faraday_hog",
+        "polarization_time",
     ],
 )
 

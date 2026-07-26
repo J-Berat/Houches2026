@@ -51,16 +51,10 @@ const COMPARISONS = [
     ),
 ]
 
-# Every figure from the selected notebooks will be computed. Available groups:
-# "dynamo", "dust", "starlightpol", "zeeman", "moose", and "shine".
-const SELECTED_NOTEBOOKS = [
-    "dynamo",
-    "dust",
-    "starlightpol",
-    "zeeman",
-    "moose",
-    "shine",
-]
+# Compute every registered notebook group by default. Replace this expression
+# with a string vector to run only a subset. MOOSE deliberately contributes
+# only its phi-space tomography and H I--Faraday HOG products.
+const SELECTED_NOTEBOOKS = available_notebooks()
 
 const COMPARISON_REPOSITORY = get(
     ENV,

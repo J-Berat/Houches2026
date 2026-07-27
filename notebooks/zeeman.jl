@@ -2902,6 +2902,7 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 | Display fitted slopes | $(@bind show_spectrum_slopes PlutoUI.CheckBox(default = true)) |
 | Minimum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_min PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_min)) |
 | Maximum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_max PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_max)) |
+| Time-series vertical dynamic range [decades] | $(@bind spectrum_time_dynamic_decades PlutoUI.NumberField(2.0:0.5:16.0; default = 8.0)) |
 | Display the Kolmogorov $k^{-5/3}$ reference | $(@bind show_kolmogorov_spectrum PlutoUI.CheckBox(default = true)) |
 | Display the Kazantsev $k^{3/2}$ reference | $(@bind show_kazantsev_spectrum PlutoUI.CheckBox(default = true)) |
 """

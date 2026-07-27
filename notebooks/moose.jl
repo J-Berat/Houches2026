@@ -3155,6 +3155,7 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 | Display fitted slopes | $(@bind show_spectrum_slopes PlutoUI.CheckBox(default = true)) |
 | Minimum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_min PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_min)) |
 | Maximum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_max PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_max)) |
+| Time-series vertical dynamic range [decades] | $(@bind spectrum_time_dynamic_decades PlutoUI.NumberField(2.0:0.5:16.0; default = 8.0)) |
 | Display the Kolmogorov $k^{-5/3}$ reference | $(@bind show_kolmogorov_spectrum PlutoUI.CheckBox(default = true)) |
 | Display the Kazantsev $k^{3/2}$ reference | $(@bind show_kazantsev_spectrum PlutoUI.CheckBox(default = true)) |
 """
@@ -4135,6 +4136,13 @@ Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 **Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
 **Display the H I--Faraday HOG comparison:** $(@bind display_hi_faraday_hog PlutoUI.CheckBox(default = true))
 
+The H I composite uses phase-resolved emission rather than three disjoint
+bands of the total cube. CNM, LNM, and WNM are integrated over independent,
+overlapping velocity windows. The default nested windows reflect the
+increasing thermal width from CNM to WNM. The astronomical additive palette
+assigns blue--cyan to CNM, green to LNM, and red--orange to WNM; overlapping
+emission produces cyan, yellow, and white structures on a dark background.
+
 The H I--Faraday HOG is decomposed into total H I, CNM, LNM, and WNM
 velocity cubes. The phase-resolved cubes use the temperature cuts below:
 CNM has $T<T_{\rm CNM}$, LNM has
@@ -4173,11 +4181,16 @@ thermal panels so that their differences remain physically interpretable.
 | FFT CNM tracer map | $(@bind show_shine_fftcnm PlutoUI.CheckBox(default = false)) |
 | Optically thick $T_B(v)$ | $(@bind show_shine_Tb_spectrum PlutoUI.CheckBox(default = true)) |
 | Optical-depth spectrum $\tau(v)$ | $(@bind show_shine_tau_spectrum PlutoUI.CheckBox(default = true)) |
-| Blue/green velocity boundary [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_blue_green PlutoUI.NumberField(-200.0:0.5:200.0; default = 4.0)) |
-| Green/red velocity boundary [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_green_red PlutoUI.NumberField(-200.0:0.5:200.0; default = 10.0)) |
+| CNM velocity minimum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_cnm_vmin PlutoUI.NumberField(-200.0:0.5:200.0; default = -5.0)) |
+| CNM velocity maximum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_cnm_vmax PlutoUI.NumberField(-200.0:0.5:200.0; default = 5.0)) |
+| LNM velocity minimum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_lnm_vmin PlutoUI.NumberField(-200.0:0.5:200.0; default = -10.0)) |
+| LNM velocity maximum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_lnm_vmax PlutoUI.NumberField(-200.0:0.5:200.0; default = 10.0)) |
+| WNM velocity minimum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_wnm_vmin PlutoUI.NumberField(-200.0:0.5:200.0; default = -20.0)) |
+| WNM velocity maximum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_wnm_vmax PlutoUI.NumberField(-200.0:0.5:200.0; default = 20.0)) |
 | RGB stretch percentile | $(@bind shine_rgb_percentile PlutoUI.NumberField(90.0:0.5:100.0; default = 99.5)) |
+| RGB black-point percentile | $(@bind shine_rgb_black_percentile PlutoUI.NumberField(0.0:1.0:95.0; default = 70.0)) |
 | RGB asinh softening | $(@bind shine_rgb_softening PlutoUI.NumberField(0.01:0.01:1.0; default = 0.10)) |
-| Normalize each velocity band independently | $(@bind shine_rgb_independent PlutoUI.CheckBox(default = true)) |
+| Normalize each phase independently | $(@bind shine_rgb_independent PlutoUI.CheckBox(default = true)) |
 """
 
 # ╔═╡ bcc05889-02bb-47cf-b672-139e8efe4137

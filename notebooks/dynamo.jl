@@ -3474,9 +3474,6 @@ The fitted physical model is $B(t)=A\exp[\Gamma_B(t-t_0)]$, where $t_0$ is the f
 
 The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measured field used only as a plotting normalization. The reported $R^2$ uses the usual mean-centred total sum of squares appropriate to this intercept fit. The central fit and its $\Gamma_B\pm\sigma_{\Gamma_B}$ slope envelope are drawn only inside the fitted interval, so no straight line is extrapolated into the saturated regime. Because $E_{\mathrm B}\propto B^2$, magnetic energy grows at rate $2\Gamma_B$.
 
-The optional Kazantsev reference uses the high-magnetic-Prandtl-number prediction
-$\Gamma_{\mathrm K}=[(163-304\vartheta)/60](v_{\mathrm rms}/L_{\mathrm f})\,Re_{\mathrm eff}^{(1-\vartheta)/(1+\vartheta)}$. Here $L_{\mathrm f}=50\,\mathrm{pc}$ (forcing mode 2), $v_{\mathrm rms}$ is the median value inside the fitted interval, and—because these implicit-LES cubes contain no explicit viscosity—$Re_{\mathrm eff}$ is a resolution estimate obtained by identifying the dissipation scale with $2\Delta x$. The predicted line is anchored to the fitted curve at the centre of the retained interval: its normalization is therefore not fitted, and only its slope is being compared.
-
 **Display the magnetic growth-rate fit:** $(@bind display_growth_fit PlutoUI.CheckBox(default = false))
 
 | Setting | Control |
@@ -3485,10 +3482,8 @@ $\Gamma_{\mathrm K}=[(163-304\vartheta)/60](v_{\mathrm rms}/L_{\mathrm f})\,Re_{
 | Fit-window selection | $(@bind growth_fit_mode PlutoUI.Select(["Automatic", "Manual"]; default = "Automatic")) |
 | Manual fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(run_files[selected_run]); default = min(2, length(run_files[selected_run])):min(8, length(run_files[selected_run])), show_value = true)) |
 | Data and fitted exponential panel | $(@bind show_growth_fit_panel PlutoUI.CheckBox(default = true)) |
-| Kazantsev and fit-uncertainty comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
+| Fit-uncertainty comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
 | Display fitted curve | $(@bind show_growth_fit PlutoUI.CheckBox(default = true)) |
-| Display Kazantsev prediction | $(@bind show_kazantsev_prediction PlutoUI.CheckBox(default = true)) |
-| Kazantsev turbulence model | $(@bind kazantsev_turbulence_model PlutoUI.Select(["Kolmogorov (θ = 1/3)", "Burgers (θ = 1/2)"]; default = "Kolmogorov (θ = 1/3)")) |
 | Logarithmic $B(t)$ axis in section 6 | $(@bind log_B_time PlutoUI.CheckBox(default = true)) |
 """
 
@@ -3496,7 +3491,6 @@ $\Gamma_{\mathrm K}=[(163-304\vartheta)/60](v_{\mathrm rms}/L_{\mathrm f})\,Re_{
 begin
     growth_series = all_series[selected_run]
     growth_times = Float64.(getfield.(growth_series, :t))
-    growth_vrms = Float64.(getfield.(growth_series, :vrms))
     growth_B = growth_fit_field == "Mean field ⟨B⟩" ?
         Float64.(getfield.(growth_series, :Bmean)) :
         Float64.(getfield.(growth_series, :Brms))
@@ -3590,37 +3584,6 @@ begin
         for Γ in theory_gammas
     ]
 
-    # High-Pm Kazantsev prediction (Schober et al. 2012). These simulations are
-    # implicit LES, so Re_eff is a resolution estimate rather than a measured
-    # physical Reynolds number. With l_d = 2dx and v(l) proportional to l^theta,
-    # Re_eff = (L_f/l_d)^(1+theta).
-    kazantsev_theta = kazantsev_turbulence_model == "Burgers (θ = 1/2)" ? 0.5 : 1 / 3
-    kazantsev_model_name = kazantsev_theta == 0.5 ? "Burgers" : "Kolmogorov"
-    kazantsev_forcing_scale_pc = PHYSICAL_BOX_LENGTH_PC / 2
-    kazantsev_dissipation_cells = 2.0
-    kazantsev_dx_pc = PHYSICAL_BOX_LENGTH_PC / minimum(size(cube.rho))
-    kazantsev_dissipation_scale_pc = kazantsev_dissipation_cells * kazantsev_dx_pc
-    kazantsev_effective_reynolds =
-        (kazantsev_forcing_scale_pc / kazantsev_dissipation_scale_pc) ^
-        (1 + kazantsev_theta)
-    kazantsev_velocity_indices = filter(growth_indices) do index
-        1 <= index <= length(growth_vrms) && isfinite(growth_vrms[index]) &&
-            growth_vrms[index] > 0
-    end
-    kazantsev_vrms_kms = isempty(kazantsev_velocity_indices) ? NaN :
-        median(growth_vrms[kazantsev_velocity_indices])
-    kazantsev_vrms_pc_myr = kazantsev_vrms_kms * KM_CM * MYR_S / PC_CM
-    kazantsev_prefactor = (163 - 304kazantsev_theta) / 60
-    kazantsev_gamma = kazantsev_prefactor *
-        (kazantsev_vrms_pc_myr / kazantsev_forcing_scale_pc) *
-        kazantsev_effective_reynolds ^
-        ((1 - kazantsev_theta) / (1 + kazantsev_theta))
-    kazantsev_log_ratio_curve = growth_fit_center_log_B - log(growth_B0) .+
-        kazantsev_gamma .* (growth_elapsed_time .- growth_fit_center_time)
-    kazantsev_is_valid = !isempty(growth_indices) && isfinite(kazantsev_gamma) &&
-        kazantsev_gamma > 0 && all(isfinite, (
-            kazantsev_effective_reynolds, kazantsev_vrms_kms,
-            growth_fit_center_log_B, growth_B0))
     growth_has_interval = !isempty(growth_indices)
     growth_first_index = growth_has_interval ? first(growth_indices) : missing
     growth_last_index = growth_has_interval ? last(growth_indices) : missing
@@ -3629,10 +3592,6 @@ begin
     growth_r2_text = string(round(growth_fit.r2; sigdigits = 4))
     growth_amplitude_text = string(round(exp(growth_fit.log_amplitude); sigdigits = 5))
     growth_energy_gamma_text = string(round(2 * growth_fit.gamma; sigdigits = 5))
-    kazantsev_gamma_text = string(round(kazantsev_gamma; sigdigits = 5))
-    kazantsev_reynolds_text = string(round(kazantsev_effective_reynolds; sigdigits = 4))
-    kazantsev_velocity_text = string(round(kazantsev_vrms_kms; sigdigits = 4))
-    kazantsev_ratio_text = string(round(growth_fit.gamma / kazantsev_gamma; sigdigits = 4))
 end
 
 # ╔═╡ 8120f7e9-74ed-4a48-b2f4-dbc75ebf0132
@@ -3649,11 +3608,6 @@ Markdown.parse("""
 | Standard error ``\\sigma_{\\Gamma_B}`` | **$(growth_error_text)** ``\\mathrm{Myr}^{-1}`` |
 | Coefficient of determination ``R^2`` | **$(growth_r2_text)** |
 | Magnetic-energy growth rate ``2\\Gamma_B`` | **$(growth_energy_gamma_text)** ``\\mathrm{Myr}^{-1}`` |
-| Kazantsev model | **$(kazantsev_model_name)**, high ``Pm`` |
-| Median ``v_{\\mathrm rms}`` in fitted interval | **$(kazantsev_velocity_text)** ``\\mathrm{km\\,s}^{-1}`` |
-| Resolution estimate ``Re_{\\mathrm eff}`` | **$(kazantsev_reynolds_text)** (``L_{\\mathrm f}=50\\,\\mathrm{pc}``, ``\\ell_{\\mathrm d}=2\\Delta x``) |
-| Kazantsev prediction ``\\Gamma_{\\mathrm K}`` | **$(kazantsev_gamma_text)** ``\\mathrm{Myr}^{-1}`` |
-| Measured-to-Kazantsev ratio ``\\Gamma_B/\\Gamma_{\\mathrm K}`` | **$(kazantsev_ratio_text)** |
 """)
 
 # ╔═╡ 71c8ea26-d2ad-4430-9265-0b28d45bba1c
@@ -3870,20 +3824,6 @@ begin
                     @sprintf("%.3f", growth_fit.r2),
                 ))
             end
-            if show_kazantsev_prediction && kazantsev_is_valid
-                lines!(ag1, growth_times[growth_indices],
-                    kazantsev_log_ratio_curve[growth_indices];
-                    color = MHD_COLORS[2], linewidth = 2.8,
-                    linestyle = :dashdot)
-                push!(fit_legend_elements,
-                    LineElement(color = MHD_COLORS[2], linewidth = 2.8,
-                        linestyle = :dashdot))
-                push!(fit_legend_labels, latexstring(
-                    "\\mathrm{Kazantsev\\ (", kazantsev_model_name,
-                    ")} :\\;\\Gamma_{\\mathrm K}=",
-                    @sprintf("%.4g", kazantsev_gamma),
-                    "\\;\\mathrm{Myr}^{-1}"))
-            end
             growth_has_interval && vspan!(ag1,
                 growth_times[growth_first_index], growth_times[growth_last_index];
                 color = (:gray50, 0.10))
@@ -3916,20 +3856,6 @@ begin
                     offset < 0 ? "-" : "+",
                     "\\sigma_{\\Gamma_B}=",
                     @sprintf("%.3g", Γ),
-                    "\\;\\mathrm{Myr}^{-1}"))
-            end
-            if show_kazantsev_prediction && kazantsev_is_valid
-                lines!(ag2, panel_fit_times,
-                    kazantsev_log_ratio_curve[growth_indices];
-                    color = MHD_COLORS[2], linewidth = 2.8,
-                    linestyle = :dashdot)
-                push!(theory_legend_elements,
-                    LineElement(color = MHD_COLORS[2], linewidth = 2.8,
-                        linestyle = :dashdot))
-                push!(theory_legend_labels, latexstring(
-                    "\\mathrm{Kazantsev\\ (", kazantsev_model_name,
-                    ")} :\\;\\Gamma_{\\mathrm K}=",
-                    @sprintf("%.4g", kazantsev_gamma),
                     "\\;\\mathrm{Myr}^{-1}"))
             end
             if show_growth_fit && isfinite(growth_fit.gamma)
@@ -5626,6 +5552,7 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 | Display fitted slopes | $(@bind show_spectrum_slopes PlutoUI.CheckBox(default = true)) |
 | Minimum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_min PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_min)) |
 | Maximum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_max PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_max)) |
+| Time-series vertical dynamic range [decades] | $(@bind spectrum_time_dynamic_decades PlutoUI.NumberField(2.0:0.5:16.0; default = 8.0)) |
 | Display the Kolmogorov $k^{-5/3}$ reference | $(@bind show_kolmogorov_spectrum PlutoUI.CheckBox(default = true)) |
 | Display the Kazantsev $k^{3/2}$ reference | $(@bind show_kazantsev_spectrum PlutoUI.CheckBox(default = true)) |
 """
@@ -5939,7 +5866,7 @@ begin
         panel_rows = cld(length(comparison_run_labels), panel_columns)
         figure = Figure(
             size = (560panel_columns + 120, 470panel_rows + 100),
-            figure_padding = (100, 70, 25, 25),
+            figure_padding = (100, 70, 35, 60),
         )
         Label(
             figure[0, 1:panel_columns],
@@ -5957,14 +5884,39 @@ begin
             append!(all_modes, physical_k .* Float64(product.box_length_pc) ./ (2pi))
             append!(all_power, power)
         end
-        mode_limits = enclosing_decade_limits(filter(
+        positive_modes = filter(
             value -> isfinite(value) && value > 0,
             all_modes,
-        ))
-        power_limits = enclosing_decade_limits(filter(
+        )
+        positive_power = filter(
             value -> isfinite(value) && value > 0,
             all_power,
-        ))
+        )
+        mode_limits = if isempty(positive_modes)
+            nothing
+        else
+            log_modes = log10.(positive_modes)
+            log_span = max(maximum(log_modes) - minimum(log_modes), 0.1)
+            padding = 0.025log_span
+            (
+                10.0^(minimum(log_modes) - padding),
+                10.0^(maximum(log_modes) + padding),
+            )
+        end
+        power_limits = if isempty(positive_power)
+            nothing
+        else
+            log_power = log10.(positive_power)
+            upper_log = quantile(log_power, 0.995)
+            lower_log = max(
+                quantile(log_power, 0.01) - 0.10,
+                upper_log - max(Float64(spectrum_time_dynamic_decades), 1.0),
+            )
+            (
+                10.0^lower_log,
+                10.0^(upper_log + 0.15),
+            )
+        end
 
         for (panel_index, label) in enumerate(comparison_run_labels)
             row = cld(panel_index, panel_columns)

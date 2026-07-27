@@ -3073,9 +3073,6 @@ The fitted physical model is $B(t)=A\exp[\Gamma_B(t-t_0)]$, where $t_0$ is the f
 
 The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measured field used only as a plotting normalization. The reported $R^2$ uses the usual mean-centred total sum of squares appropriate to this intercept fit. The central fit and its $\Gamma_B\pm\sigma_{\Gamma_B}$ slope envelope are drawn only inside the fitted interval, so no straight line is extrapolated into the saturated regime. Because $E_{\mathrm B}\propto B^2$, magnetic energy grows at rate $2\Gamma_B$.
 
-The optional Kazantsev reference uses the high-magnetic-Prandtl-number prediction
-$\Gamma_{\mathrm K}=[(163-304\vartheta)/60](v_{\mathrm rms}/L_{\mathrm f})\,Re_{\mathrm eff}^{(1-\vartheta)/(1+\vartheta)}$. Here $L_{\mathrm f}=50\,\mathrm{pc}$ (forcing mode 2), $v_{\mathrm rms}$ is the median value inside the fitted interval, and—because these implicit-LES cubes contain no explicit viscosity—$Re_{\mathrm eff}$ is a resolution estimate obtained by identifying the dissipation scale with $2\Delta x$. The predicted line is anchored to the fitted curve at the centre of the retained interval: its normalization is therefore not fitted, and only its slope is being compared.
-
 **Display the magnetic growth-rate fit:** $(@bind display_growth_fit PlutoUI.CheckBox(default = false))
 
 | Setting | Control |
@@ -3084,10 +3081,8 @@ $\Gamma_{\mathrm K}=[(163-304\vartheta)/60](v_{\mathrm rms}/L_{\mathrm f})\,Re_{
 | Fit-window selection | $(@bind growth_fit_mode PlutoUI.Select(["Automatic", "Manual"]; default = "Automatic")) |
 | Manual fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(run_files[selected_run]); default = min(2, length(run_files[selected_run])):min(8, length(run_files[selected_run])), show_value = true)) |
 | Data and fitted exponential panel | $(@bind show_growth_fit_panel PlutoUI.CheckBox(default = true)) |
-| Kazantsev and fit-uncertainty comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
+| Fit-uncertainty comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
 | Display fitted curve | $(@bind show_growth_fit PlutoUI.CheckBox(default = true)) |
-| Display Kazantsev prediction | $(@bind show_kazantsev_prediction PlutoUI.CheckBox(default = true)) |
-| Kazantsev turbulence model | $(@bind kazantsev_turbulence_model PlutoUI.Select(["Kolmogorov (θ = 1/3)", "Burgers (θ = 1/2)"]; default = "Kolmogorov (θ = 1/3)")) |
 | Logarithmic $B(t)$ axis in section 6 | $(@bind log_B_time PlutoUI.CheckBox(default = true)) |
 """
 
@@ -3095,7 +3090,6 @@ $\Gamma_{\mathrm K}=[(163-304\vartheta)/60](v_{\mathrm rms}/L_{\mathrm f})\,Re_{
 begin
     growth_series = all_series[selected_run]
     growth_times = Float64.(getfield.(growth_series, :t))
-    growth_vrms = Float64.(getfield.(growth_series, :vrms))
     growth_B = growth_fit_field == "Mean field ⟨B⟩" ?
         Float64.(getfield.(growth_series, :Bmean)) :
         Float64.(getfield.(growth_series, :Brms))
@@ -3189,37 +3183,6 @@ begin
         for Γ in theory_gammas
     ]
 
-    # High-Pm Kazantsev prediction (Schober et al. 2012). These simulations are
-    # implicit LES, so Re_eff is a resolution estimate rather than a measured
-    # physical Reynolds number. With l_d = 2dx and v(l) proportional to l^theta,
-    # Re_eff = (L_f/l_d)^(1+theta).
-    kazantsev_theta = kazantsev_turbulence_model == "Burgers (θ = 1/2)" ? 0.5 : 1 / 3
-    kazantsev_model_name = kazantsev_theta == 0.5 ? "Burgers" : "Kolmogorov"
-    kazantsev_forcing_scale_pc = PHYSICAL_BOX_LENGTH_PC / 2
-    kazantsev_dissipation_cells = 2.0
-    kazantsev_dx_pc = PHYSICAL_BOX_LENGTH_PC / minimum(size(cube.rho))
-    kazantsev_dissipation_scale_pc = kazantsev_dissipation_cells * kazantsev_dx_pc
-    kazantsev_effective_reynolds =
-        (kazantsev_forcing_scale_pc / kazantsev_dissipation_scale_pc) ^
-        (1 + kazantsev_theta)
-    kazantsev_velocity_indices = filter(growth_indices) do index
-        1 <= index <= length(growth_vrms) && isfinite(growth_vrms[index]) &&
-            growth_vrms[index] > 0
-    end
-    kazantsev_vrms_kms = isempty(kazantsev_velocity_indices) ? NaN :
-        median(growth_vrms[kazantsev_velocity_indices])
-    kazantsev_vrms_pc_myr = kazantsev_vrms_kms * KM_CM * MYR_S / PC_CM
-    kazantsev_prefactor = (163 - 304kazantsev_theta) / 60
-    kazantsev_gamma = kazantsev_prefactor *
-        (kazantsev_vrms_pc_myr / kazantsev_forcing_scale_pc) *
-        kazantsev_effective_reynolds ^
-        ((1 - kazantsev_theta) / (1 + kazantsev_theta))
-    kazantsev_log_ratio_curve = growth_fit_center_log_B - log(growth_B0) .+
-        kazantsev_gamma .* (growth_elapsed_time .- growth_fit_center_time)
-    kazantsev_is_valid = !isempty(growth_indices) && isfinite(kazantsev_gamma) &&
-        kazantsev_gamma > 0 && all(isfinite, (
-            kazantsev_effective_reynolds, kazantsev_vrms_kms,
-            growth_fit_center_log_B, growth_B0))
     growth_has_interval = !isempty(growth_indices)
     growth_first_index = growth_has_interval ? first(growth_indices) : missing
     growth_last_index = growth_has_interval ? last(growth_indices) : missing
@@ -3228,10 +3191,6 @@ begin
     growth_r2_text = string(round(growth_fit.r2; sigdigits = 4))
     growth_amplitude_text = string(round(exp(growth_fit.log_amplitude); sigdigits = 5))
     growth_energy_gamma_text = string(round(2 * growth_fit.gamma; sigdigits = 5))
-    kazantsev_gamma_text = string(round(kazantsev_gamma; sigdigits = 5))
-    kazantsev_reynolds_text = string(round(kazantsev_effective_reynolds; sigdigits = 4))
-    kazantsev_velocity_text = string(round(kazantsev_vrms_kms; sigdigits = 4))
-    kazantsev_ratio_text = string(round(growth_fit.gamma / kazantsev_gamma; sigdigits = 4))
 end
 
 # ╔═╡ 71c8ea26-d2ad-4430-9265-0b28d45bba1c
@@ -3643,6 +3602,7 @@ This reference is therefore only meaningful while the dynamo is still kinematic.
 | Display fitted slopes | $(@bind show_spectrum_slopes PlutoUI.CheckBox(default = true)) |
 | Minimum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_min PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_min)) |
 | Maximum fitted wavenumber [$\mathrm{pc}^{-1}$] | $(@bind spectrum_fit_k_max PlutoUI.NumberField(spectrum_k_choices; default = spectrum_default_k_max)) |
+| Time-series vertical dynamic range [decades] | $(@bind spectrum_time_dynamic_decades PlutoUI.NumberField(2.0:0.5:16.0; default = 8.0)) |
 | Display the Kolmogorov $k^{-5/3}$ reference | $(@bind show_kolmogorov_spectrum PlutoUI.CheckBox(default = true)) |
 | Display the Kazantsev $k^{3/2}$ reference | $(@bind show_kazantsev_spectrum PlutoUI.CheckBox(default = true)) |
 """
@@ -4902,6 +4862,13 @@ Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 **Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
 **Display the H I--Faraday HOG comparison:** $(@bind display_hi_faraday_hog PlutoUI.CheckBox(default = true))
 
+The H I composite uses phase-resolved emission rather than three disjoint
+bands of the total cube. CNM, LNM, and WNM are integrated over independent,
+overlapping velocity windows. The default nested windows reflect the
+increasing thermal width from CNM to WNM. The astronomical additive palette
+assigns blue--cyan to CNM, green to LNM, and red--orange to WNM; overlapping
+emission produces cyan, yellow, and white structures on a dark background.
+
 The H I--Faraday HOG is decomposed into total H I, CNM, LNM, and WNM
 velocity cubes. The phase-resolved cubes use the temperature cuts below:
 CNM has $T<T_{\rm CNM}$, LNM has
@@ -4940,11 +4907,16 @@ thermal panels so that their differences remain physically interpretable.
 | FFT CNM tracer map | $(@bind show_shine_fftcnm PlutoUI.CheckBox(default = false)) |
 | Optically thick $T_B(v)$ | $(@bind show_shine_Tb_spectrum PlutoUI.CheckBox(default = true)) |
 | Optical-depth spectrum $\tau(v)$ | $(@bind show_shine_tau_spectrum PlutoUI.CheckBox(default = true)) |
-| Blue/green velocity boundary [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_blue_green PlutoUI.NumberField(-200.0:0.5:200.0; default = 4.0)) |
-| Green/red velocity boundary [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_green_red PlutoUI.NumberField(-200.0:0.5:200.0; default = 10.0)) |
+| CNM velocity minimum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_cnm_vmin PlutoUI.NumberField(-200.0:0.5:200.0; default = -5.0)) |
+| CNM velocity maximum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_cnm_vmax PlutoUI.NumberField(-200.0:0.5:200.0; default = 5.0)) |
+| LNM velocity minimum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_lnm_vmin PlutoUI.NumberField(-200.0:0.5:200.0; default = -10.0)) |
+| LNM velocity maximum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_lnm_vmax PlutoUI.NumberField(-200.0:0.5:200.0; default = 10.0)) |
+| WNM velocity minimum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_wnm_vmin PlutoUI.NumberField(-200.0:0.5:200.0; default = -20.0)) |
+| WNM velocity maximum [$\mathrm{km\,s^{-1}}$] | $(@bind shine_rgb_wnm_vmax PlutoUI.NumberField(-200.0:0.5:200.0; default = 20.0)) |
 | RGB stretch percentile | $(@bind shine_rgb_percentile PlutoUI.NumberField(90.0:0.5:100.0; default = 99.5)) |
+| RGB black-point percentile | $(@bind shine_rgb_black_percentile PlutoUI.NumberField(0.0:1.0:95.0; default = 70.0)) |
 | RGB asinh softening | $(@bind shine_rgb_softening PlutoUI.NumberField(0.01:0.01:1.0; default = 0.10)) |
-| Normalize each velocity band independently | $(@bind shine_rgb_independent PlutoUI.CheckBox(default = true)) |
+| Normalize each phase independently | $(@bind shine_rgb_independent PlutoUI.CheckBox(default = true)) |
 """
 
 # ╔═╡ bcc05889-02bb-47cf-b672-139e8efe4137
@@ -5087,83 +5059,144 @@ end
 
 # ╔═╡ 5ad762e1-105f-4cf7-9cf1-e0bb8c6f1bf5
 begin
-    "Integrate positive H I brightness over a closed velocity interval."
-    function shine_velocity_band(Tb, velocities, lower, upper, dv;
-            include_lower = true, include_upper = true)
-        indices = findall(velocities) do velocity
-            lower_ok = include_lower ? lower <= velocity : lower < velocity
-            upper_ok = include_upper ? velocity <= upper : velocity < upper
-            lower_ok && upper_ok
-        end
-        isempty(indices) && return zeros(Float64, size(Tb, 1), size(Tb, 2))
-        dropdims(sum(max.(@view(Tb[:, :, indices]), 0.0); dims = 3); dims = 3) .* dv
+    "Return an ordered velocity window clipped to the synthetic cube."
+    function shine_rgb_velocity_window(first_velocity, second_velocity)
+        lower = clamp(min(Float64(first_velocity), Float64(second_velocity)),
+            shine_vlo, shine_vhi)
+        upper = clamp(max(Float64(first_velocity), Float64(second_velocity)),
+            shine_vlo, shine_vhi)
+        lower, upper
     end
 
-    "Apply a robust asinh display stretch to one velocity-integrated map."
-    function shine_rgb_stretch(data, scale, softening)
-        safe_scale = max(scale, eps(Float64))
+    """
+    Integrate the emergent H I brightness of one thermal phase over its own
+    velocity window. Beam convolution is applied after the linear velocity
+    integral, avoiding a full phase PPV cube in memory.
+    """
+    function shine_phase_velocity_map(phase_density, lower, upper)
+        velocity_indices = findall(v ->
+            lower <= v <= upper, shine_velocity_axis)
+        phase_map = zeros(Float64, size(phase_density, 1), size(phase_density, 2))
+        isempty(velocity_indices) && return phase_map
+        Threads.@threads for i in axes(phase_density, 1)
+            for j in axes(phase_density, 2)
+                brightness, _ = shine_hi_spectrum(
+                    @view(phase_density[i, j, :]),
+                    @view(shine_velocity[i, j, :]),
+                    @view(shine_temperature[i, j, :]),
+                    shine_velocity_axis,
+                    dx_los_cm,
+                    shine_mu_value,
+                    shine_fixed_width_value,
+                )
+                phase_map[i, j] =
+                    sum(max.(@view(brightness[velocity_indices]), 0.0)) * shine_dv
+            end
+        end
+        apply_observational_beam_2d(phase_map, cube, sky_dims)
+    end
+
+    "Apply a robust asinh display stretch to one phase-integrated map."
+    function shine_rgb_stretch(data, scale, softening, black_quantile)
+        positive_values = filter(value ->
+            isfinite(value) && value > 0, vec(data))
+        black_level = isempty(positive_values) ? 0.0 :
+            quantile(positive_values, clamp(black_quantile, 0.0, 0.95))
+        safe_scale = max(scale, black_level + eps(max(abs(black_level), 1.0)))
         safe_softening = max(softening, eps(Float64))
-        stretched = asinh.(max.(data, 0.0) ./ (safe_softening * safe_scale)) ./
+        normalized = max.(data .- black_level, 0.0) ./ (safe_scale - black_level)
+        stretched = asinh.(normalized ./ safe_softening) ./
             asinh(1 / safe_softening)
         clamp.(stretched, 0.0, 1.0)
     end
 
-    shine_rgb_boundary_1 = clamp(min(Float64(shine_rgb_blue_green),
-        Float64(shine_rgb_green_red)), shine_vlo, shine_vhi)
-    shine_rgb_boundary_2 = clamp(max(Float64(shine_rgb_blue_green),
-        Float64(shine_rgb_green_red)), shine_vlo, shine_vhi)
+    shine_rgb_cnm_window = shine_rgb_velocity_window(
+        shine_rgb_cnm_vmin, shine_rgb_cnm_vmax)
+    shine_rgb_lnm_window = shine_rgb_velocity_window(
+        shine_rgb_lnm_vmin, shine_rgb_lnm_vmax)
+    shine_rgb_wnm_window = shine_rgb_velocity_window(
+        shine_rgb_wnm_vmin, shine_rgb_wnm_vmax)
 
-    shine_rgb_blue_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
-        shine_vlo, shine_rgb_boundary_1, shine_dv; include_upper = false)
-    shine_rgb_green_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
-        shine_rgb_boundary_1, shine_rgb_boundary_2, shine_dv)
-    shine_rgb_red_map = shine_velocity_band(shine_Tb, shine_velocity_axis,
-        shine_rgb_boundary_2, shine_vhi, shine_dv; include_lower = false)
+    shine_rgb_cnm_map = shine_phase_velocity_map(
+        shine_nCNM, shine_rgb_cnm_window...)
+    shine_rgb_lnm_map = shine_phase_velocity_map(
+        shine_nLNM, shine_rgb_lnm_window...)
+    shine_rgb_wnm_map = shine_phase_velocity_map(
+        shine_nWNM, shine_rgb_wnm_window...)
 
     shine_rgb_quantile = clamp(Float64(shine_rgb_percentile) / 100, 0.0, 1.0)
     shine_rgb_scales = [quantile(filter(isfinite, vec(channel)), shine_rgb_quantile)
-        for channel in (shine_rgb_red_map, shine_rgb_green_map, shine_rgb_blue_map)]
+        for channel in (shine_rgb_cnm_map, shine_rgb_lnm_map, shine_rgb_wnm_map)]
     if !shine_rgb_independent
         shared_scale = maximum(shine_rgb_scales)
         shine_rgb_scales .= shared_scale
     end
     shine_rgb_softening_value = max(Float64(shine_rgb_softening), 0.01)
-    shine_rgb_red = shine_rgb_stretch(shine_rgb_red_map, shine_rgb_scales[1],
-        shine_rgb_softening_value)
-    shine_rgb_green = shine_rgb_stretch(shine_rgb_green_map, shine_rgb_scales[2],
-        shine_rgb_softening_value)
-    shine_rgb_blue = shine_rgb_stretch(shine_rgb_blue_map, shine_rgb_scales[3],
-        shine_rgb_softening_value)
+    shine_rgb_black_quantile =
+        clamp(Float64(shine_rgb_black_percentile) / 100, 0.0, 0.95)
+    shine_rgb_cnm = shine_rgb_stretch(shine_rgb_cnm_map, shine_rgb_scales[1],
+        shine_rgb_softening_value, shine_rgb_black_quantile)
+    shine_rgb_lnm = shine_rgb_stretch(shine_rgb_lnm_map, shine_rgb_scales[2],
+        shine_rgb_softening_value, shine_rgb_black_quantile)
+    shine_rgb_wnm = shine_rgb_stretch(shine_rgb_wnm_map, shine_rgb_scales[3],
+        shine_rgb_softening_value, shine_rgb_black_quantile)
+
+    # Astronomical blue--green--red additive composite, matching the reference
+    # rendering: phase overlap naturally produces cyan, yellow, and white.
+    shine_rgb_cnm_color = (0.000, 0.000, 1.000)
+    shine_rgb_lnm_color = (0.000, 1.000, 0.000)
+    shine_rgb_wnm_color = (1.000, 0.000, 0.000)
+    shine_rgb_red = clamp.(
+        shine_rgb_cnm_color[1] .* shine_rgb_cnm .+
+        shine_rgb_lnm_color[1] .* shine_rgb_lnm .+
+        shine_rgb_wnm_color[1] .* shine_rgb_wnm, 0.0, 1.0)
+    shine_rgb_green = clamp.(
+        shine_rgb_cnm_color[2] .* shine_rgb_cnm .+
+        shine_rgb_lnm_color[2] .* shine_rgb_lnm .+
+        shine_rgb_wnm_color[2] .* shine_rgb_wnm, 0.0, 1.0)
+    shine_rgb_blue = clamp.(
+        shine_rgb_cnm_color[3] .* shine_rgb_cnm .+
+        shine_rgb_lnm_color[3] .* shine_rgb_lnm .+
+        shine_rgb_wnm_color[3] .* shine_rgb_wnm, 0.0, 1.0)
     shine_rgb_image = RGBf.(shine_rgb_red, shine_rgb_green, shine_rgb_blue)
 
-    fig_shine_rgb = Figure(size = (820, 670))
+    fig_shine_rgb = Figure(size = (1100, 1000))
     shine_rgb_axis = physical_map_axis(fig_shine_rgb[1, 1],
         xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
         ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"),
-        title = L"\mathrm{H\,I\ velocity\ composite}")
+        aspect = DataAspect(),
+        title = L"\mathrm{H\,I\ phase\!-\!velocity\ composite}")
     image!(shine_rgb_axis,
         (first(sky_coordinates[1]), last(sky_coordinates[1])),
         (first(sky_coordinates[2]), last(sky_coordinates[2])),
         shine_rgb_image)
-    rowsize!(fig_shine_rgb.layout, 1, Aspect(1, 1))
-
     shine_rgb_labels = [
-        latexstring("R:\\ ", @sprintf("%.4g", shine_rgb_boundary_2),
-            "<v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_vhi),
+        latexstring("\\mathrm{CNM}:\\ ", @sprintf("%.4g", shine_rgb_cnm_window[1]),
+            "\\leq v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_rgb_cnm_window[2]),
             "\\;\\mathrm{km\\,s}^{-1}"),
-        latexstring("G:\\ ", @sprintf("%.4g", shine_rgb_boundary_1),
-            "\\leq v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_rgb_boundary_2),
+        latexstring("\\mathrm{LNM}:\\ ", @sprintf("%.4g", shine_rgb_lnm_window[1]),
+            "\\leq v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_rgb_lnm_window[2]),
             "\\;\\mathrm{km\\,s}^{-1}"),
-        latexstring("B:\\ ", @sprintf("%.4g", shine_vlo),
-            "\\leq v_{\\mathrm{LOS}}<", @sprintf("%.4g", shine_rgb_boundary_1),
+        latexstring("\\mathrm{WNM}:\\ ", @sprintf("%.4g", shine_rgb_wnm_window[1]),
+            "\\leq v_{\\mathrm{LOS}}\\leq ", @sprintf("%.4g", shine_rgb_wnm_window[2]),
             "\\;\\mathrm{km\\,s}^{-1}"),
     ]
-    shine_rgb_label_colors = [RGBf(0.86, 0.16, 0.20), RGBf(0.05, 0.62, 0.34), RGBf(0.12, 0.35, 0.92)]
-    shine_rgb_legend = GridLayout(fig_shine_rgb[2, 1])
-    for index in eachindex(shine_rgb_labels)
-        Label(shine_rgb_legend[1, index], shine_rgb_labels[index];
-            color = shine_rgb_label_colors[index], fontsize = 16, tellwidth = true)
-    end
+    shine_rgb_label_colors = [
+        RGBf(shine_rgb_cnm_color...),
+        RGBf(shine_rgb_lnm_color...),
+        RGBf(shine_rgb_wnm_color...),
+    ]
+    Legend(fig_shine_rgb[2, 1],
+        [LineElement(color = color, linewidth = 8)
+            for color in shine_rgb_label_colors],
+        shine_rgb_labels,
+        L"\mathrm{Thermal\ phase\ and\ overlapping\ velocity\ window}";
+        orientation = :horizontal, nbanks = 1, framevisible = false,
+        tellheight = true, labelsize = 14, titlesize = 15)
+    colsize!(fig_shine_rgb.layout, 1, Relative(1.0))
+    rowsize!(fig_shine_rgb.layout, 1, Relative(0.82))
+    rowsize!(fig_shine_rgb.layout, 2, Relative(0.18))
+    rowgap!(fig_shine_rgb.layout, 10)
     display_shine_rgb ? fig_shine_rgb : nothing
 end
 
@@ -5747,9 +5780,9 @@ begin
         (data = shine_mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[2], period = nothing),
         (data = shine_peak_tau, label = L"\max_v\tau_{21}", color = MHD_COLORS[3], period = nothing),
         (data = shine_fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", color = MHD_COLORS[4], period = nothing),
-        (data = shine_rgb_blue_map, label = L"W_{\mathrm{blue}}\;[\mathrm{K\,km\,s}^{-1}]", color = :dodgerblue3, period = nothing),
-        (data = shine_rgb_green_map, label = L"W_{\mathrm{green}}\;[\mathrm{K\,km\,s}^{-1}]", color = :seagreen3, period = nothing),
-        (data = shine_rgb_red_map, label = L"W_{\mathrm{red}}\;[\mathrm{K\,km\,s}^{-1}]", color = :firebrick3, period = nothing),
+        (data = shine_rgb_cnm_map, label = L"W_{\mathrm{CNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(0.000, 0.000, 1.000), period = nothing),
+        (data = shine_rgb_lnm_map, label = L"W_{\mathrm{LNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(0.000, 1.000, 0.000), period = nothing),
+        (data = shine_rgb_wnm_map, label = L"W_{\mathrm{WNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(1.000, 0.000, 0.000), period = nothing),
     ]
     fig_shine_structure = display_observational_structure_functions ?
         observational_structure_figure(shine_structure_specs, cube, sky_dims,

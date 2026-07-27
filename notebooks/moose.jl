@@ -4139,6 +4139,9 @@ The H I--Faraday HOG is decomposed into total H I, CNM, LNM, and WNM
 velocity cubes. The phase-resolved cubes use the temperature cuts below:
 CNM has $T<T_{\rm CNM}$, LNM has
 $T_{\rm CNM}\leq T<T_{\rm WNM}$, and WNM has $T\geq T_{\rm WNM}$.
+An optional Gaussian EBHIS noise realization is added to every H I velocity
+channel after beam convolution. The same realization is used for all four
+thermal panels so that their differences remain physically interpretable.
 
 | SHINE setting | Control |
 |:--|:--|
@@ -4151,6 +4154,9 @@ $T_{\rm CNM}\leq T<T_{\rm WNM}$, and WNM has $T\geq T_{\rm WNM}$.
 | Channel width [$\mathrm{km\,s^{-1}}$] | $(@bind shine_velocity_step PlutoUI.NumberField(0.25:0.25:10.0; default = 1.0)) |
 | CNM/LNM boundary [$\mathrm{K}$] | $(@bind shine_TCNM PlutoUI.NumberField(10.0:10.0:2000.0; default = 200.0)) |
 | LNM/WNM boundary [$\mathrm{K}$] | $(@bind shine_TWNM PlutoUI.NumberField(100.0:50.0:20000.0; default = 2000.0)) |
+| Add EBHIS-like noise to HOG H I cubes | $(@bind add_shine_ebhis_noise PlutoUI.CheckBox(default = true)) |
+| EBHIS channel rms $\sigma_{T_B}$ [$\mathrm{mK}$] | $(@bind shine_ebhis_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 90.0)) |
+| EBHIS random seed | $(@bind shine_ebhis_seed PlutoUI.NumberField(0:1:100000; default = 31415)) |
 | FFT CNM threshold [$\mathrm{(km\,s^{-1})^{-1}}$] | $(@bind shine_fft_klim PlutoUI.NumberField(0.0:0.01:2.0; default = 0.12)) |
 | First sky-axis pixel | $(@bind shine_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel | $(@bind shine_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
@@ -4383,6 +4389,23 @@ begin
             lnm = phase_brightness_cube(phase_density_cubes.lnm),
             wnm = phase_brightness_cube(phase_density_cubes.wnm),
         )
+        if add_shine_ebhis_noise
+            sigma_ebhis_K = 1.0e-3 * Float64(shine_ebhis_noise_mK)
+            isfinite(sigma_ebhis_K) && sigma_ebhis_K >= 0 ||
+                error("The EBHIS H I channel noise must be finite and non-negative.")
+            if sigma_ebhis_K > 0
+                ebhis_rng = MersenneTwister(Int(shine_ebhis_seed))
+                noise_buffer = Matrix{Float64}(
+                    undef, size(local_nhi, 1), size(local_nhi, 2))
+                for channel in axes(hi_cubes.total, 3)
+                    randn!(ebhis_rng, noise_buffer)
+                    for phase_cube in values(hi_cubes)
+                        phase_channel = @view phase_cube[:, :, channel]
+                        phase_channel .+= sigma_ebhis_K .* noise_buffer
+                    end
+                end
+            end
+        end
 
         local_number_density = number_density(c.rho)
         local_ne = moose_electron_density(local_number_density, local_temperature)
@@ -4636,6 +4659,9 @@ begin
         Float64(shine_fixed_width_kms),
         Float64(shine_TCNM_value),
         Float64(shine_TWNM_value),
+        Bool(add_shine_ebhis_noise),
+        Float64(shine_ebhis_noise_mK),
+        Int(shine_ebhis_seed),
         first(shine_velocity_axis),
         last(shine_velocity_axis),
         length(shine_velocity_axis),
@@ -4670,7 +4696,7 @@ begin
         snapshot_path =
             run_files[label][comparison_snapshot_indices[label]]
         hi_faraday_hog_by_run[label] = cached_scientific_product((
-            :hi_faraday_hog_phase_v1,
+            :hi_faraday_hog_phase_ebhis_v1,
             cube_signature(snapshot_path),
             hif_hog_parameter_signature,
         )) do
@@ -4738,9 +4764,16 @@ begin
         size = (330hif_hog_columns + 260, 570hif_hog_run_count + 190),
         figure_padding = (30, 30, 35, 60),
     )
+    hif_hog_title = add_shine_ebhis_noise ?
+        latexstring(
+            "\\mathrm{H\\,I\\!-\\!Faraday\\ HOG\\ by\\ thermal\\ phase},\\quad ",
+            "\\sigma_{T_B}^{\\mathrm{EBHIS}}=",
+            @sprintf("%.4g", Float64(shine_ebhis_noise_mK)),
+            "\\;\\mathrm{mK\\,channel}^{-1}") :
+        L"\mathrm{H\,I\!-\!Faraday\ HOG\ by\ thermal\ phase}"
     Label(
         fig_hi_faraday_hog[0, 1:hif_hog_columns],
-        L"\mathrm{H\,I\!-\!Faraday\ HOG\ by\ thermal\ phase}";
+        hif_hog_title;
         fontsize = 23,
     )
     for (column, phase) in enumerate(hif_hog_phase_specs)

@@ -3432,61 +3432,6 @@ begin
         output
     end
 
-    """
-    Add channel noise whose RM-synthesis image has the requested rms in each
-    of Re F(phi) and Im F(phi).
-
-    For the equal-weight transform F = sum(P_j exp(-2i phi dlambda2_j))/N,
-    independent Q/U noise sigma_channel gives sigma_F =
-    sigma_channel/sqrt(N). Injecting the noise before RM synthesis therefore
-    preserves the Faraday-channel correlations imposed by the RMSF.
-    """
-    function add_moose_faraday_noise!(Q, U, faraday_rms_mK, rng)
-        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
-        ndims(Q) == 3 || error("LoTSS-like MOOSE noise requires Q/U frequency cubes.")
-        sigma_F_K = Float64(faraday_rms_mK) * 1.0e-3
-        isfinite(sigma_F_K) && sigma_F_K >= 0 ||
-            error("MOOSE Faraday-spectrum noise must be finite and non-negative.")
-        sigma_channel_K = sigma_F_K * sqrt(size(Q, 3))
-        if sigma_channel_K > 0
-            noise_buffer = Matrix{Float64}(undef, size(Q, 1), size(Q, 2))
-            @views for channel in axes(Q, 3)
-                randn!(rng, noise_buffer)
-                Q[:, :, channel] .+= sigma_channel_K .* noise_buffer
-                randn!(rng, noise_buffer)
-                U[:, :, channel] .+= sigma_channel_K .* noise_buffer
-            end
-        end
-        Q, U
-    end
-
-    """
-    Choose an RM-synthesis noise level comparable to the polarized signal.
-
-    The signal proxy is the rms polarized brightness across the clean Q/U
-    frequency cube. The requested LoTSS value remains a lower bound, while
-    target_snr controls the signal-to-noise ratio used for the synthetic
-    experiment.
-    """
-    function moose_signal_matched_noise_mK(Q, U, minimum_rms_mK, target_snr)
-        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
-        snr = Float64(target_snr)
-        isfinite(snr) && snr > 0 ||
-            error("The target MOOSE Faraday-spectrum S/N must be positive.")
-        power_sum = 0.0
-        sample_count = 0
-        @inbounds for index in eachindex(Q, U)
-            q_value = Float64(Q[index])
-            u_value = Float64(U[index])
-            if isfinite(q_value) && isfinite(u_value)
-                power_sum += q_value^2 + u_value^2
-                sample_count += 1
-            end
-        end
-        polarized_rms_K = sample_count > 0 ?
-            sqrt(power_sum / sample_count) : 0.0
-        max(Float64(minimum_rms_mK), 1.0e3 * polarized_rms_K / snr)
-    end
 end
 
 # ╔═╡ 67f95c39-1888-4d23-a2c2-2ee3a6cd7f0f

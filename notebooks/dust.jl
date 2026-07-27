@@ -3551,61 +3551,6 @@ begin
         output
     end
 
-    """
-    Add channel noise whose RM-synthesis image has the requested rms in each
-    of Re F(phi) and Im F(phi).
-
-    For the equal-weight transform F = sum(P_j exp(-2i phi dlambda2_j))/N,
-    independent Q/U noise sigma_channel gives sigma_F =
-    sigma_channel/sqrt(N). Injecting the noise before RM synthesis therefore
-    preserves the Faraday-channel correlations imposed by the RMSF.
-    """
-    function add_moose_faraday_noise!(Q, U, faraday_rms_mK, rng)
-        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
-        ndims(Q) == 3 || error("LoTSS-like MOOSE noise requires Q/U frequency cubes.")
-        sigma_F_K = Float64(faraday_rms_mK) * 1.0e-3
-        isfinite(sigma_F_K) && sigma_F_K >= 0 ||
-            error("MOOSE Faraday-spectrum noise must be finite and non-negative.")
-        sigma_channel_K = sigma_F_K * sqrt(size(Q, 3))
-        if sigma_channel_K > 0
-            noise_buffer = Matrix{Float64}(undef, size(Q, 1), size(Q, 2))
-            @views for channel in axes(Q, 3)
-                randn!(rng, noise_buffer)
-                Q[:, :, channel] .+= sigma_channel_K .* noise_buffer
-                randn!(rng, noise_buffer)
-                U[:, :, channel] .+= sigma_channel_K .* noise_buffer
-            end
-        end
-        Q, U
-    end
-
-    """
-    Choose an RM-synthesis noise level comparable to the polarized signal.
-
-    The signal proxy is the rms polarized brightness across the clean Q/U
-    frequency cube. The requested LoTSS value remains a lower bound, while
-    target_snr controls the signal-to-noise ratio used for the synthetic
-    experiment.
-    """
-    function moose_signal_matched_noise_mK(Q, U, minimum_rms_mK, target_snr)
-        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
-        snr = Float64(target_snr)
-        isfinite(snr) && snr > 0 ||
-            error("The target MOOSE Faraday-spectrum S/N must be positive.")
-        power_sum = 0.0
-        sample_count = 0
-        @inbounds for index in eachindex(Q, U)
-            q_value = Float64(Q[index])
-            u_value = Float64(U[index])
-            if isfinite(q_value) && isfinite(u_value)
-                power_sum += q_value^2 + u_value^2
-                sample_count += 1
-            end
-        end
-        polarized_rms_K = sample_count > 0 ?
-            sqrt(power_sum / sample_count) : 0.0
-        max(Float64(minimum_rms_mK), 1.0e3 * polarized_rms_K / snr)
-    end
 end
 
 # ╔═╡ d6a2f4b1-59ac-4e77-a10a-4b74c0d89231
@@ -4337,10 +4282,6 @@ use all physical and instrumental defaults listed below.
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
-| Add LoTSS-like noise to $F(\phi)$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = true)) |
-| Minimum $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
-| Target Faraday-spectrum signal-to-noise ratio | $(@bind moose_faraday_target_snr PlutoUI.NumberField(0.1:0.1:100.0; default = 1.0)) |
-| Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
 | Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
 | Synchrotron brightness | $(@bind show_moose_I PlutoUI.CheckBox(default = true)) |

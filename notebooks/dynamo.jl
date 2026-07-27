@@ -3778,9 +3778,103 @@ end
 
 # ╔═╡ a7def784-6c52-4f98-9d76-ece082b45229
 begin
-    normalized_B = growth_B ./ growth_B0
-    ln_normalized_B = log.(max.(normalized_B, floatmin(Float64)))
-    finite_growth_log_values = filter(isfinite, ln_normalized_B)
+    """
+    Build the magnetic-growth model for one simulation.  Every run keeps its
+    own first valid field B0, time origin, fit interval, slope, and uncertainty;
+    only the plotting axes are shared across a comparison group.
+    """
+    growth_comparison_fit_field = growth_fit_field
+    growth_comparison_fit_mode = growth_fit_mode
+    growth_comparison_fit_window = growth_fit_window
+    growth_comparison_window_selector = automatic_growth_fit_window
+    growth_comparison_fit_function = exponential_growth_fit
+
+    comparison_growth_model = function(
+        label,
+        series,
+        fit_field,
+        fit_mode,
+        fit_window,
+        window_selector,
+        fit_function,
+    )
+        times = Float64.(getfield.(series, :t))
+        magnetic_field = fit_field == "Mean field ⟨B⟩" ?
+            Float64.(getfield.(series, :Bmean)) :
+            Float64.(getfield.(series, :Brms))
+        reference_index = findfirst(i -> isfinite(times[i]) &&
+            isfinite(magnetic_field[i]) && magnetic_field[i] > 0,
+            eachindex(magnetic_field))
+        B0 = isnothing(reference_index) ? NaN : magnetic_field[reference_index]
+        t0 = isnothing(reference_index) ? NaN : times[reference_index]
+        elapsed_time = times .- t0
+        log_field = map(magnetic_field) do value
+            isfinite(value) && value > 0 ? log(value) : NaN
+        end
+        manual_indices = filter(i -> 1 <= i <= length(times) &&
+            isfinite(times[i]) && isfinite(elapsed_time[i]) &&
+            isfinite(log_field[i]), collect(fit_window))
+        fit_indices = fit_mode == "Automatic" ?
+            window_selector(elapsed_time, log_field) :
+            manual_indices
+        fit = fit_function(elapsed_time, log_field, fit_indices)
+        gamma_error = isfinite(fit.gamma_error) ? fit.gamma_error : 0.0
+        fit_center_time = isempty(fit_indices) ? NaN :
+            mean(elapsed_time[fit_indices])
+        fit_center_log_B = fit.log_amplitude + fit.gamma * fit_center_time
+        fitted_log_ratio = fit.log_amplitude - log(B0) .+
+            fit.gamma .* elapsed_time
+        lower_log_ratio = fit_center_log_B - log(B0) .+
+            (fit.gamma - gamma_error) .* (elapsed_time .- fit_center_time)
+        upper_log_ratio = fit_center_log_B - log(B0) .+
+            (fit.gamma + gamma_error) .* (elapsed_time .- fit_center_time)
+        normalized_field = magnetic_field ./ B0
+        logarithmic_ratio = map(normalized_field) do value
+            isfinite(value) && value > 0 ? log(value) : NaN
+        end
+        (;
+            label,
+            times,
+            magnetic_field,
+            B0,
+            t0,
+            elapsed_time,
+            logarithmic_ratio,
+            fit_indices,
+            fit,
+            gamma_error,
+            fitted_log_ratio,
+            lower_log_ratio,
+            upper_log_ratio,
+        )
+    end
+
+    growth_series_collection = all_series
+    growth_comparison_models = Dict(
+        label => comparison_growth_model(
+            label,
+            growth_series_collection[label],
+            growth_comparison_fit_field,
+            growth_comparison_fit_mode,
+            growth_comparison_fit_window,
+            growth_comparison_window_selector,
+            growth_comparison_fit_function,
+        )
+        for label in comparison_run_labels
+    )
+    finite_growth_log_values = reduce(vcat, [
+        filter(isfinite, model.logarithmic_ratio)
+        for model in values(growth_comparison_models)
+    ]; init = Float64[])
+    for model in values(growth_comparison_models)
+        isempty(model.fit_indices) && continue
+        append!(finite_growth_log_values,
+            filter(isfinite, model.fitted_log_ratio[model.fit_indices]))
+        append!(finite_growth_log_values,
+            filter(isfinite, model.lower_log_ratio[model.fit_indices]))
+        append!(finite_growth_log_values,
+            filter(isfinite, model.upper_log_ratio[model.fit_indices]))
+    end
     growth_log_minimum = isempty(finite_growth_log_values) ? 0.0 :
         minimum(finite_growth_log_values)
     growth_log_maximum = isempty(finite_growth_log_values) ? 1.0 :
@@ -3795,88 +3889,101 @@ begin
         fig_growth = Figure(size = (900, 180))
         Label(fig_growth[1, 1], L"\mathrm{Select\ at\ least\ one\ magnetic-growth\ panel.}", fontsize = 20)
     else
-        fig_growth = Figure(size = (550growth_panel_count, 650))
+        fig_growth = Figure(size = (600growth_panel_count, 720))
         growth_column = 0
+        growth_run_elements = [
+            LineElement(color = run_colors[label], linewidth = 2.6)
+            for label in comparison_run_labels
+        ]
+        growth_run_labels = [
+            begin
+                model = growth_comparison_models[label]
+                if isfinite(model.fit.gamma)
+                    latexstring(
+                        run_label_latex_source(plain_legend_run_label(label)),
+                        raw";\;\Gamma_B=",
+                        @sprintf("%.3g", model.fit.gamma),
+                        raw"\pm",
+                        @sprintf("%.2g", model.gamma_error),
+                        raw"\;\mathrm{Myr}^{-1}",
+                    )
+                else
+                    legend_run_label(label)
+                end
+            end
+            for label in comparison_run_labels
+        ]
         if show_growth_fit_panel
             growth_column += 1
             ag1 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
-                ylabel = L"\ln(B/B_0)")
-            lines!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run],
-                linewidth = 2.5)
-            scatter!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run], markersize = 8)
-            fit_legend_elements = Any[
-                LineElement(color = run_colors[selected_run], linewidth = 2.5),
-            ]
-            fit_legend_labels = LaTeXString[L"\mathrm{Data}"]
-            if show_growth_fit && isfinite(growth_fit.gamma)
-                fit_t = growth_times[growth_indices]
-                fit_log_ratio = growth_fit.log_amplitude - log(growth_B0) .+
-                    growth_fit.gamma .* growth_elapsed_time[growth_indices]
-                lines!(ag1, fit_t, fit_log_ratio; color = :black, linewidth = 3,
-                    linestyle = :dash)
-                push!(fit_legend_elements,
-                    LineElement(color = :black, linewidth = 3, linestyle = :dash))
-                push!(fit_legend_labels, latexstring(
-                    "\\mathrm{Fit}:\\;\\Gamma_B=",
-                    @sprintf("%.4g", growth_fit.gamma),
-                    "\\pm", @sprintf("%.2g", growth_fit.gamma_error),
-                    "\\;\\mathrm{Myr}^{-1},\\;R^2=",
-                    @sprintf("%.3f", growth_fit.r2),
-                ))
+                ylabel = L"\ln(B/B_0)",
+                title = L"\mathrm{Magnetic\ growth\ and\ exponential\ fits}")
+            for label in comparison_run_labels
+                model = growth_comparison_models[label]
+                color = run_colors[label]
+                lines!(ag1, model.times, model.logarithmic_ratio;
+                    color, linewidth = 2.5)
+                scatter!(ag1, model.times, model.logarithmic_ratio;
+                    color, markersize = 7)
+                if show_growth_fit && isfinite(model.fit.gamma) &&
+                        !isempty(model.fit_indices)
+                    lines!(ag1, model.times[model.fit_indices],
+                        model.fitted_log_ratio[model.fit_indices];
+                        color, linewidth = 3, linestyle = :dash)
+                end
             end
-            growth_has_interval && vspan!(ag1,
-                growth_times[growth_first_index], growth_times[growth_last_index];
-                color = (:gray50, 0.10))
             ylims!(ag1, growth_y_limits...)
-            Legend(fig_growth[2, growth_column], fit_legend_elements,
-                fit_legend_labels; orientation = :vertical, nbanks = 1,
-                tellheight = true, framevisible = false, labelsize = 14)
         end
         if show_growth_theory_panel
             growth_column += 1
             ag2 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
-                ylabel = L"\ln(B/B_0)")
-            lines!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run],
-                linewidth = 2.5)
-            scatter!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run], markersize = 7)
-            theory_legend_elements = Any[
-                LineElement(color = run_colors[selected_run], linewidth = 2.5),
-            ]
-            theory_legend_labels = LaTeXString[L"\mathrm{Data}"]
-            panel_fit_times = growth_times[growth_indices]
-            for (offset, Γ, curve, color) in zip(
-                    (-1, 1), theory_gammas, theory_B_curves, theory_colors)
-                lines!(ag2, panel_fit_times,
-                    log.(curve[growth_indices] ./ growth_B0); color, linewidth = 2,
-                    linestyle = :dot)
-                push!(theory_legend_elements,
-                    LineElement(color = color, linewidth = 2, linestyle = :dot))
-                push!(theory_legend_labels, latexstring(
-                    "\\Gamma_B^{\\mathrm{fit}}",
-                    offset < 0 ? "-" : "+",
-                    "\\sigma_{\\Gamma_B}=",
-                    @sprintf("%.3g", Γ),
-                    "\\;\\mathrm{Myr}^{-1}"))
+                ylabel = L"\ln(B/B_0)",
+                title = L"\mathrm{Fit\ uncertainty}\;(\Gamma_B\pm\sigma_{\Gamma_B})")
+            for label in comparison_run_labels
+                model = growth_comparison_models[label]
+                color = run_colors[label]
+                lines!(ag2, model.times, model.logarithmic_ratio;
+                    color, linewidth = 2.5)
+                scatter!(ag2, model.times, model.logarithmic_ratio;
+                    color, markersize = 7)
+                if !isempty(model.fit_indices) && isfinite(model.fit.gamma)
+                    fit_times = model.times[model.fit_indices]
+                    lines!(ag2, fit_times,
+                        model.lower_log_ratio[model.fit_indices];
+                        color, linewidth = 1.8, linestyle = :dot)
+                    lines!(ag2, fit_times,
+                        model.upper_log_ratio[model.fit_indices];
+                        color, linewidth = 1.8, linestyle = :dot)
+                    if show_growth_fit
+                        lines!(ag2, fit_times,
+                            model.fitted_log_ratio[model.fit_indices];
+                            color, linewidth = 3, linestyle = :dash)
+                    end
+                end
             end
-            if show_growth_fit && isfinite(growth_fit.gamma)
-                lines!(ag2, panel_fit_times, log.(fitted_ratio_curve[growth_indices]);
-                    color = :black,
-                    linewidth = 2.5, linestyle = :dashdot)
-                push!(theory_legend_elements,
-                    LineElement(color = :black, linewidth = 2.5, linestyle = :dashdot))
-                push!(theory_legend_labels, latexstring(
-                    "\\mathrm{Best\\ fit}:\\;\\Gamma_B=",
-                    @sprintf("%.4g", growth_fit.gamma),
-                    "\\;\\mathrm{Myr}^{-1}"))
-            end
-            growth_has_interval && vspan!(ag2,
-                growth_times[growth_first_index], growth_times[growth_last_index];
-                color = (:gray50, 0.10))
             ylims!(ag2, growth_y_limits...)
-            Legend(fig_growth[2, growth_column], theory_legend_elements,
-                theory_legend_labels; orientation = :vertical, nbanks = 1,
-                tellheight = true, framevisible = false, labelsize = 13)
         end
+
+        growth_legend_layout = GridLayout(fig_growth[2, 1:growth_panel_count])
+        Legend(growth_legend_layout[1, 1],
+            growth_run_elements, growth_run_labels, L"\mathrm{Simulation}";
+            orientation = :horizontal, nbanks = 1,
+            tellheight = true, framevisible = false, labelsize = 14)
+        growth_style_elements = Any[
+            LineElement(color = :gray25, linewidth = 2.5,
+                marker = :circle, markersize = 7),
+            LineElement(color = :gray25, linewidth = 3, linestyle = :dash),
+            LineElement(color = :gray25, linewidth = 1.8, linestyle = :dot),
+        ]
+        growth_style_labels = LaTeXString[
+            L"\mathrm{Snapshots}",
+            L"\mathrm{Best\ fit}",
+            L"\Gamma_B\pm\sigma_{\Gamma_B}",
+        ]
+        Legend(growth_legend_layout[2, 1],
+            growth_style_elements, growth_style_labels, L"\mathrm{Line\ style}";
+            orientation = :horizontal, nbanks = 1,
+            tellheight = true, framevisible = false, labelsize = 14)
         rowgap!(fig_growth.layout, 8)
     end
     display_growth_fit ? fig_growth : nothing

@@ -3685,61 +3685,6 @@ begin
         output
     end
 
-    """
-    Add channel noise whose RM-synthesis image has the requested rms in each
-    of Re F(phi) and Im F(phi).
-
-    For the equal-weight transform F = sum(P_j exp(-2i phi dlambda2_j))/N,
-    independent Q/U noise sigma_channel gives sigma_F =
-    sigma_channel/sqrt(N). Injecting the noise before RM synthesis therefore
-    preserves the Faraday-channel correlations imposed by the RMSF.
-    """
-    function add_moose_faraday_noise!(Q, U, faraday_rms_mK, rng)
-        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
-        ndims(Q) == 3 || error("LoTSS-like MOOSE noise requires Q/U frequency cubes.")
-        sigma_F_K = Float64(faraday_rms_mK) * 1.0e-3
-        isfinite(sigma_F_K) && sigma_F_K >= 0 ||
-            error("MOOSE Faraday-spectrum noise must be finite and non-negative.")
-        sigma_channel_K = sigma_F_K * sqrt(size(Q, 3))
-        if sigma_channel_K > 0
-            noise_buffer = Matrix{Float64}(undef, size(Q, 1), size(Q, 2))
-            @views for channel in axes(Q, 3)
-                randn!(rng, noise_buffer)
-                Q[:, :, channel] .+= sigma_channel_K .* noise_buffer
-                randn!(rng, noise_buffer)
-                U[:, :, channel] .+= sigma_channel_K .* noise_buffer
-            end
-        end
-        Q, U
-    end
-
-    """
-    Choose an RM-synthesis noise level comparable to the polarized signal.
-
-    The signal proxy is the rms polarized brightness across the clean Q/U
-    frequency cube. The requested LoTSS value remains a lower bound, while
-    target_snr controls the signal-to-noise ratio used for the synthetic
-    experiment.
-    """
-    function moose_signal_matched_noise_mK(Q, U, minimum_rms_mK, target_snr)
-        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
-        snr = Float64(target_snr)
-        isfinite(snr) && snr > 0 ||
-            error("The target MOOSE Faraday-spectrum S/N must be positive.")
-        power_sum = 0.0
-        sample_count = 0
-        @inbounds for index in eachindex(Q, U)
-            q_value = Float64(Q[index])
-            u_value = Float64(U[index])
-            if isfinite(q_value) && isfinite(u_value)
-                power_sum += q_value^2 + u_value^2
-                sample_count += 1
-            end
-        end
-        polarized_rms_K = sample_count > 0 ?
-            sqrt(power_sum / sample_count) : 0.0
-        max(Float64(minimum_rms_mK), 1.0e3 * polarized_rms_K / snr)
-    end
 end
 
 # ╔═╡ 62b61ef2-8e5d-4fe9-a435-e18fb5be9461
@@ -3778,10 +3723,6 @@ use all physical and instrumental defaults listed below.
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
-| Add LoTSS-like noise to $F(\phi)$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = true)) |
-| Minimum $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
-| Target Faraday-spectrum signal-to-noise ratio | $(@bind moose_faraday_target_snr PlutoUI.NumberField(0.1:0.1:100.0; default = 1.0)) |
-| Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
 | Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
 | Synchrotron brightness | $(@bind show_moose_I PlutoUI.CheckBox(default = true)) |
@@ -3984,20 +3925,6 @@ begin
         moose_Q_band_K, cube, sky_dims)
     moose_U_band_K = apply_observational_beam_cube(
         moose_U_band_K, cube, sky_dims)
-    moose_applied_faraday_noise_mK = add_moose_noise ?
-        moose_signal_matched_noise_mK(
-            moose_Q_band_K,
-            moose_U_band_K,
-            moose_faraday_noise_mK,
-            moose_faraday_target_snr,
-        ) : 0.0
-    add_moose_noise && add_moose_faraday_noise!(
-        moose_Q_band_K,
-        moose_U_band_K,
-        moose_applied_faraday_noise_mK,
-        MersenneTwister(Int(moose_instrument_seed)),
-    )
-
     moose_lambda0_sq_m2 = mean(moose_band_lambda2_m2)
     moose_rm_phase_matrix = [cis(-2.0 * phi * (lambda2 - moose_lambda0_sq_m2))
         for lambda2 in moose_band_lambda2_m2, phi in moose_phi_axis]
@@ -4050,10 +3977,7 @@ begin
                 instrument_text = latexstring(
                     "\\Delta\\nu=", @sprintf("%.3f", moose_channel_width_value_MHz),
                     "\\;\\mathrm{MHz},\\quad N_\\nu=", moose_nfrequency,
-                    ",\\quad \\sigma_F=",
-                    @sprintf("%.3g", 1.0e-3 * moose_applied_faraday_noise_mK),
-                    "\\;\\mathrm{K\\,RMSF}^{-1},\\quad (S/N)_{F,\\mathrm{target}}=",
-                    @sprintf("%.2g", Float64(moose_faraday_target_snr)))
+                    ",\\quad F(\\phi):\\ \\mathrm{noiseless}")
                 Label(fig_moose_tomography[0, index], instrument_text;
                     fontsize = 14)
                 axislegend(ax; position = :rt, framevisible = false)
@@ -4150,6 +4074,7 @@ $T_{\rm CNM}\leq T<T_{\rm WNM}$, and WNM has $T\geq T_{\rm WNM}$.
 An optional Gaussian EBHIS noise realization is added to every H I velocity
 channel after beam convolution. The same realization is used for all four
 thermal panels so that their differences remain physically interpretable.
+The Faraday-depth cube used by HOG is always noise-free.
 
 | SHINE setting | Control |
 |:--|:--|
@@ -4469,19 +4394,8 @@ begin
         end
         q_band = apply_observational_beam_cube(q_band, c, sky_dims)
         u_band = apply_observational_beam_cube(u_band, c, sky_dims)
-        applied_noise_mK = add_moose_noise ?
-            moose_signal_matched_noise_mK(
-                q_band,
-                u_band,
-                moose_faraday_noise_mK,
-                moose_faraday_target_snr,
-            ) : 0.0
-        add_moose_noise && add_moose_faraday_noise!(
-            q_band,
-            u_band,
-            applied_noise_mK,
-            MersenneTwister(Int(moose_instrument_seed)),
-        )
+        # HOG compares EBHIS-like noisy H I channels with a deterministic,
+        # noise-free Faraday cube.
         polarized_matrix = reshape(complex.(q_band, u_band), :, nfrequency)
         faraday_matrix =
             polarized_matrix * moose_rm_phase_matrix / nfrequency
@@ -4699,17 +4613,13 @@ begin
         Bool(apply_moose_interferometer),
         Float64(moose_largest_scale_pix),
         Float64(moose_smallest_scale_pix),
-        Bool(add_moose_noise),
-        Float64(moose_faraday_noise_mK),
-        Float64(moose_faraday_target_snr),
-        Int(moose_instrument_seed),
     )
     hi_faraday_hog_by_run = Dict{String, Any}()
     for label in comparison_run_labels
         snapshot_path =
             run_files[label][comparison_snapshot_indices[label]]
         hi_faraday_hog_by_run[label] = cached_scientific_product((
-            :hi_faraday_hog_phase_ebhis_v1,
+            :hi_faraday_hog_phase_ebhis_no_faraday_noise_v2,
             cube_signature(snapshot_path),
             hif_hog_parameter_signature,
         )) do
@@ -4774,16 +4684,17 @@ begin
     hif_hog_columns = length(hif_hog_phase_specs)
     hif_hog_run_count = length(comparison_run_labels)
     fig_hi_faraday_hog = Figure(
-        size = (330hif_hog_columns + 260, 570hif_hog_run_count + 190),
-        figure_padding = (30, 30, 35, 60),
+        size = (300hif_hog_columns + 240, 470hif_hog_run_count + 150),
+        figure_padding = (25, 70, 30, 45),
     )
     hif_hog_title = add_shine_ebhis_noise ?
         latexstring(
             "\\mathrm{H\\,I\\!-\\!Faraday\\ HOG\\ by\\ thermal\\ phase},\\quad ",
             "\\sigma_{T_B}^{\\mathrm{EBHIS}}=",
             @sprintf("%.4g", Float64(shine_ebhis_noise_mK)),
-            "\\;\\mathrm{mK\\,channel}^{-1}") :
-        L"\mathrm{H\,I\!-\!Faraday\ HOG\ by\ thermal\ phase}"
+            "\\;\\mathrm{mK\\,channel}^{-1},\\quad ",
+            "F(\\phi):\\ \\mathrm{noiseless}") :
+        L"\mathrm{H\,I\!-\!Faraday\ HOG\ by\ thermal\ phase},\quad F(\phi):\ \mathrm{noiseless}"
     Label(
         fig_hi_faraday_hog[0, 1:hif_hog_columns],
         hif_hog_title;
@@ -4809,7 +4720,7 @@ begin
             )
             heatmap_axis = latex_axis(
                 fig_hi_faraday_hog[heatmap_row, column];
-                xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
+                xlabel = "",
                 ylabel = column == 1 ?
                     L"\phi\;[\mathrm{rad\,m}^{-2}]" : "",
             )
@@ -4857,14 +4768,17 @@ begin
         tickformat = latex_ticklabels,
     )
     for column in 1:hif_hog_columns
-        colsize!(fig_hi_faraday_hog.layout, column, Fixed(300))
+        colsize!(fig_hi_faraday_hog.layout, column, Fixed(280))
     end
-    colsize!(fig_hi_faraday_hog.layout, hif_hog_columns + 1, 24)
+    colsize!(fig_hi_faraday_hog.layout, hif_hog_columns + 1, 38)
+    rowsize!(fig_hi_faraday_hog.layout, 1, Fixed(30))
     for run_index in 1:hif_hog_run_count
-        rowsize!(fig_hi_faraday_hog.layout, 3run_index - 1, Fixed(26))
-        rowsize!(fig_hi_faraday_hog.layout, 3run_index, Relative(0.62))
-        rowsize!(fig_hi_faraday_hog.layout, 3run_index + 1, Relative(0.38))
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index - 1, Fixed(30))
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index, Fixed(260))
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index + 1, Fixed(145))
     end
+    rowgap!(fig_hi_faraday_hog.layout, 8)
+    colgap!(fig_hi_faraday_hog.layout, 12)
     display_hi_faraday_hog ? fig_hi_faraday_hog : nothing
 end
 

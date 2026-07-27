@@ -3931,9 +3931,103 @@ end
 
 # ╔═╡ a7def784-6c52-4f98-9d76-ece082b45229
 begin
-    normalized_B = growth_B ./ growth_B0
-    ln_normalized_B = log.(max.(normalized_B, floatmin(Float64)))
-    finite_growth_log_values = filter(isfinite, ln_normalized_B)
+    """
+    Build the magnetic-growth model for one simulation.  Every run keeps its
+    own first valid field B0, time origin, fit interval, slope, and uncertainty;
+    only the plotting axes are shared across a comparison group.
+    """
+    growth_comparison_fit_field = growth_fit_field
+    growth_comparison_fit_mode = growth_fit_mode
+    growth_comparison_fit_window = growth_fit_window
+    growth_comparison_window_selector = automatic_growth_fit_window
+    growth_comparison_fit_function = exponential_growth_fit
+
+    comparison_growth_model = function(
+        label,
+        series,
+        fit_field,
+        fit_mode,
+        fit_window,
+        window_selector,
+        fit_function,
+    )
+        times = Float64.(getfield.(series, :t))
+        magnetic_field = fit_field == "Mean field ⟨B⟩" ?
+            Float64.(getfield.(series, :Bmean)) :
+            Float64.(getfield.(series, :Brms))
+        reference_index = findfirst(i -> isfinite(times[i]) &&
+            isfinite(magnetic_field[i]) && magnetic_field[i] > 0,
+            eachindex(magnetic_field))
+        B0 = isnothing(reference_index) ? NaN : magnetic_field[reference_index]
+        t0 = isnothing(reference_index) ? NaN : times[reference_index]
+        elapsed_time = times .- t0
+        log_field = map(magnetic_field) do value
+            isfinite(value) && value > 0 ? log(value) : NaN
+        end
+        manual_indices = filter(i -> 1 <= i <= length(times) &&
+            isfinite(times[i]) && isfinite(elapsed_time[i]) &&
+            isfinite(log_field[i]), collect(fit_window))
+        fit_indices = fit_mode == "Automatic" ?
+            window_selector(elapsed_time, log_field) :
+            manual_indices
+        fit = fit_function(elapsed_time, log_field, fit_indices)
+        gamma_error = isfinite(fit.gamma_error) ? fit.gamma_error : 0.0
+        fit_center_time = isempty(fit_indices) ? NaN :
+            mean(elapsed_time[fit_indices])
+        fit_center_log_B = fit.log_amplitude + fit.gamma * fit_center_time
+        fitted_log_ratio = fit.log_amplitude - log(B0) .+
+            fit.gamma .* elapsed_time
+        lower_log_ratio = fit_center_log_B - log(B0) .+
+            (fit.gamma - gamma_error) .* (elapsed_time .- fit_center_time)
+        upper_log_ratio = fit_center_log_B - log(B0) .+
+            (fit.gamma + gamma_error) .* (elapsed_time .- fit_center_time)
+        normalized_field = magnetic_field ./ B0
+        logarithmic_ratio = map(normalized_field) do value
+            isfinite(value) && value > 0 ? log(value) : NaN
+        end
+        (;
+            label,
+            times,
+            magnetic_field,
+            B0,
+            t0,
+            elapsed_time,
+            logarithmic_ratio,
+            fit_indices,
+            fit,
+            gamma_error,
+            fitted_log_ratio,
+            lower_log_ratio,
+            upper_log_ratio,
+        )
+    end
+
+    growth_series_collection = all_series
+    growth_comparison_models = Dict(
+        label => comparison_growth_model(
+            label,
+            growth_series_collection[label],
+            growth_comparison_fit_field,
+            growth_comparison_fit_mode,
+            growth_comparison_fit_window,
+            growth_comparison_window_selector,
+            growth_comparison_fit_function,
+        )
+        for label in comparison_run_labels
+    )
+    finite_growth_log_values = reduce(vcat, [
+        filter(isfinite, model.logarithmic_ratio)
+        for model in values(growth_comparison_models)
+    ]; init = Float64[])
+    for model in values(growth_comparison_models)
+        isempty(model.fit_indices) && continue
+        append!(finite_growth_log_values,
+            filter(isfinite, model.fitted_log_ratio[model.fit_indices]))
+        append!(finite_growth_log_values,
+            filter(isfinite, model.lower_log_ratio[model.fit_indices]))
+        append!(finite_growth_log_values,
+            filter(isfinite, model.upper_log_ratio[model.fit_indices]))
+    end
     growth_log_minimum = isempty(finite_growth_log_values) ? 0.0 :
         minimum(finite_growth_log_values)
     growth_log_maximum = isempty(finite_growth_log_values) ? 1.0 :
@@ -3948,88 +4042,101 @@ begin
         fig_growth = Figure(size = (900, 180))
         Label(fig_growth[1, 1], L"\mathrm{Select\ at\ least\ one\ magnetic-growth\ panel.}", fontsize = 20)
     else
-        fig_growth = Figure(size = (550growth_panel_count, 650))
+        fig_growth = Figure(size = (600growth_panel_count, 720))
         growth_column = 0
+        growth_run_elements = [
+            LineElement(color = run_colors[label], linewidth = 2.6)
+            for label in comparison_run_labels
+        ]
+        growth_run_labels = [
+            begin
+                model = growth_comparison_models[label]
+                if isfinite(model.fit.gamma)
+                    latexstring(
+                        run_label_latex_source(plain_legend_run_label(label)),
+                        raw";\;\Gamma_B=",
+                        @sprintf("%.3g", model.fit.gamma),
+                        raw"\pm",
+                        @sprintf("%.2g", model.gamma_error),
+                        raw"\;\mathrm{Myr}^{-1}",
+                    )
+                else
+                    legend_run_label(label)
+                end
+            end
+            for label in comparison_run_labels
+        ]
         if show_growth_fit_panel
             growth_column += 1
             ag1 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
-                ylabel = L"\ln(B/B_0)")
-            lines!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run],
-                linewidth = 2.5)
-            scatter!(ag1, growth_times, ln_normalized_B; color = run_colors[selected_run], markersize = 8)
-            fit_legend_elements = Any[
-                LineElement(color = run_colors[selected_run], linewidth = 2.5),
-            ]
-            fit_legend_labels = LaTeXString[L"\mathrm{Data}"]
-            if show_growth_fit && isfinite(growth_fit.gamma)
-                fit_t = growth_times[growth_indices]
-                fit_log_ratio = growth_fit.log_amplitude - log(growth_B0) .+
-                    growth_fit.gamma .* growth_elapsed_time[growth_indices]
-                lines!(ag1, fit_t, fit_log_ratio; color = :black, linewidth = 3,
-                    linestyle = :dash)
-                push!(fit_legend_elements,
-                    LineElement(color = :black, linewidth = 3, linestyle = :dash))
-                push!(fit_legend_labels, latexstring(
-                    "\\mathrm{Fit}:\\;\\Gamma_B=",
-                    @sprintf("%.4g", growth_fit.gamma),
-                    "\\pm", @sprintf("%.2g", growth_fit.gamma_error),
-                    "\\;\\mathrm{Myr}^{-1},\\;R^2=",
-                    @sprintf("%.3f", growth_fit.r2),
-                ))
+                ylabel = L"\ln(B/B_0)",
+                title = L"\mathrm{Magnetic\ growth\ and\ exponential\ fits}")
+            for label in comparison_run_labels
+                model = growth_comparison_models[label]
+                color = run_colors[label]
+                lines!(ag1, model.times, model.logarithmic_ratio;
+                    color, linewidth = 2.5)
+                scatter!(ag1, model.times, model.logarithmic_ratio;
+                    color, markersize = 7)
+                if show_growth_fit && isfinite(model.fit.gamma) &&
+                        !isempty(model.fit_indices)
+                    lines!(ag1, model.times[model.fit_indices],
+                        model.fitted_log_ratio[model.fit_indices];
+                        color, linewidth = 3, linestyle = :dash)
+                end
             end
-            growth_has_interval && vspan!(ag1,
-                growth_times[growth_first_index], growth_times[growth_last_index];
-                color = (:gray50, 0.10))
             ylims!(ag1, growth_y_limits...)
-            Legend(fig_growth[2, growth_column], fit_legend_elements,
-                fit_legend_labels; orientation = :vertical, nbanks = 1,
-                tellheight = true, framevisible = false, labelsize = 14)
         end
         if show_growth_theory_panel
             growth_column += 1
             ag2 = latex_axis(fig_growth[1, growth_column], xlabel = L"t\;[\mathrm{Myr}]",
-                ylabel = L"\ln(B/B_0)")
-            lines!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run],
-                linewidth = 2.5)
-            scatter!(ag2, growth_times, ln_normalized_B; color = run_colors[selected_run], markersize = 7)
-            theory_legend_elements = Any[
-                LineElement(color = run_colors[selected_run], linewidth = 2.5),
-            ]
-            theory_legend_labels = LaTeXString[L"\mathrm{Data}"]
-            panel_fit_times = growth_times[growth_indices]
-            for (offset, Γ, curve, color) in zip(
-                    (-1, 1), theory_gammas, theory_B_curves, theory_colors)
-                lines!(ag2, panel_fit_times,
-                    log.(curve[growth_indices] ./ growth_B0); color, linewidth = 2,
-                    linestyle = :dot)
-                push!(theory_legend_elements,
-                    LineElement(color = color, linewidth = 2, linestyle = :dot))
-                push!(theory_legend_labels, latexstring(
-                    "\\Gamma_B^{\\mathrm{fit}}",
-                    offset < 0 ? "-" : "+",
-                    "\\sigma_{\\Gamma_B}=",
-                    @sprintf("%.3g", Γ),
-                    "\\;\\mathrm{Myr}^{-1}"))
+                ylabel = L"\ln(B/B_0)",
+                title = L"\mathrm{Fit\ uncertainty}\;(\Gamma_B\pm\sigma_{\Gamma_B})")
+            for label in comparison_run_labels
+                model = growth_comparison_models[label]
+                color = run_colors[label]
+                lines!(ag2, model.times, model.logarithmic_ratio;
+                    color, linewidth = 2.5)
+                scatter!(ag2, model.times, model.logarithmic_ratio;
+                    color, markersize = 7)
+                if !isempty(model.fit_indices) && isfinite(model.fit.gamma)
+                    fit_times = model.times[model.fit_indices]
+                    lines!(ag2, fit_times,
+                        model.lower_log_ratio[model.fit_indices];
+                        color, linewidth = 1.8, linestyle = :dot)
+                    lines!(ag2, fit_times,
+                        model.upper_log_ratio[model.fit_indices];
+                        color, linewidth = 1.8, linestyle = :dot)
+                    if show_growth_fit
+                        lines!(ag2, fit_times,
+                            model.fitted_log_ratio[model.fit_indices];
+                            color, linewidth = 3, linestyle = :dash)
+                    end
+                end
             end
-            if show_growth_fit && isfinite(growth_fit.gamma)
-                lines!(ag2, panel_fit_times, log.(fitted_ratio_curve[growth_indices]);
-                    color = :black,
-                    linewidth = 2.5, linestyle = :dashdot)
-                push!(theory_legend_elements,
-                    LineElement(color = :black, linewidth = 2.5, linestyle = :dashdot))
-                push!(theory_legend_labels, latexstring(
-                    "\\mathrm{Best\\ fit}:\\;\\Gamma_B=",
-                    @sprintf("%.4g", growth_fit.gamma),
-                    "\\;\\mathrm{Myr}^{-1}"))
-            end
-            growth_has_interval && vspan!(ag2,
-                growth_times[growth_first_index], growth_times[growth_last_index];
-                color = (:gray50, 0.10))
             ylims!(ag2, growth_y_limits...)
-            Legend(fig_growth[2, growth_column], theory_legend_elements,
-                theory_legend_labels; orientation = :vertical, nbanks = 1,
-                tellheight = true, framevisible = false, labelsize = 13)
         end
+
+        growth_legend_layout = GridLayout(fig_growth[2, 1:growth_panel_count])
+        Legend(growth_legend_layout[1, 1],
+            growth_run_elements, growth_run_labels, L"\mathrm{Simulation}";
+            orientation = :horizontal, nbanks = 1,
+            tellheight = true, framevisible = false, labelsize = 14)
+        growth_style_elements = Any[
+            LineElement(color = :gray25, linewidth = 2.5,
+                marker = :circle, markersize = 7),
+            LineElement(color = :gray25, linewidth = 3, linestyle = :dash),
+            LineElement(color = :gray25, linewidth = 1.8, linestyle = :dot),
+        ]
+        growth_style_labels = LaTeXString[
+            L"\mathrm{Snapshots}",
+            L"\mathrm{Best\ fit}",
+            L"\Gamma_B\pm\sigma_{\Gamma_B}",
+        ]
+        Legend(growth_legend_layout[2, 1],
+            growth_style_elements, growth_style_labels, L"\mathrm{Line\ style}";
+            orientation = :horizontal, nbanks = 1,
+            tellheight = true, framevisible = false, labelsize = 14)
         rowgap!(fig_growth.layout, 8)
     end
     display_growth_fit ? fig_growth : nothing
@@ -6748,61 +6855,6 @@ begin
         output
     end
 
-    """
-    Add channel noise whose RM-synthesis image has the requested rms in each
-    of Re F(phi) and Im F(phi).
-
-    For the equal-weight transform F = sum(P_j exp(-2i phi dlambda2_j))/N,
-    independent Q/U noise sigma_channel gives sigma_F =
-    sigma_channel/sqrt(N). Injecting the noise before RM synthesis therefore
-    preserves the Faraday-channel correlations imposed by the RMSF.
-    """
-    function add_moose_faraday_noise!(Q, U, faraday_rms_mK, rng)
-        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
-        ndims(Q) == 3 || error("LoTSS-like MOOSE noise requires Q/U frequency cubes.")
-        sigma_F_K = Float64(faraday_rms_mK) * 1.0e-3
-        isfinite(sigma_F_K) && sigma_F_K >= 0 ||
-            error("MOOSE Faraday-spectrum noise must be finite and non-negative.")
-        sigma_channel_K = sigma_F_K * sqrt(size(Q, 3))
-        if sigma_channel_K > 0
-            noise_buffer = Matrix{Float64}(undef, size(Q, 1), size(Q, 2))
-            @views for channel in axes(Q, 3)
-                randn!(rng, noise_buffer)
-                Q[:, :, channel] .+= sigma_channel_K .* noise_buffer
-                randn!(rng, noise_buffer)
-                U[:, :, channel] .+= sigma_channel_K .* noise_buffer
-            end
-        end
-        Q, U
-    end
-
-    """
-    Choose an RM-synthesis noise level comparable to the polarized signal.
-
-    The signal proxy is the rms polarized brightness across the clean Q/U
-    frequency cube. The requested LoTSS value remains a lower bound, while
-    target_snr controls the signal-to-noise ratio used for the synthetic
-    experiment.
-    """
-    function moose_signal_matched_noise_mK(Q, U, minimum_rms_mK, target_snr)
-        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
-        snr = Float64(target_snr)
-        isfinite(snr) && snr > 0 ||
-            error("The target MOOSE Faraday-spectrum S/N must be positive.")
-        power_sum = 0.0
-        sample_count = 0
-        @inbounds for index in eachindex(Q, U)
-            q_value = Float64(Q[index])
-            u_value = Float64(U[index])
-            if isfinite(q_value) && isfinite(u_value)
-                power_sum += q_value^2 + u_value^2
-                sample_count += 1
-            end
-        end
-        polarized_rms_K = sample_count > 0 ?
-            sqrt(power_sum / sample_count) : 0.0
-        max(Float64(minimum_rms_mK), 1.0e3 * polarized_rms_K / snr)
-    end
 end
 
 # ╔═╡ d6a2f4b1-59ac-4e77-a10a-4b74c0d89231
@@ -7765,10 +7817,6 @@ use all physical and instrumental defaults listed below.
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
-| Add LoTSS-like noise to $F(\phi)$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = true)) |
-| Minimum $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
-| Target Faraday-spectrum signal-to-noise ratio | $(@bind moose_faraday_target_snr PlutoUI.NumberField(0.1:0.1:100.0; default = 1.0)) |
-| Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
 | Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
 | Synchrotron brightness | $(@bind show_moose_I PlutoUI.CheckBox(default = true)) |
@@ -7971,20 +8019,6 @@ begin
         moose_Q_band_K, cube, sky_dims)
     moose_U_band_K = apply_observational_beam_cube(
         moose_U_band_K, cube, sky_dims)
-    moose_applied_faraday_noise_mK = add_moose_noise ?
-        moose_signal_matched_noise_mK(
-            moose_Q_band_K,
-            moose_U_band_K,
-            moose_faraday_noise_mK,
-            moose_faraday_target_snr,
-        ) : 0.0
-    add_moose_noise && add_moose_faraday_noise!(
-        moose_Q_band_K,
-        moose_U_band_K,
-        moose_applied_faraday_noise_mK,
-        MersenneTwister(Int(moose_instrument_seed)),
-    )
-
     moose_lambda0_sq_m2 = mean(moose_band_lambda2_m2)
     moose_rm_phase_matrix = [cis(-2.0 * phi * (lambda2 - moose_lambda0_sq_m2))
         for lambda2 in moose_band_lambda2_m2, phi in moose_phi_axis]
@@ -8037,10 +8071,7 @@ begin
                 instrument_text = latexstring(
                     "\\Delta\\nu=", @sprintf("%.3f", moose_channel_width_value_MHz),
                     "\\;\\mathrm{MHz},\\quad N_\\nu=", moose_nfrequency,
-                    ",\\quad \\sigma_F=",
-                    @sprintf("%.3g", 1.0e-3 * moose_applied_faraday_noise_mK),
-                    "\\;\\mathrm{K\\,RMSF}^{-1},\\quad (S/N)_{F,\\mathrm{target}}=",
-                    @sprintf("%.2g", Float64(moose_faraday_target_snr)))
+                    ",\\quad F(\\phi):\\ \\mathrm{noiseless}")
                 Label(fig_moose_tomography[0, index], instrument_text;
                     fontsize = 14)
                 axislegend(ax; position = :rt, framevisible = false)
@@ -8242,6 +8273,7 @@ $T_{\rm CNM}\leq T<T_{\rm WNM}$, and WNM has $T\geq T_{\rm WNM}$.
 An optional Gaussian EBHIS noise realization is added to every H I velocity
 channel after beam convolution. The same realization is used for all four
 thermal panels so that their differences remain physically interpretable.
+The Faraday-depth cube used by HOG is always noise-free.
 
 | SHINE setting | Control |
 |:--|:--|
@@ -8734,19 +8766,8 @@ begin
         end
         q_band = apply_observational_beam_cube(q_band, c, sky_dims)
         u_band = apply_observational_beam_cube(u_band, c, sky_dims)
-        applied_noise_mK = add_moose_noise ?
-            moose_signal_matched_noise_mK(
-                q_band,
-                u_band,
-                moose_faraday_noise_mK,
-                moose_faraday_target_snr,
-            ) : 0.0
-        add_moose_noise && add_moose_faraday_noise!(
-            q_band,
-            u_band,
-            applied_noise_mK,
-            MersenneTwister(Int(moose_instrument_seed)),
-        )
+        # HOG compares EBHIS-like noisy H I channels with a deterministic,
+        # noise-free Faraday cube.
         polarized_matrix = reshape(complex.(q_band, u_band), :, nfrequency)
         faraday_matrix =
             polarized_matrix * moose_rm_phase_matrix / nfrequency
@@ -8964,17 +8985,13 @@ begin
         Bool(apply_moose_interferometer),
         Float64(moose_largest_scale_pix),
         Float64(moose_smallest_scale_pix),
-        Bool(add_moose_noise),
-        Float64(moose_faraday_noise_mK),
-        Float64(moose_faraday_target_snr),
-        Int(moose_instrument_seed),
     )
     hi_faraday_hog_by_run = Dict{String, Any}()
     for label in comparison_run_labels
         snapshot_path =
             run_files[label][comparison_snapshot_indices[label]]
         hi_faraday_hog_by_run[label] = cached_scientific_product((
-            :hi_faraday_hog_phase_ebhis_v1,
+            :hi_faraday_hog_phase_ebhis_no_faraday_noise_v2,
             cube_signature(snapshot_path),
             hif_hog_parameter_signature,
         )) do
@@ -9039,16 +9056,17 @@ begin
     hif_hog_columns = length(hif_hog_phase_specs)
     hif_hog_run_count = length(comparison_run_labels)
     fig_hi_faraday_hog = Figure(
-        size = (330hif_hog_columns + 260, 570hif_hog_run_count + 190),
-        figure_padding = (30, 30, 35, 60),
+        size = (300hif_hog_columns + 240, 470hif_hog_run_count + 150),
+        figure_padding = (25, 70, 30, 45),
     )
     hif_hog_title = add_shine_ebhis_noise ?
         latexstring(
             "\\mathrm{H\\,I\\!-\\!Faraday\\ HOG\\ by\\ thermal\\ phase},\\quad ",
             "\\sigma_{T_B}^{\\mathrm{EBHIS}}=",
             @sprintf("%.4g", Float64(shine_ebhis_noise_mK)),
-            "\\;\\mathrm{mK\\,channel}^{-1}") :
-        L"\mathrm{H\,I\!-\!Faraday\ HOG\ by\ thermal\ phase}"
+            "\\;\\mathrm{mK\\,channel}^{-1},\\quad ",
+            "F(\\phi):\\ \\mathrm{noiseless}") :
+        L"\mathrm{H\,I\!-\!Faraday\ HOG\ by\ thermal\ phase},\quad F(\phi):\ \mathrm{noiseless}"
     Label(
         fig_hi_faraday_hog[0, 1:hif_hog_columns],
         hif_hog_title;
@@ -9074,7 +9092,7 @@ begin
             )
             heatmap_axis = latex_axis(
                 fig_hi_faraday_hog[heatmap_row, column];
-                xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
+                xlabel = "",
                 ylabel = column == 1 ?
                     L"\phi\;[\mathrm{rad\,m}^{-2}]" : "",
             )
@@ -9122,14 +9140,17 @@ begin
         tickformat = latex_ticklabels,
     )
     for column in 1:hif_hog_columns
-        colsize!(fig_hi_faraday_hog.layout, column, Fixed(300))
+        colsize!(fig_hi_faraday_hog.layout, column, Fixed(280))
     end
-    colsize!(fig_hi_faraday_hog.layout, hif_hog_columns + 1, 24)
+    colsize!(fig_hi_faraday_hog.layout, hif_hog_columns + 1, 38)
+    rowsize!(fig_hi_faraday_hog.layout, 1, Fixed(30))
     for run_index in 1:hif_hog_run_count
-        rowsize!(fig_hi_faraday_hog.layout, 3run_index - 1, Fixed(26))
-        rowsize!(fig_hi_faraday_hog.layout, 3run_index, Relative(0.62))
-        rowsize!(fig_hi_faraday_hog.layout, 3run_index + 1, Relative(0.38))
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index - 1, Fixed(30))
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index, Fixed(260))
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index + 1, Fixed(145))
     end
+    rowgap!(fig_hi_faraday_hog.layout, 8)
+    colgap!(fig_hi_faraday_hog.layout, 12)
     display_hi_faraday_hog ? fig_hi_faraday_hog : nothing
 end
 

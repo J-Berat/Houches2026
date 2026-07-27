@@ -452,7 +452,7 @@ begin
 
     latex_ticklabels(values) = latex_number.(values)
     as_latex(label::LaTeXString) = label
-    as_latex(label::AbstractString) = latexstring(label)
+    as_latex(label::AbstractString) = isempty(label) ? label : latexstring(label)
 
     """
     Create a Makie axis whose labels and numeric tick labels are always
@@ -1701,7 +1701,7 @@ begin
         elseif comparison_kind == :ratio
             forcing_ratio = directory_parameter(name, ["r"])
             !isnothing(forcing_ratio) &&
-                return "R = $(parameter_text(forcing_ratio))"
+                return "χ = $(parameter_text(forcing_ratio))"
             chi = chi_value(root, directory)
             !isnothing(chi) && return "χ = $(parameter_text(chi))"
             occursin(r"_lo_(ratio|chi)$", lowercase(name)) && return "Low χ"
@@ -1855,7 +1855,7 @@ begin
     run_colors = Dict(label => MHD_COLORS[mod1(index, length(MHD_COLORS))]
         for (index, label) in enumerate(run_labels))
     comparison_parameter = comparison_kind == :resolution ? "grid resolution N³" :
-        comparison_kind == :ratio ? "forcing ratio R" :
+        comparison_kind == :ratio ? "forcing ratio χ" :
         comparison_kind == :mach ? "turbulent RMS" : "simulation folder"
 
     function latex_text_source(text)
@@ -1881,7 +1881,7 @@ begin
             return "N=" * value * "^3"
         elseif startswith(text, "R = ")
             value = replace(text, "R = " => ""; count = 1)
-            return "R=" * value
+            return "\\chi=" * value
         elseif startswith(text, "RMS = ")
             value = replace(text, "RMS = " => ""; count = 1)
             return "\\mathrm{RMS}=" * value
@@ -3143,14 +3143,16 @@ begin
                     power_band.upper[valid];
                     color = (run_colors[label], 0.16))
                 slopes = Float64[]
-                for product in products
-                    result = power_law_slope(
-                        getfield(product, spec.kfield),
-                        getfield(product, spec.pfield),
-                        spectrum_fit_k_min,
-                        spectrum_fit_k_max,
-                    )
-                    isfinite(result.slope) && push!(slopes, result.slope)
+                if show_spectrum_slopes
+                    for product in products
+                        result = power_law_slope(
+                            getfield(product, spec.kfield),
+                            getfield(product, spec.pfield),
+                            spectrum_fit_k_min,
+                            spectrum_fit_k_max,
+                        )
+                        isfinite(result.slope) && push!(slopes, result.slope)
+                    end
                 end
                 slope_median, slope_lower, slope_upper =
                     isempty(slopes) ? (NaN, NaN, NaN) :
@@ -3166,6 +3168,28 @@ begin
                         run_label_latex_source(
                             plain_legend_run_label(label)),
                         slope_text))
+                median_fit = show_spectrum_slopes ?
+                    power_law_slope(
+                        k,
+                        power_band.median,
+                        spectrum_fit_k_min,
+                        spectrum_fit_k_max,
+                    ) : nothing
+                if !isnothing(median_fit) && isfinite(median_fit.slope)
+                    fit_k = Float64[median_fit.lower, median_fit.upper]
+                    fit_power = 10.0 .^ (
+                        median_fit.intercept .+
+                        median_fit.slope .* log10.(fit_k)
+                    )
+                    lines!(
+                        axis,
+                        fit_k,
+                        fit_power;
+                        color = run_colors[label],
+                        linewidth = 2,
+                        linestyle = :dash,
+                    )
+                end
                 if any(valid)
                     push!(spectrum_legend_elements,
                         LineElement(color = run_colors[label],
@@ -3552,6 +3576,34 @@ begin
             end
         end
         Q, U
+    end
+
+    """
+    Choose an RM-synthesis noise level comparable to the polarized signal.
+
+    The signal proxy is the rms polarized brightness across the clean Q/U
+    frequency cube. The requested LoTSS value remains a lower bound, while
+    target_snr controls the signal-to-noise ratio used for the synthetic
+    experiment.
+    """
+    function moose_signal_matched_noise_mK(Q, U, minimum_rms_mK, target_snr)
+        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
+        snr = Float64(target_snr)
+        isfinite(snr) && snr > 0 ||
+            error("The target MOOSE Faraday-spectrum S/N must be positive.")
+        power_sum = 0.0
+        sample_count = 0
+        @inbounds for index in eachindex(Q, U)
+            q_value = Float64(Q[index])
+            u_value = Float64(U[index])
+            if isfinite(q_value) && isfinite(u_value)
+                power_sum += q_value^2 + u_value^2
+                sample_count += 1
+            end
+        end
+        polarized_rms_K = sample_count > 0 ?
+            sqrt(power_sum / sample_count) : 0.0
+        max(Float64(minimum_rms_mK), 1.0e3 * polarized_rms_K / snr)
     end
 end
 
@@ -4285,7 +4337,8 @@ use all physical and instrumental defaults listed below.
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
 | Add LoTSS-like noise to $F(\phi)$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = true)) |
-| $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
+| Minimum $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
+| Target Faraday-spectrum signal-to-noise ratio | $(@bind moose_faraday_target_snr PlutoUI.NumberField(0.1:0.1:100.0; default = 1.0)) |
 | Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
 | Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
@@ -4294,7 +4347,7 @@ use all physical and instrumental defaults listed below.
 | Polarization fraction | $(@bind show_moose_fraction PlutoUI.CheckBox(default = true)) |
 | RM-synthesis band start [$\mathrm{MHz}$] | $(@bind moose_band_start_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 120.0)) |
 | RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 167.0)) |
-| Number of frequency channels | $(@bind moose_band_channels PlutoUI.NumberField(2:1:4096; default = 401)) |
+| Frequency-channel width $\Delta\nu$ [$\mathrm{MHz}$] | $(@bind moose_channel_width_MHz PlutoUI.NumberField(0.001:0.001:20.0; default = 0.098)) |
 | Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -10.0)) |
 | Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 10.0)) |
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |

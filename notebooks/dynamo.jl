@@ -452,7 +452,7 @@ begin
 
     latex_ticklabels(values) = latex_number.(values)
     as_latex(label::LaTeXString) = label
-    as_latex(label::AbstractString) = latexstring(label)
+    as_latex(label::AbstractString) = isempty(label) ? label : latexstring(label)
 
     """
     Create a Makie axis whose labels and numeric tick labels are always
@@ -1701,7 +1701,7 @@ begin
         elseif comparison_kind == :ratio
             forcing_ratio = directory_parameter(name, ["r"])
             !isnothing(forcing_ratio) &&
-                return "R = $(parameter_text(forcing_ratio))"
+                return "χ = $(parameter_text(forcing_ratio))"
             chi = chi_value(root, directory)
             !isnothing(chi) && return "χ = $(parameter_text(chi))"
             occursin(r"_lo_(ratio|chi)$", lowercase(name)) && return "Low χ"
@@ -1855,7 +1855,7 @@ begin
     run_colors = Dict(label => MHD_COLORS[mod1(index, length(MHD_COLORS))]
         for (index, label) in enumerate(run_labels))
     comparison_parameter = comparison_kind == :resolution ? "grid resolution N³" :
-        comparison_kind == :ratio ? "forcing ratio R" :
+        comparison_kind == :ratio ? "forcing ratio χ" :
         comparison_kind == :mach ? "turbulent RMS" : "simulation folder"
 
     function latex_text_source(text)
@@ -1881,7 +1881,7 @@ begin
             return "N=" * value * "^3"
         elseif startswith(text, "R = ")
             value = replace(text, "R = " => ""; count = 1)
-            return "R=" * value
+            return "\\chi=" * value
         elseif startswith(text, "RMS = ")
             value = replace(text, "RMS = " => ""; count = 1)
             return "\\mathrm{RMS}=" * value
@@ -5748,14 +5748,16 @@ begin
                     power_band.upper[valid];
                     color = (run_colors[label], 0.16))
                 slopes = Float64[]
-                for product in products
-                    result = power_law_slope(
-                        getfield(product, spec.kfield),
-                        getfield(product, spec.pfield),
-                        spectrum_fit_k_min,
-                        spectrum_fit_k_max,
-                    )
-                    isfinite(result.slope) && push!(slopes, result.slope)
+                if show_spectrum_slopes
+                    for product in products
+                        result = power_law_slope(
+                            getfield(product, spec.kfield),
+                            getfield(product, spec.pfield),
+                            spectrum_fit_k_min,
+                            spectrum_fit_k_max,
+                        )
+                        isfinite(result.slope) && push!(slopes, result.slope)
+                    end
                 end
                 slope_median, slope_lower, slope_upper =
                     isempty(slopes) ? (NaN, NaN, NaN) :
@@ -5771,6 +5773,28 @@ begin
                         run_label_latex_source(
                             plain_legend_run_label(label)),
                         slope_text))
+                median_fit = show_spectrum_slopes ?
+                    power_law_slope(
+                        k,
+                        power_band.median,
+                        spectrum_fit_k_min,
+                        spectrum_fit_k_max,
+                    ) : nothing
+                if !isnothing(median_fit) && isfinite(median_fit.slope)
+                    fit_k = Float64[median_fit.lower, median_fit.upper]
+                    fit_power = 10.0 .^ (
+                        median_fit.intercept .+
+                        median_fit.slope .* log10.(fit_k)
+                    )
+                    lines!(
+                        axis,
+                        fit_k,
+                        fit_power;
+                        color = run_colors[label],
+                        linewidth = 2,
+                        linestyle = :dash,
+                    )
+                end
                 if any(valid)
                     push!(spectrum_legend_elements,
                         LineElement(color = run_colors[label],
@@ -5946,6 +5970,20 @@ begin
             row = cld(panel_index, panel_columns)
             column = mod1(panel_index, panel_columns)
             records = spectrum_time_records[label]
+            slope_values = Float64[]
+            if show_spectrum_slopes
+                for record in records
+                    product = record.product
+                    result = power_law_slope(
+                        getfield(product, spec.kfield),
+                        spec.scale .* getfield(product, spec.pfield),
+                        spectrum_fit_k_min,
+                        spectrum_fit_k_max,
+                    )
+                    isfinite(result.slope) &&
+                        push!(slope_values, result.slope)
+                end
+            end
             plottable_count = count(records) do record
                 product = record.product
                 k = getfield(product, spec.kfield)
@@ -5974,9 +6012,48 @@ begin
                 xminorticksvisible = true,
                 yminorticksvisible = true,
             )
+            if !isempty(slope_values)
+                slope_median, slope_lower, slope_upper =
+                    quantile(slope_values, (0.50, 0.16, 0.84))
+                slope_label = latexstring(
+                    raw"\tilde{\alpha}=",
+                    @sprintf("%.2f", slope_median),
+                    raw"^{+",
+                    @sprintf("%.2f", slope_upper - slope_median),
+                    raw"}_{-",
+                    @sprintf("%.2f", slope_median - slope_lower),
+                    raw"}",
+                )
+                text!(
+                    axis,
+                    0.97,
+                    0.97;
+                    text = slope_label,
+                    space = :relative,
+                    align = (:right, :top),
+                    fontsize = 15,
+                )
+            end
+
+            representative = findfirst(records) do record
+                !isempty(getfield(record.product, spec.kfield))
+            end
+            if show_spectrum_slopes && !isnothing(representative)
+                product = records[representative].product
+                fit_mode_limits = sort(Float64[
+                    spectrum_fit_k_min,
+                    spectrum_fit_k_max,
+                ]) .* Float64(product.box_length_pc) ./ (2pi)
+                vspan!(
+                    axis,
+                    fit_mode_limits...;
+                    color = (:gray55, 0.10),
+                )
+            end
             for record in records
                 product = record.product
-                mode = Float64.(getfield(product, spec.kfield)) .*
+                physical_k = Float64.(getfield(product, spec.kfield))
+                mode = physical_k .*
                     Float64(product.box_length_pc) ./ (2pi)
                 power = spec.scale .* Float64.(getfield(product, spec.pfield))
                 valid = isfinite.(mode) .& isfinite.(power) .&
@@ -5990,9 +6067,29 @@ begin
                     color = (color, 0.35 + 0.65time_fraction),
                     linewidth = 1.2 + 1.8time_fraction,
                 )
-            end
-            representative = findfirst(records) do record
-                !isempty(getfield(record.product, spec.kfield))
+                if show_spectrum_slopes
+                    fit = power_law_slope(
+                        physical_k,
+                        power,
+                        spectrum_fit_k_min,
+                        spectrum_fit_k_max,
+                    )
+                    if isfinite(fit.slope)
+                        fit_k = Float64[fit.lower, fit.upper]
+                        fit_mode = fit_k .* Float64(product.box_length_pc) ./ (2pi)
+                        fit_power = 10.0 .^ (
+                            fit.intercept .+ fit.slope .* log10.(fit_k)
+                        )
+                        lines!(
+                            axis,
+                            fit_mode,
+                            fit_power;
+                            color = (color, 0.65 + 0.35time_fraction),
+                            linewidth = 1.0 + time_fraction,
+                            linestyle = :dash,
+                        )
+                    end
+                end
             end
             if !isnothing(representative)
                 product = records[representative].product

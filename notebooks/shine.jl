@@ -452,7 +452,7 @@ begin
 
     latex_ticklabels(values) = latex_number.(values)
     as_latex(label::LaTeXString) = label
-    as_latex(label::AbstractString) = latexstring(label)
+    as_latex(label::AbstractString) = isempty(label) ? label : latexstring(label)
 
     """
     Create a Makie axis whose labels and numeric tick labels are always
@@ -1701,7 +1701,7 @@ begin
         elseif comparison_kind == :ratio
             forcing_ratio = directory_parameter(name, ["r"])
             !isnothing(forcing_ratio) &&
-                return "R = $(parameter_text(forcing_ratio))"
+                return "χ = $(parameter_text(forcing_ratio))"
             chi = chi_value(root, directory)
             !isnothing(chi) && return "χ = $(parameter_text(chi))"
             occursin(r"_lo_(ratio|chi)$", lowercase(name)) && return "Low χ"
@@ -1855,7 +1855,7 @@ begin
     run_colors = Dict(label => MHD_COLORS[mod1(index, length(MHD_COLORS))]
         for (index, label) in enumerate(run_labels))
     comparison_parameter = comparison_kind == :resolution ? "grid resolution N³" :
-        comparison_kind == :ratio ? "forcing ratio R" :
+        comparison_kind == :ratio ? "forcing ratio χ" :
         comparison_kind == :mach ? "turbulent RMS" : "simulation folder"
 
     function latex_text_source(text)
@@ -1881,7 +1881,7 @@ begin
             return "N=" * value * "^3"
         elseif startswith(text, "R = ")
             value = replace(text, "R = " => ""; count = 1)
-            return "R=" * value
+            return "\\chi=" * value
         elseif startswith(text, "RMS = ")
             value = replace(text, "RMS = " => ""; count = 1)
             return "\\mathrm{RMS}=" * value
@@ -3765,14 +3765,16 @@ begin
                     power_band.upper[valid];
                     color = (run_colors[label], 0.16))
                 slopes = Float64[]
-                for product in products
-                    result = power_law_slope(
-                        getfield(product, spec.kfield),
-                        getfield(product, spec.pfield),
-                        spectrum_fit_k_min,
-                        spectrum_fit_k_max,
-                    )
-                    isfinite(result.slope) && push!(slopes, result.slope)
+                if show_spectrum_slopes
+                    for product in products
+                        result = power_law_slope(
+                            getfield(product, spec.kfield),
+                            getfield(product, spec.pfield),
+                            spectrum_fit_k_min,
+                            spectrum_fit_k_max,
+                        )
+                        isfinite(result.slope) && push!(slopes, result.slope)
+                    end
                 end
                 slope_median, slope_lower, slope_upper =
                     isempty(slopes) ? (NaN, NaN, NaN) :
@@ -3788,6 +3790,28 @@ begin
                         run_label_latex_source(
                             plain_legend_run_label(label)),
                         slope_text))
+                median_fit = show_spectrum_slopes ?
+                    power_law_slope(
+                        k,
+                        power_band.median,
+                        spectrum_fit_k_min,
+                        spectrum_fit_k_max,
+                    ) : nothing
+                if !isnothing(median_fit) && isfinite(median_fit.slope)
+                    fit_k = Float64[median_fit.lower, median_fit.upper]
+                    fit_power = 10.0 .^ (
+                        median_fit.intercept .+
+                        median_fit.slope .* log10.(fit_k)
+                    )
+                    lines!(
+                        axis,
+                        fit_k,
+                        fit_power;
+                        color = run_colors[label],
+                        linewidth = 2,
+                        linestyle = :dash,
+                    )
+                end
                 if any(valid)
                     push!(spectrum_legend_elements,
                         LineElement(color = run_colors[label],
@@ -4174,6 +4198,34 @@ begin
             end
         end
         Q, U
+    end
+
+    """
+    Choose an RM-synthesis noise level comparable to the polarized signal.
+
+    The signal proxy is the rms polarized brightness across the clean Q/U
+    frequency cube. The requested LoTSS value remains a lower bound, while
+    target_snr controls the signal-to-noise ratio used for the synthetic
+    experiment.
+    """
+    function moose_signal_matched_noise_mK(Q, U, minimum_rms_mK, target_snr)
+        size(Q) == size(U) || error("MOOSE Q/U cubes must have identical shapes.")
+        snr = Float64(target_snr)
+        isfinite(snr) && snr > 0 ||
+            error("The target MOOSE Faraday-spectrum S/N must be positive.")
+        power_sum = 0.0
+        sample_count = 0
+        @inbounds for index in eachindex(Q, U)
+            q_value = Float64(Q[index])
+            u_value = Float64(U[index])
+            if isfinite(q_value) && isfinite(u_value)
+                power_sum += q_value^2 + u_value^2
+                sample_count += 1
+            end
+        end
+        polarized_rms_K = sample_count > 0 ?
+            sqrt(power_sum / sample_count) : 0.0
+        max(Float64(minimum_rms_mK), 1.0e3 * polarized_rms_K / snr)
     end
 end
 
@@ -4613,7 +4665,8 @@ use all physical and instrumental defaults listed below.
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
 | Add LoTSS-like noise to $F(\phi)$ | $(@bind add_moose_noise PlutoUI.CheckBox(default = true)) |
-| $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
+| Minimum $F(\phi)$ rms noise [$\mathrm{mK\,RMSF^{-1}}$] | $(@bind moose_faraday_noise_mK PlutoUI.NumberField(0.0:1.0:1000.0; default = 60.0)) |
+| Target Faraday-spectrum signal-to-noise ratio | $(@bind moose_faraday_target_snr PlutoUI.NumberField(0.1:0.1:100.0; default = 1.0)) |
 | Instrument random seed | $(@bind moose_instrument_seed PlutoUI.NumberField(0:1:100000; default = 42)) |
 | Display shifted $uv$ transfer mask | $(@bind show_moose_uv_mask PlutoUI.CheckBox(default = false)) |
 | Faraday-depth map | $(@bind show_moose_phi PlutoUI.CheckBox(default = true)) |
@@ -4622,7 +4675,7 @@ use all physical and instrumental defaults listed below.
 | Polarization fraction | $(@bind show_moose_fraction PlutoUI.CheckBox(default = true)) |
 | RM-synthesis band start [$\mathrm{MHz}$] | $(@bind moose_band_start_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 120.0)) |
 | RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 167.0)) |
-| Number of frequency channels | $(@bind moose_band_channels PlutoUI.NumberField(2:1:4096; default = 401)) |
+| Frequency-channel width $\Delta\nu$ [$\mathrm{MHz}$] | $(@bind moose_channel_width_MHz PlutoUI.NumberField(0.001:0.001:20.0; default = 0.098)) |
 | Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -10.0)) |
 | Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 10.0)) |
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
@@ -4767,14 +4820,17 @@ end
 begin
     moose_band_lo = min(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
     moose_band_hi = max(Float64(moose_band_start_MHz), Float64(moose_band_end_MHz))
-    moose_nfrequency = max(Int(moose_band_channels), 2)
     moose_band_hi > moose_band_lo ||
         error("The MOOSE RM-synthesis band must have a non-zero width.")
-    moose_band_frequency_MHz = collect(range(
-        moose_band_lo,
-        moose_band_hi;
-        length = moose_nfrequency,
-    ))
+    moose_channel_width_value_MHz = Float64(moose_channel_width_MHz)
+    isfinite(moose_channel_width_value_MHz) &&
+        moose_channel_width_value_MHz > 0 ||
+        error("The MOOSE frequency-channel width must be positive.")
+    moose_band_frequency_MHz = collect(
+        moose_band_lo:moose_channel_width_value_MHz:moose_band_hi)
+    length(moose_band_frequency_MHz) >= 2 ||
+        error("The MOOSE band must contain at least two frequency channels.")
+    moose_nfrequency = length(moose_band_frequency_MHz)
     moose_band_frequency_Hz = moose_band_frequency_MHz .* 1.0e6
     moose_band_lambda2_m2 = (299_792_458.0 ./ moose_band_frequency_Hz) .^ 2
     moose_phi_lo = min(Float64(moose_phi_min), Float64(moose_phi_max))
@@ -4806,10 +4862,17 @@ begin
         moose_Q_band_K, cube, sky_dims)
     moose_U_band_K = apply_observational_beam_cube(
         moose_U_band_K, cube, sky_dims)
+    moose_applied_faraday_noise_mK = add_moose_noise ?
+        moose_signal_matched_noise_mK(
+            moose_Q_band_K,
+            moose_U_band_K,
+            moose_faraday_noise_mK,
+            moose_faraday_target_snr,
+        ) : 0.0
     add_moose_noise && add_moose_faraday_noise!(
         moose_Q_band_K,
         moose_U_band_K,
-        moose_faraday_noise_mK,
+        moose_applied_faraday_noise_mK,
         MersenneTwister(Int(moose_instrument_seed)),
     )
 
@@ -4838,6 +4901,11 @@ Synthetic $\mathrm{H\,I}$ 21-cm transfer with CNM, LNM, and WNM components.
 **Display the spatial power spectra:** $(@bind display_shine_power_spectra PlutoUI.CheckBox(default = true))
 **Display the H I velocity RGB composite:** $(@bind display_shine_rgb PlutoUI.CheckBox(default = true))
 **Display the H I--Faraday HOG comparison:** $(@bind display_hi_faraday_hog PlutoUI.CheckBox(default = true))
+
+The H I--Faraday HOG is decomposed into total H I, CNM, LNM, and WNM
+velocity cubes. The phase-resolved cubes use the temperature cuts below:
+CNM has $T<T_{\rm CNM}$, LNM has
+$T_{\rm CNM}\leq T<T_{\rm WNM}$, and WNM has $T\geq T_{\rm WNM}$.
 
 | SHINE setting | Control |
 |:--|:--|
@@ -5148,29 +5216,52 @@ begin
             (c.vx, c.vy, c.vz)[los_dim],
             permutation,
         )
-        hi_cube = zeros(
-            Float64,
-            size(local_nhi, 1),
-            size(local_nhi, 2),
-            length(shine_velocity_axis),
+        cold_boundary = min(Float64(shine_TCNM), Float64(shine_TWNM))
+        warm_boundary = max(Float64(shine_TCNM), Float64(shine_TWNM))
+        phase_density_cubes = (
+            total = local_nhi,
+            cnm = ifelse.(local_hi_temperature .< cold_boundary,
+                local_nhi, 0.0),
+            lnm = ifelse.(
+                (local_hi_temperature .>= cold_boundary) .&
+                (local_hi_temperature .< warm_boundary),
+                local_nhi,
+                0.0,
+            ),
+            wnm = ifelse.(local_hi_temperature .>= warm_boundary,
+                local_nhi, 0.0),
         )
         thermal_mu = max(Float64(shine_thermal_mu), eps(Float64))
         fixed_width = max(Float64(shine_fixed_width_kms), 0.0)
-        Threads.@threads for i in axes(local_nhi, 1)
-            for j in axes(local_nhi, 2)
-                brightness, _ = shine_hi_spectrum(
-                    @view(local_nhi[i, j, :]),
-                    @view(local_velocity[i, j, :]),
-                    @view(local_hi_temperature[i, j, :]),
-                    shine_velocity_axis,
-                    local_dx_cm,
-                    thermal_mu,
-                    fixed_width,
-                )
-                hi_cube[i, j, :] .= brightness
+        function phase_brightness_cube(phase_density)
+            brightness_cube = zeros(
+                Float64,
+                size(local_nhi, 1),
+                size(local_nhi, 2),
+                length(shine_velocity_axis),
+            )
+            Threads.@threads for i in axes(local_nhi, 1)
+                for j in axes(local_nhi, 2)
+                    brightness, _ = shine_hi_spectrum(
+                        @view(phase_density[i, j, :]),
+                        @view(local_velocity[i, j, :]),
+                        @view(local_hi_temperature[i, j, :]),
+                        shine_velocity_axis,
+                        local_dx_cm,
+                        thermal_mu,
+                        fixed_width,
+                    )
+                    brightness_cube[i, j, :] .= brightness
+                end
             end
+            apply_observational_beam_cube(brightness_cube, c, sky_dims)
         end
-        hi_cube = apply_observational_beam_cube(hi_cube, c, sky_dims)
+        hi_cubes = (
+            total = phase_brightness_cube(phase_density_cubes.total),
+            cnm = phase_brightness_cube(phase_density_cubes.cnm),
+            lnm = phase_brightness_cube(phase_density_cubes.lnm),
+            wnm = phase_brightness_cube(phase_density_cubes.wnm),
+        )
 
         local_number_density = number_density(c.rho)
         local_ne = moose_electron_density(local_number_density, local_temperature)
@@ -5221,10 +5312,17 @@ begin
         end
         q_band = apply_observational_beam_cube(q_band, c, sky_dims)
         u_band = apply_observational_beam_cube(u_band, c, sky_dims)
+        applied_noise_mK = add_moose_noise ?
+            moose_signal_matched_noise_mK(
+                q_band,
+                u_band,
+                moose_faraday_noise_mK,
+                moose_faraday_target_snr,
+            ) : 0.0
         add_moose_noise && add_moose_faraday_noise!(
             q_band,
             u_band,
-            moose_faraday_noise_mK,
+            applied_noise_mK,
             MersenneTwister(Int(moose_instrument_seed)),
         )
         polarized_matrix = reshape(complex.(q_band, u_band), :, nfrequency)
@@ -5235,7 +5333,7 @@ begin
             map_shape...,
             length(moose_phi_axis),
         ))
-        hi_cube, faraday_cube
+        hi_cubes, faraday_cube
     end
 
     function hif_hog_channel_indices(channel_count, maximum_count)
@@ -5391,12 +5489,20 @@ begin
     end
 
     function hi_faraday_hog_for_cube(c)
-        hi_cube, faraday_cube = hi_faraday_observable_cubes(c)
-        hi_faraday_hog_product(
-            hi_cube,
-            shine_velocity_axis,
-            faraday_cube,
-            moose_phi_axis,
+        hi_cubes, faraday_cube = hi_faraday_observable_cubes(c)
+        (
+            total = hi_faraday_hog_product(
+                hi_cubes.total, shine_velocity_axis,
+                faraday_cube, moose_phi_axis),
+            cnm = hi_faraday_hog_product(
+                hi_cubes.cnm, shine_velocity_axis,
+                faraday_cube, moose_phi_axis),
+            lnm = hi_faraday_hog_product(
+                hi_cubes.lnm, shine_velocity_axis,
+                faraday_cube, moose_phi_axis),
+            wnm = hi_faraday_hog_product(
+                hi_cubes.wnm, shine_velocity_axis,
+                faraday_cube, moose_phi_axis),
         )
     end
 
@@ -5407,6 +5513,8 @@ begin
         Float64(shine_mu_H),
         Float64(shine_thermal_mu),
         Float64(shine_fixed_width_kms),
+        Float64(shine_TCNM_value),
+        Float64(shine_TWNM_value),
         first(shine_velocity_axis),
         last(shine_velocity_axis),
         length(shine_velocity_axis),
@@ -5433,6 +5541,7 @@ begin
         Float64(moose_smallest_scale_pix),
         Bool(add_moose_noise),
         Float64(moose_faraday_noise_mK),
+        Float64(moose_faraday_target_snr),
         Int(moose_instrument_seed),
     )
     hi_faraday_hog_by_run = Dict{String, Any}()
@@ -5440,103 +5549,155 @@ begin
         snapshot_path =
             run_files[label][comparison_snapshot_indices[label]]
         hi_faraday_hog_by_run[label] = cached_scientific_product((
-            :hi_faraday_hog_v1,
+            :hi_faraday_hog_phase_v1,
             cube_signature(snapshot_path),
             hif_hog_parameter_signature,
         )) do
-            if label == selected_run &&
-                    snapshot_path == selected_path
-                hi_faraday_hog_product(
-                    shine_Tb,
-                    shine_velocity_axis,
-                    moose_F_abs,
-                    moose_phi_axis,
-                )
-            else
-                hi_faraday_hog_for_cube(comparison_cube(label))
-            end
+            hi_faraday_hog_for_cube(
+                label == selected_run && snapshot_path == selected_path ?
+                    cube : comparison_cube(label))
         end
     end
 
+    hif_hog_phase_specs = [
+        (
+            key = :total,
+            title = L"\mathrm{H\,I}",
+            color = MHD_COLORS[1],
+        ),
+        (
+            key = :cnm,
+            title = latexstring(
+                "\\mathrm{CNM}:\\ T<",
+                @sprintf("%.4g", shine_TCNM_value),
+                "\\;\\mathrm{K}"),
+            color = MHD_COLORS[2],
+        ),
+        (
+            key = :lnm,
+            title = latexstring(
+                "\\mathrm{LNM}:\\ ",
+                @sprintf("%.4g", shine_TCNM_value),
+                "\\leq T<",
+                @sprintf("%.4g", shine_TWNM_value),
+                "\\;\\mathrm{K}"),
+            color = MHD_COLORS[3],
+        ),
+        (
+            key = :wnm,
+            title = latexstring(
+                "\\mathrm{WNM}:\\ T\\geq",
+                @sprintf("%.4g", shine_TWNM_value),
+                "\\;\\mathrm{K}"),
+            color = MHD_COLORS[4],
+        ),
+    ]
     hif_hog_positive_values = vcat([
         filter(
             value -> isfinite(value) && value > 0,
-            vec(hi_faraday_hog_by_run[label].statistic),
+            vec(getproperty(hi_faraday_hog_by_run[label], phase.key).statistic),
         )
         for label in comparison_run_labels
+        for phase in hif_hog_phase_specs
     ]...)
     hif_hog_color_maximum = isempty(hif_hog_positive_values) ? 1.0 :
         max(quantile(hif_hog_positive_values, 0.995), eps(Float64))
     hif_hog_profile_maximum = maximum(
         vcat([
-            hi_faraday_hog_by_run[label].profile
+            getproperty(hi_faraday_hog_by_run[label], phase.key).profile
             for label in comparison_run_labels
+            for phase in hif_hog_phase_specs
         ]...);
         init = hif_hog_color_maximum,
     )
 
-    hif_hog_columns = length(comparison_run_labels)
+    hif_hog_columns = length(hif_hog_phase_specs)
+    hif_hog_run_count = length(comparison_run_labels)
     fig_hi_faraday_hog = Figure(
-        size = (400hif_hog_columns + 100, 690),
+        size = (330hif_hog_columns + 260, 570hif_hog_run_count + 190),
+        figure_padding = (30, 30, 35, 60),
     )
     Label(
         fig_hi_faraday_hog[0, 1:hif_hog_columns],
-        L"\mathrm{H\,I\!-\!Faraday\ HOG}";
+        L"\mathrm{H\,I\!-\!Faraday\ HOG\ by\ thermal\ phase}";
         fontsize = 23,
     )
+    for (column, phase) in enumerate(hif_hog_phase_specs)
+        Label(fig_hi_faraday_hog[1, column], phase.title; fontsize = 18)
+    end
     hif_hog_heatmaps = Any[]
-    for (column, label) in enumerate(comparison_run_labels)
-        product = hi_faraday_hog_by_run[label]
-        heatmap_axis = latex_axis(
-            fig_hi_faraday_hog[1, column];
-            xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
-            ylabel = L"\phi\;[\mathrm{rad\,m}^{-2}]",
-            title = legend_run_label(label),
+    for (run_index, label) in enumerate(comparison_run_labels)
+        run_label_row = 3run_index - 1
+        heatmap_row = run_label_row + 1
+        profile_row = heatmap_row + 1
+        Label(
+            fig_hi_faraday_hog[run_label_row, 1:hif_hog_columns],
+            legend_run_label(label);
+            fontsize = 17,
         )
-        heatmap_plot = heatmap!(
-            heatmap_axis,
-            product.velocity,
-            product.phi,
-            product.statistic;
-            colormap = :inferno,
-            colorrange = (0.0, hif_hog_color_maximum),
-        )
-        push!(hif_hog_heatmaps, heatmap_plot)
+        for (column, phase) in enumerate(hif_hog_phase_specs)
+            product = getproperty(
+                hi_faraday_hog_by_run[label],
+                phase.key,
+            )
+            heatmap_axis = latex_axis(
+                fig_hi_faraday_hog[heatmap_row, column];
+                xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
+                ylabel = column == 1 ?
+                    L"\phi\;[\mathrm{rad\,m}^{-2}]" : "",
+            )
+            heatmap_plot = heatmap!(
+                heatmap_axis,
+                product.velocity,
+                product.phi,
+                product.statistic;
+                colormap = :inferno,
+                colorrange = (0.0, hif_hog_color_maximum),
+            )
+            push!(hif_hog_heatmaps, heatmap_plot)
 
-        profile_axis = latex_axis(
-            fig_hi_faraday_hog[2, column];
-            xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
-            ylabel = L"\tilde{V}_{98}",
-        )
-        lines!(
-            profile_axis,
-            product.velocity,
-            product.profile;
-            color = run_colors[label],
-            linewidth = 2.5,
-        )
-        scatter!(
-            profile_axis,
-            product.velocity,
-            product.profile;
-            color = run_colors[label],
-            markersize = 5,
-        )
-        ylims!(
-            profile_axis,
-            0.0,
-            max(1.08hif_hog_profile_maximum, eps(Float64)),
-        )
+            profile_axis = latex_axis(
+                fig_hi_faraday_hog[profile_row, column];
+                xlabel = L"u\;[\mathrm{km\,s}^{-1}]",
+                ylabel = column == 1 ? L"\tilde{V}_{98}" : "",
+            )
+            lines!(
+                profile_axis,
+                product.velocity,
+                product.profile;
+                color = phase.color,
+                linewidth = 2.5,
+            )
+            scatter!(
+                profile_axis,
+                product.velocity,
+                product.profile;
+                color = phase.color,
+                markersize = 5,
+            )
+            ylims!(
+                profile_axis,
+                0.0,
+                max(1.08hif_hog_profile_maximum, eps(Float64)),
+            )
+        end
     end
     latex_colorbar(
-        fig_hi_faraday_hog[1, hif_hog_columns + 1],
+        fig_hi_faraday_hog[3:(3hif_hog_run_count + 1),
+            hif_hog_columns + 1],
         first(hif_hog_heatmaps);
         label = L"\tilde{V}_{+}",
         tickformat = latex_ticklabels,
     )
+    for column in 1:hif_hog_columns
+        colsize!(fig_hi_faraday_hog.layout, column, Fixed(300))
+    end
     colsize!(fig_hi_faraday_hog.layout, hif_hog_columns + 1, 24)
-    rowsize!(fig_hi_faraday_hog.layout, 1, Relative(0.62))
-    rowsize!(fig_hi_faraday_hog.layout, 2, Relative(0.38))
+    for run_index in 1:hif_hog_run_count
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index - 1, Fixed(26))
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index, Relative(0.62))
+        rowsize!(fig_hi_faraday_hog.layout, 3run_index + 1, Relative(0.38))
+    end
     display_hi_faraday_hog ? fig_hi_faraday_hog : nothing
 end
 

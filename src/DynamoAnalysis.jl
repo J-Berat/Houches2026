@@ -5,7 +5,7 @@ using Printf
 import REPL
 
 export BatchConfig, available_figures, available_notebooks,
-    figures_for_notebooks, run_batch
+    figures_for_notebooks, split_figures_by_los, run_batch
 
 const PROJECT_DIRECTORY = normpath(joinpath(@__DIR__, ".."))
 const MASTER_NOTEBOOK =
@@ -32,6 +32,7 @@ const BATCH_DISPLAY_FLAGS = Dict(
     "growth_rate_relations" => :display_gamma_relations,
     "normalized_magnetic_relations" => :display_normalized_B_relations,
     "energy_time" => :display_energy_time,
+    "moose_rmsf" => :display_moose_rmsf,
     "summary" => :display_phase_B_time,
     "polarization_intensity" => :display_polarization_intensity_histograms,
     "polarization_time" => :display_polarization_time,

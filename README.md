@@ -108,12 +108,16 @@ Les extensions reconnues sont `.h5`, `.hdf5`, `.fits`, `.fit` et `.fts`.
 
 The run lists and folders are configured near the top of `run_figures.jl`.
 `SELECTED_COMPARISONS` can contain `mach`, `resolution`, and/or `ratio`.
-For each selected comparison, the script creates two jobs:
+For each selected comparison and snapshot window, the script separates the
+requested figures into:
 
-- the first 20 snapshots for all 24 Dynamo figures, including separate 3D and
-  projected 2D HRO outputs and a seven-panel summary figure;
-- the last 10 snapshots for all 23 figures from Dust, StarlightPol, ZEEMAN,
-  MOOSE, and SHINE.
+- one `common` job for LOS-independent 3D and temporal diagnostics;
+- one job in each of `los_x`, `los_y`, and `los_z` for projected maps,
+  synthetic observations, 2D statistics, and mixed summary figures.
+
+Dynamo still uses the first 20 snapshots. Dust, StarlightPol, ZEEMAN, MOOSE,
+and SHINE still use the last 10 snapshots. The `common` products are not
+recomputed for each viewing direction.
 
 In batch mode, the comparative density PDFs, magnetic-field--density relation,
 3D HRO, 2D HRO, and power spectra use every selected snapshot. Their solid
@@ -139,7 +143,19 @@ zeroth, first, and second brightness-temperature moments. The spectra show
 azimuthal-mode uncertainty, the fitted interval and slope, a forcing-scale
 guide, and the projected Nyquist limit.
 
-Check all six planned jobs without computing:
+MOOSE uses a fixed physical line-of-sight depth of 100 pc for Faraday rotation
+and synchrotron-emissivity integration. Its default LoTSS band is
+120--168 MHz with 97.6 kHz channels. The MOOSE batch also exports the
+rotation-measure spread function, including its measured and theoretical FWHM,
+complex response, and strongest sidelobe level. The H I--Faraday HOG follows
+the noise experiment of Berat et al. (2026): independent white Gaussian noise
+is added to every native-resolution H I velocity channel with the default
+\(\sigma_{\rm EBHIS}=90\,\mathrm{mK}\), without an EBHIS beam convolution.
+Each simulation has a reproducible, independent realization; the Faraday cube
+remains noise-free.
+
+Check all 24 planned jobs (three comparisons × two snapshot windows ×
+`common` plus three LOS folders) without computing:
 
 ```bash
 DYNAMO_DRY_RUN=true \
@@ -159,13 +175,19 @@ The generated files are separated by comparison and snapshot window:
 figures/
 ├── varying_mach/
 │   ├── dynamo_first20/
+│   │   ├── common/
+│   │   ├── los_x/
+│   │   ├── los_y/
+│   │   └── los_z/
 │   └── observables_last10/
+│       ├── common/
+│       ├── los_x/
+│       ├── los_y/
+│       └── los_z/
 ├── varying_resolution/
-│   ├── dynamo_first20/
-│   └── observables_last10/
+│   └── ...
 └── varying_ratio/
-    ├── dynamo_first20/
-    └── observables_last10/
+    └── ...
 ```
 
 Le moteur batch :

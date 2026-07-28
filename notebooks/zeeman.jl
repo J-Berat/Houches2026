@@ -42,6 +42,7 @@ begin
     KM_CM = 1.0e5                    # cm
     GAUSS_TO_MICROGAUSS = 1.0e6
     PHYSICAL_BOX_LENGTH_PC = 100.0
+    MOOSE_PATH_LENGTH_PC = 100.0
 
     # Persistent caches. This cell has no reactive dependency, so Pluto runs it
     # once per session and the caches survive every widget change. RAW_CUBE_CACHE

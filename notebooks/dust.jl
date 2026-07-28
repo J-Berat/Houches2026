@@ -42,6 +42,7 @@ begin
     KM_CM = 1.0e5                    # cm
     GAUSS_TO_MICROGAUSS = 1.0e6
     PHYSICAL_BOX_LENGTH_PC = 100.0
+    MOOSE_PATH_LENGTH_PC = 100.0
 
     # Persistent caches. This cell has no reactive dependency, so Pluto runs it
     # once per session and the caches survive every widget change. RAW_CUBE_CACHE
@@ -4261,6 +4262,7 @@ use all physical and instrumental defaults listed below.
 |:--|:--:|
 | Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = false)) |
 | Faraday tomography | $(@bind display_moose_tomography PlutoUI.CheckBox(default = true)) |
+| Rotation-measure spread function | $(@bind display_moose_rmsf PlutoUI.CheckBox(default = true)) |
 | Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = false)) |
 | Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = false)) |
 
@@ -4279,6 +4281,7 @@ use all physical and instrumental defaults listed below.
 | Synchrotron cosmic-ray electron index $p$ | $(@bind moose_cr_index PlutoUI.NumberField(1.0:0.1:5.0; default = 3.0)) |
 | Observing frequency [$\mathrm{MHz}$] | $(@bind moose_frequency_MHz PlutoUI.NumberField(50.0:1.0:2000.0; default = 150.0)) |
 | Synchrotron normalization [$\mathrm{K}\,(\mu\mathrm{G})^{-(p+1)/2}\,\mathrm{pc}^{-1}$] | $(@bind moose_synchrotron_norm PlutoUI.NumberField(default = 1.0)) |
+| Physical MOOSE LOS depth | **$(@sprintf("%.0f", MOOSE_PATH_LENGTH_PC)) pc (fixed)** |
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
@@ -4288,8 +4291,8 @@ use all physical and instrumental defaults listed below.
 | Polarized brightness | $(@bind show_moose_P PlutoUI.CheckBox(default = true)) |
 | Polarization fraction | $(@bind show_moose_fraction PlutoUI.CheckBox(default = true)) |
 | RM-synthesis band start [$\mathrm{MHz}$] | $(@bind moose_band_start_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 120.0)) |
-| RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 167.0)) |
-| Frequency-channel width $\Delta\nu$ [$\mathrm{MHz}$] | $(@bind moose_channel_width_MHz PlutoUI.NumberField(0.001:0.001:20.0; default = 0.098)) |
+| RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 168.0)) |
+| Frequency-channel width $\Delta\nu$ [$\mathrm{MHz}$] | $(@bind moose_channel_width_MHz PlutoUI.NumberField(0.0001:0.0001:20.0; default = 0.0976)) |
 | Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -10.0)) |
 | Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 10.0)) |
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
@@ -4364,7 +4367,10 @@ begin
     moose_Bsky1_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[1]]
     moose_Bsky2_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[2]]
     moose_Bperp_uG = sqrt.(moose_Bsky1_uG .^ 2 .+ moose_Bsky2_uG .^ 2)
-    moose_phi_increment = 0.812 .* moose_ne .* moose_Blos_uG .* dx_los_pc
+    moose_dx_los_pc =
+        Float64(MOOSE_PATH_LENGTH_PC) / size(cube.rho, los_dim)
+    moose_phi_increment =
+        0.812 .* moose_ne .* moose_Blos_uG .* moose_dx_los_pc
     moose_phi_to_cell = cumsum(moose_phi_increment; dims = los_dim) .- 0.5 .* moose_phi_increment
     moose_phi_map = finite_sum_dims(moose_phi_increment, los_dim)
 
@@ -4377,11 +4383,12 @@ begin
     moose_intrinsic_angle = atan.(moose_Bsky2_uG, moose_Bsky1_uG) .+ pi / 2
     moose_lambda2_m2 = (299_792_458.0 / (Float64(moose_frequency_MHz) * 1.0e6))^2
     moose_polarization_phase = 2 .* (moose_intrinsic_angle .+ moose_phi_to_cell .* moose_lambda2_m2)
-    moose_I_K = finite_sum_dims(moose_emissivity_Kpc, los_dim) .* dx_los_pc
+    moose_I_K =
+        finite_sum_dims(moose_emissivity_Kpc, los_dim) .* moose_dx_los_pc
     moose_Q_K = finite_sum_dims(moose_emissivity_Kpc .* cos.(moose_polarization_phase),
-        los_dim) .* dx_los_pc
+        los_dim) .* moose_dx_los_pc
     moose_U_K = finite_sum_dims(moose_emissivity_Kpc .* sin.(moose_polarization_phase),
-        los_dim) .* dx_los_pc
+        los_dim) .* moose_dx_los_pc
     moose_uv_transfer = moose_instrument_transfer(size(moose_I_K),
         moose_largest_scale_pix, moose_smallest_scale_pix)
     if apply_moose_interferometer

@@ -20,6 +20,15 @@ const SELECTED_COMPARISONS = [
     "ratio",
 ]
 
+# Every projected or synthetic-observation figure is generated for these
+# viewing axes. Figures that do not depend on the LOS are generated once in
+# the sibling `common` directory.
+const SELECTED_LINES_OF_SIGHT = [
+    "x",
+    "y",
+    "z",
+]
+
 const COMPARISONS = [
     (
         key = "mach",
@@ -71,12 +80,21 @@ isempty(UNKNOWN_COMPARISONS) || error(
     "Available comparisons: " * join(getproperty.(COMPARISONS, :key), ", "),
 )
 
+const UNKNOWN_LINES_OF_SIGHT =
+    setdiff(lowercase.(SELECTED_LINES_OF_SIGHT), ["x", "y", "z"])
+isempty(UNKNOWN_LINES_OF_SIGHT) || error(
+    "Unknown lines of sight: $(join(UNKNOWN_LINES_OF_SIGHT, ", ")). " *
+    "Available values: x, y, z.",
+)
+
 function batch_config(
         comparison,
-        notebooks,
+        figures,
         snapshot_window,
         snapshot_count,
         output_group,
+        output_subdirectory,
+        line_of_sight,
     )
     BatchConfig(
         data_repository = joinpath(
@@ -87,16 +105,60 @@ function batch_config(
         snapshot = :last,
         snapshot_window = snapshot_window,
         snapshot_count = snapshot_count,
-        line_of_sight = "z",
-        figures = figures_for_notebooks(notebooks),
+        line_of_sight = line_of_sight,
+        figures = figures,
         output_directory = joinpath(
             PROJECT_DIRECTORY,
             "figures",
             comparison.output_name,
             "$(output_group)_$(snapshot_window)$(snapshot_count)",
+            output_subdirectory,
         ),
         output_format = "png",
     )
+end
+
+function append_los_jobs!(
+        configurations,
+        comparison,
+        notebooks,
+        snapshot_window,
+        snapshot_count,
+        output_group,
+    )
+    split = split_figures_by_los(figures_for_notebooks(notebooks))
+
+    # LOS-independent figures are evaluated exactly once. The nominal z axis
+    # only initializes notebook navigation and cannot affect these products.
+    isempty(split.independent) || push!(
+        configurations,
+        batch_config(
+            comparison,
+            split.independent,
+            snapshot_window,
+            snapshot_count,
+            output_group,
+            "common",
+            "z",
+        ),
+    )
+
+    for line_of_sight in SELECTED_LINES_OF_SIGHT
+        isempty(split.dependent) && continue
+        push!(
+            configurations,
+            batch_config(
+                comparison,
+                split.dependent,
+                snapshot_window,
+                snapshot_count,
+                output_group,
+                "los_$(line_of_sight)",
+                line_of_sight,
+            ),
+        )
+    end
+    configurations
 end
 
 const BATCH_CONFIGS = let
@@ -104,25 +166,21 @@ const BATCH_CONFIGS = let
     other_notebooks = filter(!=("dynamo"), SELECTED_NOTEBOOKS)
     for comparison in COMPARISONS
         comparison.key in SELECTED_COMPARISONS || continue
-        "dynamo" in SELECTED_NOTEBOOKS && push!(
+        "dynamo" in SELECTED_NOTEBOOKS && append_los_jobs!(
             configurations,
-            batch_config(
-                comparison,
-                ["dynamo"],
-                :first,
-                20,
-                "dynamo",
-            ),
+            comparison,
+            ["dynamo"],
+            :first,
+            20,
+            "dynamo",
         )
-        isempty(other_notebooks) || push!(
+        isempty(other_notebooks) || append_los_jobs!(
             configurations,
-            batch_config(
-                comparison,
-                other_notebooks,
-                :last,
-                10,
-                "observables",
-            ),
+            comparison,
+            other_notebooks,
+            :last,
+            10,
+            "observables",
         )
     end
     configurations
@@ -150,7 +208,11 @@ function print_batch_plan()
             config.snapshot_count,
             " snapshots — ",
             length(config.figures),
-            " figures",
+            " figures — ",
+            basename(config.output_directory),
+            basename(config.output_directory) == "common" ?
+                " (LOS-independent, computed once)" :
+                " (LOS = $(config.line_of_sight))",
         )
     end
     println(repeat("═", 72))

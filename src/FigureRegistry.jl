@@ -41,6 +41,7 @@ const FIGURE_REGISTRY = Dict(
     "moose_structure" => :fig_moose_structure,
     "moose_power_spectra" => :fig_moose_power_spectra,
     "moose_tomography" => :fig_moose_tomography,
+    "moose_rmsf" => :fig_moose_rmsf,
     "moose_p_column" => :fig_moose_p_column,
     "polarization_intensity" => :fig_polarization_intensity,
     "shine" => :fig_shine,
@@ -51,6 +52,45 @@ const FIGURE_REGISTRY = Dict(
     "hi_faraday_hog" => :fig_hi_faraday_hog,
     "polarization_time" => :fig_polarization_time,
 )
+
+# These diagnostics use scalar or fully three-dimensional fields and therefore
+# do not change when the viewing axis changes.  Every other registered figure
+# is conservatively treated as LOS-dependent (projected maps, synthetic
+# observations, 2D statistics, or mixed summary figures).
+const LOS_INDEPENDENT_FIGURES = Set([
+    "pdfs",
+    "phase_diagram",
+    "time_evolution",
+    "phase_magnetic_time",
+    "magnetic_fit",
+    "growth_rate_relations",
+    "normalized_magnetic_relations",
+    "magnetic_density",
+    "hro",
+    "energy_ratios",
+    "energy_time",
+    "enstrophy_density",
+    "power_spectra",
+    "density_spectra_time",
+    "velocity_spectra_time",
+    "vorticity_spectra_time",
+    "enstrophy_spectra_time",
+    "magnetic_spectra_time",
+    "structure_functions",
+    "moose_rmsf",
+])
+
+function split_figures_by_los(figures)
+    requested = unique(String.(figures))
+    unknown = setdiff(requested, collect(keys(FIGURE_REGISTRY)))
+    isempty(unknown) || error(
+        "Unknown figures: $(join(unknown, ", ")).",
+    )
+    (
+        independent = filter(name -> name in LOS_INDEPENDENT_FIGURES, requested),
+        dependent = filter(name -> name ∉ LOS_INDEPENDENT_FIGURES, requested),
+    )
+end
 
 const NOTEBOOK_FIGURES = Dict(
     "dynamo" => [
@@ -101,6 +141,7 @@ const NOTEBOOK_FIGURES = Dict(
     ],
     "moose" => [
         "moose_tomography",
+        "moose_rmsf",
         "hi_faraday_hog",
     ],
     "shine" => [

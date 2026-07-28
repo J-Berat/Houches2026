@@ -42,6 +42,7 @@ begin
     KM_CM = 1.0e5                    # cm
     GAUSS_TO_MICROGAUSS = 1.0e6
     PHYSICAL_BOX_LENGTH_PC = 100.0
+    MOOSE_PATH_LENGTH_PC = 100.0
 
     # Persistent caches. This cell has no reactive dependency, so Pluto runs it
     # once per session and the caches survive every widget change. RAW_CUBE_CACHE
@@ -4548,6 +4549,7 @@ use all physical and instrumental defaults listed below.
 |:--|:--:|
 | Faraday and synchrotron maps | $(@bind display_moose PlutoUI.CheckBox(default = false)) |
 | Faraday tomography | $(@bind display_moose_tomography PlutoUI.CheckBox(default = true)) |
+| Rotation-measure spread function | $(@bind display_moose_rmsf PlutoUI.CheckBox(default = true)) |
 | Spatial power spectra | $(@bind display_moose_power_spectra PlutoUI.CheckBox(default = false)) |
 | Polarization fraction versus $N_{\rm H}$ | $(@bind display_moose_p_column PlutoUI.CheckBox(default = false)) |
 
@@ -4566,6 +4568,7 @@ use all physical and instrumental defaults listed below.
 | Synchrotron cosmic-ray electron index $p$ | $(@bind moose_cr_index PlutoUI.NumberField(1.0:0.1:5.0; default = 3.0)) |
 | Observing frequency [$\mathrm{MHz}$] | $(@bind moose_frequency_MHz PlutoUI.NumberField(50.0:1.0:2000.0; default = 150.0)) |
 | Synchrotron normalization [$\mathrm{K}\,(\mu\mathrm{G})^{-(p+1)/2}\,\mathrm{pc}^{-1}$] | $(@bind moose_synchrotron_norm PlutoUI.NumberField(default = 1.0)) |
+| Physical MOOSE LOS depth | **$(@sprintf("%.0f", MOOSE_PATH_LENGTH_PC)) pc (fixed)** |
 | Apply MOOSE interferometric filtering | $(@bind apply_moose_interferometer PlutoUI.CheckBox(default = false)) |
 | Largest retained Fourier scale [pixels] | $(@bind moose_largest_scale_pix PlutoUI.NumberField(2.0:1.0:4096.0; default = 154.0)) |
 | Smallest retained Fourier scale [pixels] | $(@bind moose_smallest_scale_pix PlutoUI.NumberField(2.0:0.5:256.0; default = 2.0)) |
@@ -4575,8 +4578,8 @@ use all physical and instrumental defaults listed below.
 | Polarized brightness | $(@bind show_moose_P PlutoUI.CheckBox(default = true)) |
 | Polarization fraction | $(@bind show_moose_fraction PlutoUI.CheckBox(default = true)) |
 | RM-synthesis band start [$\mathrm{MHz}$] | $(@bind moose_band_start_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 120.0)) |
-| RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 167.0)) |
-| Frequency-channel width $\Delta\nu$ [$\mathrm{MHz}$] | $(@bind moose_channel_width_MHz PlutoUI.NumberField(0.001:0.001:20.0; default = 0.098)) |
+| RM-synthesis band end [$\mathrm{MHz}$] | $(@bind moose_band_end_MHz PlutoUI.NumberField(30.0:1.0:2000.0; default = 168.0)) |
+| Frequency-channel width $\Delta\nu$ [$\mathrm{MHz}$] | $(@bind moose_channel_width_MHz PlutoUI.NumberField(0.0001:0.0001:20.0; default = 0.0976)) |
 | Minimum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_min PlutoUI.NumberField(-500.0:0.25:0.0; default = -10.0)) |
 | Maximum Faraday depth [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_phi_max PlutoUI.NumberField(0.0:0.25:500.0; default = 10.0)) |
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
@@ -4651,7 +4654,10 @@ begin
     moose_Bsky1_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[1]]
     moose_Bsky2_uG = GAUSS_TO_MICROGAUSS .* Bcomponents[sky_dims[2]]
     moose_Bperp_uG = sqrt.(moose_Bsky1_uG .^ 2 .+ moose_Bsky2_uG .^ 2)
-    moose_phi_increment = 0.812 .* moose_ne .* moose_Blos_uG .* dx_los_pc
+    moose_dx_los_pc =
+        Float64(MOOSE_PATH_LENGTH_PC) / size(cube.rho, los_dim)
+    moose_phi_increment =
+        0.812 .* moose_ne .* moose_Blos_uG .* moose_dx_los_pc
     moose_phi_to_cell = cumsum(moose_phi_increment; dims = los_dim) .- 0.5 .* moose_phi_increment
     moose_phi_map = finite_sum_dims(moose_phi_increment, los_dim)
 
@@ -4664,11 +4670,12 @@ begin
     moose_intrinsic_angle = atan.(moose_Bsky2_uG, moose_Bsky1_uG) .+ pi / 2
     moose_lambda2_m2 = (299_792_458.0 / (Float64(moose_frequency_MHz) * 1.0e6))^2
     moose_polarization_phase = 2 .* (moose_intrinsic_angle .+ moose_phi_to_cell .* moose_lambda2_m2)
-    moose_I_K = finite_sum_dims(moose_emissivity_Kpc, los_dim) .* dx_los_pc
+    moose_I_K =
+        finite_sum_dims(moose_emissivity_Kpc, los_dim) .* moose_dx_los_pc
     moose_Q_K = finite_sum_dims(moose_emissivity_Kpc .* cos.(moose_polarization_phase),
-        los_dim) .* dx_los_pc
+        los_dim) .* moose_dx_los_pc
     moose_U_K = finite_sum_dims(moose_emissivity_Kpc .* sin.(moose_polarization_phase),
-        los_dim) .* dx_los_pc
+        los_dim) .* moose_dx_los_pc
     moose_uv_transfer = moose_instrument_transfer(size(moose_I_K),
         moose_largest_scale_pix, moose_smallest_scale_pix)
     if apply_moose_interferometer
@@ -4749,9 +4756,11 @@ begin
         phase = 2 .* (moose_intrinsic_angle .+
             moose_phi_to_cell .* moose_band_lambda2_m2[channel])
         moose_Q_band_K[:, :, channel] .= finite_sum_dims(
-            moose_emissivity_base_Kpc .* frequency_scale .* cos.(phase), los_dim) .* dx_los_pc
+            moose_emissivity_base_Kpc .* frequency_scale .* cos.(phase),
+            los_dim) .* moose_dx_los_pc
         moose_U_band_K[:, :, channel] .= finite_sum_dims(
-            moose_emissivity_base_Kpc .* frequency_scale .* sin.(phase), los_dim) .* dx_los_pc
+            moose_emissivity_base_Kpc .* frequency_scale .* sin.(phase),
+            los_dim) .* moose_dx_los_pc
     end
     if apply_moose_interferometer
         moose_Q_band_K = apply_moose_interferometer_cube(
@@ -4800,10 +4809,10 @@ The H I--Faraday HOG is decomposed into total H I, CNM, LNM, and WNM
 velocity cubes. The phase-resolved cubes use the temperature cuts below:
 CNM has $T<T_{\rm CNM}$, LNM has
 $T_{\rm CNM}\leq T<T_{\rm WNM}$, and WNM has $T\geq T_{\rm WNM}$.
-An optional Gaussian EBHIS noise realization is added to every H I velocity
-channel after beam convolution. The same realization is used for all four
-thermal panels so that their differences remain physically interpretable.
-The Faraday-depth cube used by HOG is always noise-free.
+An optional Gaussian EBHIS noise realization is added to every native H I
+velocity channel without beam convolution. The same realization is used for
+all four thermal panels so that their differences remain physically
+interpretable. The Faraday-depth cube used by HOG is always noise-free.
 
 | SHINE setting | Control |
 |:--|:--|
@@ -5165,7 +5174,7 @@ begin
     for a channel-by-channel HOG comparison. This follows the same SHINE and
     MOOSE prescriptions as their dedicated figures.
     """
-    function hi_faraday_observable_cubes(c)
+    function hi_faraday_observable_cubes(c; noise_seed)
         local_temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
             (K_B_CGS .* c.rho)
         local_dx_pc = c.L[los_dim] / size(c.rho, los_dim)
@@ -5221,7 +5230,10 @@ begin
                     brightness_cube[i, j, :] .= brightness
                 end
             end
-            apply_observational_beam_cube(brightness_cube, c, sky_dims)
+            # Preserve the native H I spatial resolution. For the EBHIS
+            # experiment the only instrumental effect is the per-channel
+            # white-noise realization below.
+            brightness_cube
         end
         hi_cubes = (
             total = phase_brightness_cube(phase_density_cubes.total),
@@ -5234,7 +5246,12 @@ begin
             isfinite(sigma_ebhis_K) && sigma_ebhis_K >= 0 ||
                 error("The EBHIS H I channel noise must be finite and non-negative.")
             if sigma_ebhis_K > 0
-                ebhis_rng = MersenneTwister(Int(shine_ebhis_seed))
+                # Berat et al. (2026), Sect. 4.4: independent Gaussian white
+                # noise in every H I velocity channel with
+                # sigma_EBHIS = 90 mK by default.  A common realization is
+                # applied to total/CNM/LNM/WNM maps of the same synthetic
+                # observation, while each simulation receives its own seed.
+                ebhis_rng = MersenneTwister(Int(noise_seed))
                 noise_buffer = Matrix{Float64}(
                     undef, size(local_nhi, 1), size(local_nhi, 2))
                 for channel in axes(hi_cubes.total, 3)
@@ -5254,7 +5271,10 @@ begin
         local_bsky1 = GAUSS_TO_MICROGAUSS .* components[sky_dims[1]]
         local_bsky2 = GAUSS_TO_MICROGAUSS .* components[sky_dims[2]]
         local_bperp = hypot.(local_bsky1, local_bsky2)
-        phi_increment = 0.812 .* local_ne .* local_blos .* local_dx_pc
+        moose_local_dx_pc =
+            Float64(MOOSE_PATH_LENGTH_PC) / size(c.rho, los_dim)
+        phi_increment =
+            0.812 .* local_ne .* local_blos .* moose_local_dx_pc
         phi_to_cell =
             cumsum(phi_increment; dims = los_dim) .- 0.5 .* phi_increment
         cosmic_ray_index = Float64(moose_cr_index)
@@ -5279,11 +5299,11 @@ begin
             q_band[:, :, channel] .= finite_sum_dims(
                 emissivity_base .* frequency_scale .* cos.(phase),
                 los_dim,
-            ) .* local_dx_pc
+            ) .* moose_local_dx_pc
             u_band[:, :, channel] .= finite_sum_dims(
                 emissivity_base .* frequency_scale .* sin.(phase),
                 los_dim,
-            ) .* local_dx_pc
+            ) .* moose_local_dx_pc
         end
         if apply_moose_interferometer
             transfer = moose_instrument_transfer(
@@ -5461,8 +5481,9 @@ begin
         )
     end
 
-    function hi_faraday_hog_for_cube(c)
-        hi_cubes, faraday_cube = hi_faraday_observable_cubes(c)
+    function hi_faraday_hog_for_cube(c; noise_seed)
+        hi_cubes, faraday_cube =
+            hi_faraday_observable_cubes(c; noise_seed)
         (
             total = hi_faraday_hog_product(
                 hi_cubes.total, shine_velocity_axis,
@@ -5512,22 +5533,31 @@ begin
         first(moose_phi_axis),
         last(moose_phi_axis),
         length(moose_phi_axis),
+        Float64(MOOSE_PATH_LENGTH_PC),
         Bool(apply_moose_interferometer),
         Float64(moose_largest_scale_pix),
         Float64(moose_smallest_scale_pix),
+        Bool(apply_observational_beam),
+        String(observational_beam_unit),
+        Float64(observational_beam_fwhm_major),
+        Float64(observational_beam_fwhm_minor),
+        Float64(observational_beam_pa_deg),
     )
     hi_faraday_hog_by_run = Dict{String, Any}()
-    for label in comparison_run_labels
+    for (run_index, label) in enumerate(comparison_run_labels)
         snapshot_path =
             run_files[label][comparison_snapshot_indices[label]]
+        local_noise_seed = Int(shine_ebhis_seed) + run_index - 1
         hi_faraday_hog_by_run[label] = cached_scientific_product((
-            :hi_faraday_hog_phase_ebhis_no_faraday_noise_v2,
+            :hi_faraday_hog_phase_ebhis_no_faraday_noise_100pc_v4,
             cube_signature(snapshot_path),
             hif_hog_parameter_signature,
+            local_noise_seed,
         )) do
             hi_faraday_hog_for_cube(
                 label == selected_run && snapshot_path == selected_path ?
-                    cube : comparison_cube(label))
+                    cube : comparison_cube(label);
+                noise_seed = local_noise_seed)
         end
     end
 
@@ -5594,7 +5624,7 @@ begin
             "\\mathrm{H\\,I\\!-\\!Faraday\\ HOG\\ by\\ thermal\\ phase},\\quad ",
             "\\sigma_{T_B}^{\\mathrm{EBHIS}}=",
             @sprintf("%.4g", Float64(shine_ebhis_noise_mK)),
-            "\\;\\mathrm{mK\\,channel}^{-1},\\quad ",
+            "\\;\\mathrm{mK\\,channel}^{-1}\\ (\\mathrm{no\\ H\\,I\\ beam}),\\quad ",
             "F(\\phi):\\ \\mathrm{noiseless}") :
         L"\mathrm{H\,I\!-\!Faraday\ HOG\ by\ thermal\ phase},\quad F(\phi):\ \mathrm{noiseless}"
     Label(

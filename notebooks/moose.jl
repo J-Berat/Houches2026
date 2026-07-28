@@ -2514,6 +2514,56 @@ begin
         decade_lower / padding, decade_upper * padding
     end
 
+    """
+    Return data-focused limits for a logarithmic axis.
+
+    The central 99.8% of sufficiently sampled data sets controls the frame so
+    a handful of extreme pixels cannot create several empty decades. A small
+    margin is applied in log space; short vectors retain their full range.
+    """
+    function focused_log_limits(values;
+            lower_quantile = 0.001,
+            upper_quantile = 0.999,
+            padding_fraction = 0.06)
+        valid = Float64.(filter(value -> isfinite(value) && value > 0, vec(values)))
+        isempty(valid) && return nothing
+        lower, upper = length(valid) >= 20 ?
+            quantile(valid, (lower_quantile, upper_quantile)) :
+            extrema(valid)
+        lower > 0 && upper >= lower || return nothing
+        if upper == lower
+            padding_decades = 0.05
+            return lower / 10.0^padding_decades,
+                upper * 10.0^padding_decades
+        end
+        log_lower, log_upper = log10(lower), log10(upper)
+        padding_decades =
+            max(padding_fraction * (log_upper - log_lower), 0.025)
+        10.0^(log_lower - padding_decades),
+            10.0^(log_upper + padding_decades)
+    end
+
+    "Readable 1--2--5 logarithmic ticks, including sub-decade focused ranges."
+    function focused_log_ticks(limits; maximum_tick_count = 8)
+        lower, upper = limits
+        first_exponent = floor(Int, log10(lower))
+        last_exponent = ceil(Int, log10(upper))
+        values = sort(Float64[
+            mantissa * 10.0^exponent
+            for exponent in first_exponent:last_exponent
+            for mantissa in (1.0, 2.0, 5.0)
+            if lower <= mantissa * 10.0^exponent <= upper
+        ])
+        if isempty(values)
+            values = [sqrt(lower * upper)]
+        elseif length(values) > maximum_tick_count
+            indices = unique(round.(Int,
+                range(1, length(values); length = maximum_tick_count)))
+            values = values[indices]
+        end
+        values
+    end
+
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =
         decade_tick_values(vmin, vmax)
 
@@ -2536,12 +2586,13 @@ begin
                 fontsize = 20)
             return fig
         end
+        column_limits = focused_log_limits(N)
+        column_ticks = focused_log_ticks(column_limits)
         axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
-            xticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-        column_limits = enclosing_decade_limits(N)
+            xticks = column_ticks,
+            xminorticks = IntervalsBetween(4), xminorticksvisible = true)
         isnothing(column_limits) || xlims!(axis, column_limits...)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -2777,9 +2828,12 @@ begin
             vec(Float64.(c.rho)) : ones(length(c.rho))
         local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
         local_v = sqrt.(local_turb.dv2)
+        local_T = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
         local_mean_B = finite_mean(local_mag.B)
         (
             density = vec(safe_log10.(number_density(c.rho))),
+            temperature = vec(safe_log10.(local_T)),
             magnetic = vec(safe_log10.(local_B)),
             velocity = vec(safe_log10.(local_v)),
             normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
@@ -2802,6 +2856,7 @@ begin
     mean_B = finite_mean(mag.B)
     sB = vec(safe_log10.(mag.B ./ mean_B))
     logn = vec(safe_log10.(number_density_cells))
+    logTphysical = vec(safe_log10.(T))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
     pdf_reference_samples =
@@ -2810,6 +2865,8 @@ begin
     pdf_edges = (
         density = comparative_pdf_edges(
             pdf_reference_samples, :density, nbins),
+        temperature = comparative_pdf_edges(
+            pdf_reference_samples, :temperature, nbins),
         magnetic = comparative_pdf_edges(
             pdf_reference_samples, :magnetic, nbins),
         velocity = comparative_pdf_edges(
@@ -2820,10 +2877,11 @@ begin
 
     function snapshot_pdf_products(path)
         cached_scientific_product((
-            :snapshot_pdfs_v2,
+            :snapshot_pdfs_v3,
             cube_signature(path),
             Tuple(Tuple(getfield(pdf_edges, field))
-                for field in (:density, :magnetic, :velocity, :normalized_B)),
+                for field in (:density, :temperature, :magnetic, :velocity,
+                    :normalized_B)),
             Float64(mean_molecular_weight),
             String(pdf_weighting),
         )) do
@@ -2831,6 +2889,9 @@ begin
             (
                 density = density_pdf(
                     samples.density, samples.weights, pdf_edges.density),
+                temperature = density_pdf(
+                    samples.temperature, samples.weights,
+                    pdf_edges.temperature),
                 magnetic = density_pdf(
                     samples.magnetic, samples.weights, pdf_edges.magnetic),
                 velocity = density_pdf(
@@ -2860,6 +2921,9 @@ begin
         density = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :density)
             for label in comparison_run_labels),
+        temperature = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :temperature)
+            for label in comparison_run_labels),
         magnetic = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :magnetic)
             for label in comparison_run_labels),
@@ -2871,6 +2935,7 @@ begin
             for label in comparison_run_labels),
     )
     density_pdfs = pdf_products.density
+    temperature_pdfs = pdf_products.temperature
     magnetic_pdfs = pdf_products.magnetic
     velocity_pdfs = pdf_products.velocity
     normalized_B_pdfs = pdf_products.normalized_B
@@ -3378,6 +3443,8 @@ md"""
 
 Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
 
+All observable structure-function figures use the same comparative convention as the three-dimensional functions above: every selected run is recomputed with identical physical and instrumental parameters, then superposed with one shared horizontal simulation legend.
+
 | Gaussian PSF setting | Control |
 |:--|:--|
 | Apply Gaussian beam | $(@bind apply_observational_beam PlutoUI.CheckBox(default = false)) |
@@ -3482,40 +3549,68 @@ begin
     end
 
     "Plot projected structure functions for a collection of observable maps."
-    function observational_structure_figure(specs, c, plane_dims, order, samples;
+    function observational_structure_figure(specs_by_run, cubes_by_run,
+            plane_dims, order, samples;
             heading = "Projected observable structure functions")
-        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
-        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
-            length = Int(samples)))))
-        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
-            for dimension in plane_dims)
-        separations_pc = lags .* pixel_scale_pc
-        ncols = min(2, length(specs))
-        nrows = cld(length(specs), ncols)
-        figure = Figure(size = (540ncols, 390nrows + 55))
+        isempty(specs_by_run) && return Figure(size = (900, 140))
+        first_specs = first(values(specs_by_run))
+        ncols = min(2, length(first_specs))
+        nrows = cld(length(first_specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 115))
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
-        for (spec_index, spec) in enumerate(specs)
+        for (spec_index, reference_spec) in enumerate(first_specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
             axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
-                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                title = as_latex(reference_spec.label), xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                 xminorticksvisible = true, yminorticksvisible = true)
-            values = scalar_structure_function_2d(spec.data, lags, order;
-                period = spec.period)
-            valid = isfinite.(values) .& (values .> 0)
-            if any(valid)
+            any_valid = false
+            all_separations, all_values = Float64[], Float64[]
+            for label in comparison_run_labels
+                specs = specs_by_run[label]
+                spec_index <= length(specs) || continue
+                spec = specs[spec_index]
+                c = cubes_by_run[label]
+                maximum_lag = max(1, minimum(size(spec.data)) ÷ 2)
+                lags = unique(round.(Int, exp.(range(
+                    log(1.0), log(Float64(maximum_lag));
+                    length = Int(samples)))))
+                pixel_scale_pc = minimum(
+                    c.L[dimension] / size(c.rho, dimension)
+                    for dimension in plane_dims)
+                separations_pc = lags .* pixel_scale_pc
+                values = scalar_structure_function_2d(
+                    spec.data, lags, order; period = spec.period)
+                valid = isfinite.(values) .& (values .> 0)
+                any(valid) || continue
+                any_valid = true
+                append!(all_separations, separations_pc[valid])
+                append!(all_values, values[valid])
                 lines!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, linewidth = 2.5)
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
                 scatter!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, markersize = 6)
+                    color = run_colors[label], markersize = 6)
+            end
+            if any_valid
+                x_limits = enclosing_decade_limits(all_separations)
+                y_limits = enclosing_decade_limits(all_values)
+                isnothing(x_limits) || xlims!(axis, x_limits...)
+                isnothing(y_limits) || ylims!(axis, y_limits...)
             else
                 text!(axis, 0.5, 0.5; text = "constant or invalid map",
                     space = :relative, align = (:center, :center))
             end
         end
+        Legend(figure[nrows + 1, 1:ncols],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true,
+            framevisible = false, labelsize = 14)
         figure
     end
 
@@ -3739,7 +3834,7 @@ use all physical and instrumental defaults listed below.
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
 | First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = false)) |
+| Peak Faraday-spectrum map $P_{\max}$ | $(@bind show_moose_pmax PlutoUI.CheckBox(default = true)) |
 | Faraday-spectrum amplitude | $(@bind show_moose_F_abs PlutoUI.CheckBox(default = true)) |
 | $\Re F(\phi)$ spectrum | $(@bind show_moose_F_real PlutoUI.CheckBox(default = true)) |
 | $\Im F(\phi)$ spectrum | $(@bind show_moose_F_imag PlutoUI.CheckBox(default = true)) |
@@ -4132,21 +4227,22 @@ begin
     if isempty(moose_tomography_specs)
         fig_moose_tomography = Figure(size = (900, 180))
         Label(fig_moose_tomography[1, 1],
-            L"\mathrm{Select\ the\ }p_{\max}\mathrm{\ map\ or\ an\ }F(\phi)\mathrm{\ component.}", fontsize = 20)
+            L"\mathrm{Select\ the\ }P_{\max}\mathrm{\ map\ or\ an\ }F(\phi)\mathrm{\ component.}", fontsize = 20)
     else
         fig_moose_tomography = Figure(size = (570length(moose_tomography_specs), 445))
         for (index, product) in enumerate(moose_tomography_specs)
             if product == :pmax
                 panel = fig_moose_tomography[1, index] = GridLayout()
                 ax = physical_map_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
-                    ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
+                    ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"),
+                    title = L"P_{\max}=\max_\phi |F(\phi)|")
                 hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], moose_pmax_K;
                     colormap = :viridis,
                     colorrange = robust_colorrange(moose_pmax_K, color_percentile))
                 scatter!(ax, [sky_coordinates[1][Int(moose_sky_i)]],
                     [sky_coordinates[2][Int(moose_sky_j)]];
                     marker = :cross, markersize = 20, strokewidth = 3, color = :white)
-                latex_colorbar(panel[1, 2], hm; label = L"p_{\max}=\max_\phi|F(\phi)|\;[\mathrm{K}]",
+                latex_colorbar(panel[1, 2], hm; label = L"P_{\max}\;[\mathrm{K}]",
                     tickformat = latex_ticklabels)
                 colsize!(panel, 2, 22)
             else
@@ -4179,17 +4275,125 @@ end
 
 # ╔═╡ a0040004-6f8c-4d0c-9a10-000000000004
 begin
-    moose_structure_specs = [
-        (data = moose_phi_map, label = L"\phi\;[\mathrm{rad\,m}^{-2}]", color = MHD_COLORS[1], period = nothing),
-        (data = moose_I_K, label = L"T_{\mathrm{syn}}\;[\mathrm{K}]", color = MHD_COLORS[2], period = nothing),
-        (data = moose_Q_K, label = L"Q_\nu\;[\mathrm{K}]", color = MHD_COLORS[3], period = nothing),
-        (data = moose_U_K, label = L"U_\nu\;[\mathrm{K}]", color = MHD_COLORS[4], period = nothing),
-        (data = moose_P_K, label = L"P_\nu\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
-        (data = moose_fraction, label = L"P_\nu/I_\nu", color = MHD_COLORS[6], period = nothing),
-        (data = moose_pmax_K, label = L"p_{\max}\;[\mathrm{K}]", color = MHD_COLORS[1], period = nothing),
-    ]
+    function moose_structure_products(c)
+        components = (c.bx, c.by, c.bz)
+        local_temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        local_nH = c.rho ./
+            (Float64(mean_molecular_weight) * M_H_CGS)
+        local_ne = moose_electron_density(local_nH, local_temperature)
+        local_Blos = GAUSS_TO_MICROGAUSS .* components[los_dim]
+        local_B1 = GAUSS_TO_MICROGAUSS .* components[sky_dims[1]]
+        local_B2 = GAUSS_TO_MICROGAUSS .* components[sky_dims[2]]
+        local_Bperp = sqrt.(local_B1 .^ 2 .+ local_B2 .^ 2)
+        local_dx_pc = Float64(MOOSE_PATH_LENGTH_PC) / size(c.rho, los_dim)
+        local_phi_increment = 0.812 .* local_ne .* local_Blos .* local_dx_pc
+        local_phi_to_cell = cumsum(local_phi_increment; dims = los_dim) .-
+            0.5 .* local_phi_increment
+        local_phi_map = finite_sum_dims(local_phi_increment, los_dim)
+        local_p = Float64(moose_cr_index)
+        local_B_exponent = (local_p + 1) / 2
+        local_spectral_index = -(local_p + 3) / 2
+        local_emissivity_base = Float64(moose_synchrotron_norm) .*
+            local_Bperp .^ local_B_exponent
+        local_intrinsic_angle = atan.(local_B2, local_B1) .+ pi / 2
+        local_frequency_scale =
+            (Float64(moose_frequency_MHz) / 150.0)^local_spectral_index
+        local_phase = 2 .* (local_intrinsic_angle .+
+            local_phi_to_cell .* moose_lambda2_m2)
+        local_I = finite_sum_dims(
+            local_emissivity_base .* local_frequency_scale, los_dim) .* local_dx_pc
+        local_Q = finite_sum_dims(local_emissivity_base .* local_frequency_scale .*
+            cos.(local_phase), los_dim) .* local_dx_pc
+        local_U = finite_sum_dims(local_emissivity_base .* local_frequency_scale .*
+            sin.(local_phase), los_dim) .* local_dx_pc
+        local_transfer = moose_instrument_transfer(
+            size(local_I), moose_largest_scale_pix, moose_smallest_scale_pix)
+        if apply_moose_interferometer
+            local_I = apply_moose_interferometer_2d(local_I, local_transfer)
+            local_Q = apply_moose_interferometer_2d(local_Q, local_transfer)
+            local_U = apply_moose_interferometer_2d(local_U, local_transfer)
+        end
+        local_I = apply_observational_beam_2d(local_I, c, sky_dims)
+        local_Q = apply_observational_beam_2d(local_Q, c, sky_dims)
+        local_U = apply_observational_beam_2d(local_U, c, sky_dims)
+        local_P = sqrt.(local_Q .^ 2 .+ local_U .^ 2)
+
+        local_shape = size(local_phi_map)
+        local_Q_band = Array{Float64}(
+            undef, local_shape..., moose_nfrequency)
+        local_U_band = similar(local_Q_band)
+        for channel in eachindex(moose_band_frequency_MHz)
+            frequency_scale =
+                (moose_band_frequency_MHz[channel] / 150.0)^local_spectral_index
+            phase = 2 .* (local_intrinsic_angle .+
+                local_phi_to_cell .* moose_band_lambda2_m2[channel])
+            local_Q_band[:, :, channel] .= finite_sum_dims(
+                local_emissivity_base .* frequency_scale .* cos.(phase),
+                los_dim) .* local_dx_pc
+            local_U_band[:, :, channel] .= finite_sum_dims(
+                local_emissivity_base .* frequency_scale .* sin.(phase),
+                los_dim) .* local_dx_pc
+        end
+        if apply_moose_interferometer
+            local_Q_band =
+                apply_moose_interferometer_cube(local_Q_band, local_transfer)
+            local_U_band =
+                apply_moose_interferometer_cube(local_U_band, local_transfer)
+        end
+        local_Q_band =
+            apply_observational_beam_cube(local_Q_band, c, sky_dims)
+        local_U_band =
+            apply_observational_beam_cube(local_U_band, c, sky_dims)
+        local_P_matrix = reshape(
+            complex.(local_Q_band, local_U_band), :, moose_nfrequency)
+        local_F_matrix =
+            local_P_matrix * moose_rm_phase_matrix / moose_nfrequency
+        local_pmax = reshape(
+            maximum(abs.(local_F_matrix); dims = 2), local_shape)
+        (
+            phi = local_phi_map,
+            I = local_I,
+            Q = local_Q,
+            U = local_U,
+            P = local_P,
+            fraction = local_P ./ max.(abs.(local_I), eps(Float64)),
+            pmax = local_pmax,
+        )
+    end
+    moose_structure_products_by_run = Dict(label => begin
+        if label == selected_run &&
+                comparison_snapshot_indices[label] == selected_snapshot
+            (
+                phi = moose_phi_map,
+                I = moose_I_K,
+                Q = moose_Q_K,
+                U = moose_U_K,
+                P = moose_P_K,
+                fraction = moose_fraction,
+                pmax = moose_pmax_K,
+            )
+        else
+            moose_structure_products(comparison_cube(label))
+        end
+    end for label in comparison_run_labels)
+    moose_structure_specs_by_run = Dict(label => begin
+        products = moose_structure_products_by_run[label]
+        [
+            (data = products.phi, label = L"\phi\;[\mathrm{rad\,m}^{-2}]", period = nothing),
+            (data = products.I, label = L"T_{\mathrm{syn}}\;[\mathrm{K}]", period = nothing),
+            (data = products.Q, label = L"Q_\nu\;[\mathrm{K}]", period = nothing),
+            (data = products.U, label = L"U_\nu\;[\mathrm{K}]", period = nothing),
+            (data = products.P, label = L"P_\nu\;[\mathrm{K}]", period = nothing),
+            (data = products.fraction, label = L"P_\nu/I_\nu", period = nothing),
+            (data = products.pmax, label = L"P_{\max}\;[\mathrm{K}]", period = nothing),
+        ]
+    end for label in comparison_run_labels)
+    moose_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_moose_structure = display_observational_structure_functions ?
-        observational_structure_figure(moose_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            moose_structure_specs_by_run, moose_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "MOOSE observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_moose_structure : nothing
@@ -4220,7 +4424,7 @@ begin
         (
             data = moose_pmax_K,
             title = L"\max_\phi|F(\phi)|",
-            ylabel = L"E_{p_{\max}}(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
+            ylabel = L"E_{P_{\max}}(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
             color = MHD_COLORS[4],
         ),
     ]

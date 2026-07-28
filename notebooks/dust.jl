@@ -2514,6 +2514,56 @@ begin
         decade_lower / padding, decade_upper * padding
     end
 
+    """
+    Return data-focused limits for a logarithmic axis.
+
+    The central 99.8% of sufficiently sampled data sets controls the frame so
+    a handful of extreme pixels cannot create several empty decades. A small
+    margin is applied in log space; short vectors retain their full range.
+    """
+    function focused_log_limits(values;
+            lower_quantile = 0.001,
+            upper_quantile = 0.999,
+            padding_fraction = 0.06)
+        valid = Float64.(filter(value -> isfinite(value) && value > 0, vec(values)))
+        isempty(valid) && return nothing
+        lower, upper = length(valid) >= 20 ?
+            quantile(valid, (lower_quantile, upper_quantile)) :
+            extrema(valid)
+        lower > 0 && upper >= lower || return nothing
+        if upper == lower
+            padding_decades = 0.05
+            return lower / 10.0^padding_decades,
+                upper * 10.0^padding_decades
+        end
+        log_lower, log_upper = log10(lower), log10(upper)
+        padding_decades =
+            max(padding_fraction * (log_upper - log_lower), 0.025)
+        10.0^(log_lower - padding_decades),
+            10.0^(log_upper + padding_decades)
+    end
+
+    "Readable 1--2--5 logarithmic ticks, including sub-decade focused ranges."
+    function focused_log_ticks(limits; maximum_tick_count = 8)
+        lower, upper = limits
+        first_exponent = floor(Int, log10(lower))
+        last_exponent = ceil(Int, log10(upper))
+        values = sort(Float64[
+            mantissa * 10.0^exponent
+            for exponent in first_exponent:last_exponent
+            for mantissa in (1.0, 2.0, 5.0)
+            if lower <= mantissa * 10.0^exponent <= upper
+        ])
+        if isempty(values)
+            values = [sqrt(lower * upper)]
+        elseif length(values) > maximum_tick_count
+            indices = unique(round.(Int,
+                range(1, length(values); length = maximum_tick_count)))
+            values = values[indices]
+        end
+        values
+    end
+
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =
         decade_tick_values(vmin, vmax)
 
@@ -2536,12 +2586,13 @@ begin
                 fontsize = 20)
             return fig
         end
+        column_limits = focused_log_limits(N)
+        column_ticks = focused_log_ticks(column_limits)
         axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
-            xticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-        column_limits = enclosing_decade_limits(N)
+            xticks = column_ticks,
+            xminorticks = IntervalsBetween(4), xminorticksvisible = true)
         isnothing(column_limits) || xlims!(axis, column_limits...)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -2777,9 +2828,12 @@ begin
             vec(Float64.(c.rho)) : ones(length(c.rho))
         local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
         local_v = sqrt.(local_turb.dv2)
+        local_T = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
         local_mean_B = finite_mean(local_mag.B)
         (
             density = vec(safe_log10.(number_density(c.rho))),
+            temperature = vec(safe_log10.(local_T)),
             magnetic = vec(safe_log10.(local_B)),
             velocity = vec(safe_log10.(local_v)),
             normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
@@ -2802,6 +2856,7 @@ begin
     mean_B = finite_mean(mag.B)
     sB = vec(safe_log10.(mag.B ./ mean_B))
     logn = vec(safe_log10.(number_density_cells))
+    logTphysical = vec(safe_log10.(T))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
     pdf_reference_samples =
@@ -2810,6 +2865,8 @@ begin
     pdf_edges = (
         density = comparative_pdf_edges(
             pdf_reference_samples, :density, nbins),
+        temperature = comparative_pdf_edges(
+            pdf_reference_samples, :temperature, nbins),
         magnetic = comparative_pdf_edges(
             pdf_reference_samples, :magnetic, nbins),
         velocity = comparative_pdf_edges(
@@ -2820,10 +2877,11 @@ begin
 
     function snapshot_pdf_products(path)
         cached_scientific_product((
-            :snapshot_pdfs_v2,
+            :snapshot_pdfs_v3,
             cube_signature(path),
             Tuple(Tuple(getfield(pdf_edges, field))
-                for field in (:density, :magnetic, :velocity, :normalized_B)),
+                for field in (:density, :temperature, :magnetic, :velocity,
+                    :normalized_B)),
             Float64(mean_molecular_weight),
             String(pdf_weighting),
         )) do
@@ -2831,6 +2889,9 @@ begin
             (
                 density = density_pdf(
                     samples.density, samples.weights, pdf_edges.density),
+                temperature = density_pdf(
+                    samples.temperature, samples.weights,
+                    pdf_edges.temperature),
                 magnetic = density_pdf(
                     samples.magnetic, samples.weights, pdf_edges.magnetic),
                 velocity = density_pdf(
@@ -2860,6 +2921,9 @@ begin
         density = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :density)
             for label in comparison_run_labels),
+        temperature = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :temperature)
+            for label in comparison_run_labels),
         magnetic = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :magnetic)
             for label in comparison_run_labels),
@@ -2871,6 +2935,7 @@ begin
             for label in comparison_run_labels),
     )
     density_pdfs = pdf_products.density
+    temperature_pdfs = pdf_products.temperature
     magnetic_pdfs = pdf_products.magnetic
     velocity_pdfs = pdf_products.velocity
     normalized_B_pdfs = pdf_products.normalized_B
@@ -3244,6 +3309,8 @@ md"""
 
 Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
 
+All observable structure-function figures use the same comparative convention as the three-dimensional functions above: every selected run is recomputed with identical physical and instrumental parameters, then superposed with one shared horizontal simulation legend.
+
 | Gaussian PSF setting | Control |
 |:--|:--|
 | Apply Gaussian beam | $(@bind apply_observational_beam PlutoUI.CheckBox(default = false)) |
@@ -3348,40 +3415,68 @@ begin
     end
 
     "Plot projected structure functions for a collection of observable maps."
-    function observational_structure_figure(specs, c, plane_dims, order, samples;
+    function observational_structure_figure(specs_by_run, cubes_by_run,
+            plane_dims, order, samples;
             heading = "Projected observable structure functions")
-        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
-        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
-            length = Int(samples)))))
-        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
-            for dimension in plane_dims)
-        separations_pc = lags .* pixel_scale_pc
-        ncols = min(2, length(specs))
-        nrows = cld(length(specs), ncols)
-        figure = Figure(size = (540ncols, 390nrows + 55))
+        isempty(specs_by_run) && return Figure(size = (900, 140))
+        first_specs = first(values(specs_by_run))
+        ncols = min(2, length(first_specs))
+        nrows = cld(length(first_specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 115))
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
-        for (spec_index, spec) in enumerate(specs)
+        for (spec_index, reference_spec) in enumerate(first_specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
             axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
-                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                title = as_latex(reference_spec.label), xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                 xminorticksvisible = true, yminorticksvisible = true)
-            values = scalar_structure_function_2d(spec.data, lags, order;
-                period = spec.period)
-            valid = isfinite.(values) .& (values .> 0)
-            if any(valid)
+            any_valid = false
+            all_separations, all_values = Float64[], Float64[]
+            for label in comparison_run_labels
+                specs = specs_by_run[label]
+                spec_index <= length(specs) || continue
+                spec = specs[spec_index]
+                c = cubes_by_run[label]
+                maximum_lag = max(1, minimum(size(spec.data)) ÷ 2)
+                lags = unique(round.(Int, exp.(range(
+                    log(1.0), log(Float64(maximum_lag));
+                    length = Int(samples)))))
+                pixel_scale_pc = minimum(
+                    c.L[dimension] / size(c.rho, dimension)
+                    for dimension in plane_dims)
+                separations_pc = lags .* pixel_scale_pc
+                values = scalar_structure_function_2d(
+                    spec.data, lags, order; period = spec.period)
+                valid = isfinite.(values) .& (values .> 0)
+                any(valid) || continue
+                any_valid = true
+                append!(all_separations, separations_pc[valid])
+                append!(all_values, values[valid])
                 lines!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, linewidth = 2.5)
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
                 scatter!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, markersize = 6)
+                    color = run_colors[label], markersize = 6)
+            end
+            if any_valid
+                x_limits = enclosing_decade_limits(all_separations)
+                y_limits = enclosing_decade_limits(all_values)
+                isnothing(x_limits) || xlims!(axis, x_limits...)
+                isnothing(y_limits) || ylims!(axis, y_limits...)
             else
                 text!(axis, 0.5, 0.5; text = "constant or invalid map",
                     space = :relative, align = (:center, :center))
             end
         end
+        Legend(figure[nrows + 1, 1:ncols],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true,
+            framevisible = false, labelsize = 14)
         figure
     end
 
@@ -3793,11 +3888,24 @@ begin
         local_I = apply_observational_beam_2d(local_I, c, sky_dims)
         local_Q = apply_observational_beam_2d(local_Q, c, sky_dims)
         local_U = apply_observational_beam_2d(local_U, c, sky_dims)
-        local_fraction = sqrt.(local_Q .^ 2 .+ local_U .^ 2) ./
-            max.(local_I, eps(Float64))
+        local_spectral_factor = dust_planck_MJysr * dust_sigma_cm2
+        local_I_stokes = local_spectral_factor .* local_I
+        local_Q_stokes = local_spectral_factor .* local_Q
+        local_U_stokes = local_spectral_factor .* local_U
+        local_P_stokes = sqrt.(local_Q_stokes .^ 2 .+ local_U_stokes .^ 2)
+        local_fraction = local_P_stokes ./
+            max.(local_I_stokes, eps(Float64))
         local_column = finite_sum_dims(c.rho, los_dim) .* local_dx_cm ./
             (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
-        (column = local_column, fraction = local_fraction)
+        (
+            column = local_column,
+            I = local_I_stokes,
+            Q = local_Q_stokes,
+            U = local_U_stokes,
+            P = local_P_stokes,
+            fraction = local_fraction,
+            angle = rad2deg.(0.5 .* atan.(local_U_stokes, local_Q_stokes)),
+        )
     end
 
     dust_distributions_by_run = Dict(label =>
@@ -3885,16 +3993,22 @@ end
 
 # ╔═╡ a0010001-6f8c-4d0c-9a10-000000000001
 begin
-    dust_structure_specs = [
-        (data = dust_I, label = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[1], period = nothing),
-        (data = dust_Q, label = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[2], period = nothing),
-        (data = dust_U, label = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[3], period = nothing),
-        (data = dust_P, label = L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[4], period = nothing),
-        (data = dust_fraction, label = L"p_{\mathrm d}", color = MHD_COLORS[5], period = nothing),
-        (data = dust_angle_deg, label = L"\psi_{\mathrm d}\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
-    ]
+    dust_structure_specs_by_run = Dict(label => begin
+        products = dust_distributions_by_run[label]
+        [
+            (data = products.I, label = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]", period = nothing),
+            (data = products.Q, label = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]", period = nothing),
+            (data = products.U, label = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]", period = nothing),
+            (data = products.P, label = L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]", period = nothing),
+            (data = products.fraction, label = L"p_{\mathrm d}", period = nothing),
+            (data = products.angle, label = L"\psi_{\mathrm d}\;[{}^\circ]", period = 180.0),
+        ]
+    end for label in comparison_run_labels)
+    dust_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_dust_structure = display_observational_structure_functions ?
-        observational_structure_figure(dust_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            dust_structure_specs_by_run, dust_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "Dust observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_dust_structure : nothing
@@ -4298,7 +4412,7 @@ use all physical and instrumental defaults listed below.
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
 | First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = false)) |
+| Peak Faraday-spectrum map $P_{\max}$ | $(@bind show_moose_pmax PlutoUI.CheckBox(default = true)) |
 | Faraday-spectrum amplitude | $(@bind show_moose_F_abs PlutoUI.CheckBox(default = true)) |
 | $\Re F(\phi)$ spectrum | $(@bind show_moose_F_real PlutoUI.CheckBox(default = true)) |
 | $\Im F(\phi)$ spectrum | $(@bind show_moose_F_imag PlutoUI.CheckBox(default = true)) |

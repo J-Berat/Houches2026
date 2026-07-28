@@ -2514,6 +2514,56 @@ begin
         decade_lower / padding, decade_upper * padding
     end
 
+    """
+    Return data-focused limits for a logarithmic axis.
+
+    The central 99.8% of sufficiently sampled data sets controls the frame so
+    a handful of extreme pixels cannot create several empty decades. A small
+    margin is applied in log space; short vectors retain their full range.
+    """
+    function focused_log_limits(values;
+            lower_quantile = 0.001,
+            upper_quantile = 0.999,
+            padding_fraction = 0.06)
+        valid = Float64.(filter(value -> isfinite(value) && value > 0, vec(values)))
+        isempty(valid) && return nothing
+        lower, upper = length(valid) >= 20 ?
+            quantile(valid, (lower_quantile, upper_quantile)) :
+            extrema(valid)
+        lower > 0 && upper >= lower || return nothing
+        if upper == lower
+            padding_decades = 0.05
+            return lower / 10.0^padding_decades,
+                upper * 10.0^padding_decades
+        end
+        log_lower, log_upper = log10(lower), log10(upper)
+        padding_decades =
+            max(padding_fraction * (log_upper - log_lower), 0.025)
+        10.0^(log_lower - padding_decades),
+            10.0^(log_upper + padding_decades)
+    end
+
+    "Readable 1--2--5 logarithmic ticks, including sub-decade focused ranges."
+    function focused_log_ticks(limits; maximum_tick_count = 8)
+        lower, upper = limits
+        first_exponent = floor(Int, log10(lower))
+        last_exponent = ceil(Int, log10(upper))
+        values = sort(Float64[
+            mantissa * 10.0^exponent
+            for exponent in first_exponent:last_exponent
+            for mantissa in (1.0, 2.0, 5.0)
+            if lower <= mantissa * 10.0^exponent <= upper
+        ])
+        if isempty(values)
+            values = [sqrt(lower * upper)]
+        elseif length(values) > maximum_tick_count
+            indices = unique(round.(Int,
+                range(1, length(values); length = maximum_tick_count)))
+            values = values[indices]
+        end
+        values
+    end
+
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =
         decade_tick_values(vmin, vmax)
 
@@ -2536,12 +2586,13 @@ begin
                 fontsize = 20)
             return fig
         end
+        column_limits = focused_log_limits(N)
+        column_ticks = focused_log_ticks(column_limits)
         axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
-            xticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-        column_limits = enclosing_decade_limits(N)
+            xticks = column_ticks,
+            xminorticks = IntervalsBetween(4), xminorticksvisible = true)
         isnothing(column_limits) || xlims!(axis, column_limits...)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -3125,6 +3176,8 @@ md"""
 
 Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
 
+All observable structure-function figures use the same comparative convention as the three-dimensional functions above: every selected run is recomputed with identical physical and instrumental parameters, then superposed with one shared horizontal simulation legend.
+
 | Gaussian PSF setting | Control |
 |:--|:--|
 | Apply Gaussian beam | $(@bind apply_observational_beam PlutoUI.CheckBox(default = false)) |
@@ -3229,40 +3282,68 @@ begin
     end
 
     "Plot projected structure functions for a collection of observable maps."
-    function observational_structure_figure(specs, c, plane_dims, order, samples;
+    function observational_structure_figure(specs_by_run, cubes_by_run,
+            plane_dims, order, samples;
             heading = "Projected observable structure functions")
-        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
-        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
-            length = Int(samples)))))
-        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
-            for dimension in plane_dims)
-        separations_pc = lags .* pixel_scale_pc
-        ncols = min(2, length(specs))
-        nrows = cld(length(specs), ncols)
-        figure = Figure(size = (540ncols, 390nrows + 55))
+        isempty(specs_by_run) && return Figure(size = (900, 140))
+        first_specs = first(values(specs_by_run))
+        ncols = min(2, length(first_specs))
+        nrows = cld(length(first_specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 115))
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
-        for (spec_index, spec) in enumerate(specs)
+        for (spec_index, reference_spec) in enumerate(first_specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
             axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
-                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                title = as_latex(reference_spec.label), xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                 xminorticksvisible = true, yminorticksvisible = true)
-            values = scalar_structure_function_2d(spec.data, lags, order;
-                period = spec.period)
-            valid = isfinite.(values) .& (values .> 0)
-            if any(valid)
+            any_valid = false
+            all_separations, all_values = Float64[], Float64[]
+            for label in comparison_run_labels
+                specs = specs_by_run[label]
+                spec_index <= length(specs) || continue
+                spec = specs[spec_index]
+                c = cubes_by_run[label]
+                maximum_lag = max(1, minimum(size(spec.data)) ÷ 2)
+                lags = unique(round.(Int, exp.(range(
+                    log(1.0), log(Float64(maximum_lag));
+                    length = Int(samples)))))
+                pixel_scale_pc = minimum(
+                    c.L[dimension] / size(c.rho, dimension)
+                    for dimension in plane_dims)
+                separations_pc = lags .* pixel_scale_pc
+                values = scalar_structure_function_2d(
+                    spec.data, lags, order; period = spec.period)
+                valid = isfinite.(values) .& (values .> 0)
+                any(valid) || continue
+                any_valid = true
+                append!(all_separations, separations_pc[valid])
+                append!(all_values, values[valid])
                 lines!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, linewidth = 2.5)
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
                 scatter!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, markersize = 6)
+                    color = run_colors[label], markersize = 6)
+            end
+            if any_valid
+                x_limits = enclosing_decade_limits(all_separations)
+                y_limits = enclosing_decade_limits(all_values)
+                isnothing(x_limits) || xlims!(axis, x_limits...)
+                isnothing(y_limits) || ylims!(axis, y_limits...)
             else
                 text!(axis, 0.5, 0.5; text = "constant or invalid map",
                     space = :relative, align = (:center, :center))
             end
         end
+        Legend(figure[nrows + 1, 1:ncols],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true,
+            framevisible = false, labelsize = 14)
         figure
     end
 
@@ -3662,15 +3743,71 @@ end
 
 # ╔═╡ a0030003-6f8c-4d0c-9a10-000000000003
 begin
-    zeeman_structure_specs = [
-        (data = zeeman_Bmap_uG, label = L"\langle B_{\mathrm{LOS}}\rangle_{\mathrm{HI}}\;[\mu\mathrm{G}]", color = MHD_COLORS[1], period = nothing),
-        (data = zeeman_split_map_Hz, label = L"\Delta\nu_Z\;[\mathrm{Hz}]", color = MHD_COLORS[2], period = nothing),
-        (data = zeeman_NHI_map, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
-        (data = zeeman_Ipeak_map_K, label = L"\max_v I(v)\;[\mathrm{K}]", color = MHD_COLORS[4], period = nothing),
-        (data = zeeman_pV_map, label = L"p_V", color = MHD_COLORS[5], period = nothing),
-    ]
+    function zeeman_structure_products(c)
+        local_temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        local_components = (c.vx, c.vy, c.vz)
+        local_Bcomponents = (c.bx, c.by, c.bz)
+        local_nHI = Float64(zeeman_neutral_fraction) .* c.rho ./ (1.4M_H_CGS)
+        local_Blos = GAUSS_TO_MICROGAUSS .* local_Bcomponents[los_dim]
+        local_valid = isfinite.(local_nHI) .& isfinite.(local_Blos) .&
+            (local_nHI .> 0)
+        local_weight = finite_sum_dims(
+            ifelse.(local_valid, local_nHI, NaN), los_dim)
+        local_Bnumerator = finite_sum_dims(
+            ifelse.(local_valid, local_nHI .* local_Blos, NaN), los_dim)
+        local_weight = apply_observational_beam_2d(local_weight, c, sky_dims)
+        local_Bnumerator =
+            apply_observational_beam_2d(local_Bnumerator, c, sky_dims)
+        local_Bmap = local_Bnumerator ./ max.(local_weight, eps(Float64))
+        local_dx_cm = c.L[los_dim] / size(c.rho, los_dim) * PC_CM
+        local_NHI, local_pV, local_Ipeak = zeeman_fraction_maps(
+            local_nHI, local_components[los_dim], local_temperature, local_Blos,
+            los_dim, sky_dims, local_dx_cm,
+            Float64(zeeman_microturbulence_kms),
+            Float64(zeeman_frequency_MHz) * 1.0e6,
+            Float64(zeeman_coefficient_Hz_uG), Int(zeeman_channel_count))
+        local_polarized_peak = apply_observational_beam_2d(
+            local_pV .* local_Ipeak, c, sky_dims)
+        local_Ipeak = apply_observational_beam_2d(local_Ipeak, c, sky_dims)
+        local_NHI = apply_observational_beam_2d(local_NHI, c, sky_dims)
+        (
+            B = local_Bmap,
+            split = Float64(zeeman_coefficient_Hz_uG) .* local_Bmap,
+            NHI = local_NHI,
+            Ipeak = local_Ipeak,
+            pV = local_polarized_peak ./ max.(local_Ipeak, eps(Float64)),
+        )
+    end
+    zeeman_structure_products_by_run = Dict(label => begin
+        if label == selected_run &&
+                comparison_snapshot_indices[label] == selected_snapshot
+            (
+                B = zeeman_Bmap_uG,
+                split = zeeman_split_map_Hz,
+                NHI = zeeman_NHI_map,
+                Ipeak = zeeman_Ipeak_map_K,
+                pV = zeeman_pV_map,
+            )
+        else
+            zeeman_structure_products(comparison_cube(label))
+        end
+    end for label in comparison_run_labels)
+    zeeman_structure_specs_by_run = Dict(label => begin
+        products = zeeman_structure_products_by_run[label]
+        [
+            (data = products.B, label = L"\langle B_{\mathrm{LOS}}\rangle_{\mathrm{HI}}\;[\mu\mathrm{G}]", period = nothing),
+            (data = products.split, label = L"\Delta\nu_Z\;[\mathrm{Hz}]", period = nothing),
+            (data = products.NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.Ipeak, label = L"\max_v I(v)\;[\mathrm{K}]", period = nothing),
+            (data = products.pV, label = L"p_V", period = nothing),
+        ]
+    end for label in comparison_run_labels)
+    zeeman_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_zeeman_structure = display_observational_structure_functions ?
-        observational_structure_figure(zeeman_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            zeeman_structure_specs_by_run, zeeman_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "Zeeman observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_zeeman_structure : nothing

@@ -2527,6 +2527,56 @@ begin
         decade_lower / padding, decade_upper * padding
     end
 
+    """
+    Return data-focused limits for a logarithmic axis.
+
+    The central 99.8% of sufficiently sampled data sets controls the frame so
+    a handful of extreme pixels cannot create several empty decades. A small
+    margin is applied in log space; short vectors retain their full range.
+    """
+    function focused_log_limits(values;
+            lower_quantile = 0.001,
+            upper_quantile = 0.999,
+            padding_fraction = 0.06)
+        valid = Float64.(filter(value -> isfinite(value) && value > 0, vec(values)))
+        isempty(valid) && return nothing
+        lower, upper = length(valid) >= 20 ?
+            quantile(valid, (lower_quantile, upper_quantile)) :
+            extrema(valid)
+        lower > 0 && upper >= lower || return nothing
+        if upper == lower
+            padding_decades = 0.05
+            return lower / 10.0^padding_decades,
+                upper * 10.0^padding_decades
+        end
+        log_lower, log_upper = log10(lower), log10(upper)
+        padding_decades =
+            max(padding_fraction * (log_upper - log_lower), 0.025)
+        10.0^(log_lower - padding_decades),
+            10.0^(log_upper + padding_decades)
+    end
+
+    "Readable 1--2--5 logarithmic ticks, including sub-decade focused ranges."
+    function focused_log_ticks(limits; maximum_tick_count = 8)
+        lower, upper = limits
+        first_exponent = floor(Int, log10(lower))
+        last_exponent = ceil(Int, log10(upper))
+        values = sort(Float64[
+            mantissa * 10.0^exponent
+            for exponent in first_exponent:last_exponent
+            for mantissa in (1.0, 2.0, 5.0)
+            if lower <= mantissa * 10.0^exponent <= upper
+        ])
+        if isempty(values)
+            values = [sqrt(lower * upper)]
+        elseif length(values) > maximum_tick_count
+            indices = unique(round.(Int,
+                range(1, length(values); length = maximum_tick_count)))
+            values = values[indices]
+        end
+        values
+    end
+
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =
         decade_tick_values(vmin, vmax)
 
@@ -2549,12 +2599,13 @@ begin
                 fontsize = 20)
             return fig
         end
+        column_limits = focused_log_limits(N)
+        column_ticks = focused_log_ticks(column_limits)
         axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
-            xticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-        column_limits = enclosing_decade_limits(N)
+            xticks = column_ticks,
+            xminorticks = IntervalsBetween(4), xminorticksvisible = true)
         isnothing(column_limits) || xlims!(axis, column_limits...)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -2908,13 +2959,14 @@ md"""
 
 ## 3. Physical probability density functions
 
-The panels compare every run selected in **Simulations in comparative plots** at the selected snapshot index (clamped to the last available snapshot of shorter runs). They show number density $n$, magnetic-field strength $|B|$, and turbulent speed $|\delta\mathbf v|$ in physical units. Shared $\log_{10}X$ bins are used across runs. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
+The panels compare every run selected in **Simulations in comparative plots** at the selected snapshot index (clamped to the last available snapshot of shorter runs). They show number density $n$, gas temperature $T$, magnetic-field strength $|B|$, and turbulent speed $|\delta\mathbf v|$ in physical units. Shared $\log_{10}X$ bins are used across runs. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
 
 **Display physical PDFs:** $(@bind display_pdfs PlutoUI.CheckBox(default = true))
 
 | PDF panel | Display |
 |:--|:--:|
 | Number-density PDF | $(@bind show_pdf_density PlutoUI.CheckBox(default = true)) |
+| Temperature PDF | $(@bind show_pdf_temperature PlutoUI.CheckBox(default = true)) |
 | Magnetic-field PDF | $(@bind show_pdf_magnetic PlutoUI.CheckBox(default = true)) |
 | Turbulent-speed PDF | $(@bind show_pdf_velocity PlutoUI.CheckBox(default = true)) |
 """
@@ -2939,9 +2991,12 @@ begin
             vec(Float64.(c.rho)) : ones(length(c.rho))
         local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
         local_v = sqrt.(local_turb.dv2)
+        local_T = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
         local_mean_B = finite_mean(local_mag.B)
         (
             density = vec(safe_log10.(number_density(c.rho))),
+            temperature = vec(safe_log10.(local_T)),
             magnetic = vec(safe_log10.(local_B)),
             velocity = vec(safe_log10.(local_v)),
             normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
@@ -2964,6 +3019,7 @@ begin
     mean_B = finite_mean(mag.B)
     sB = vec(safe_log10.(mag.B ./ mean_B))
     logn = vec(safe_log10.(number_density_cells))
+    logTphysical = vec(safe_log10.(T))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
     pdf_reference_samples =
@@ -2972,6 +3028,8 @@ begin
     pdf_edges = (
         density = comparative_pdf_edges(
             pdf_reference_samples, :density, nbins),
+        temperature = comparative_pdf_edges(
+            pdf_reference_samples, :temperature, nbins),
         magnetic = comparative_pdf_edges(
             pdf_reference_samples, :magnetic, nbins),
         velocity = comparative_pdf_edges(
@@ -2982,10 +3040,11 @@ begin
 
     function snapshot_pdf_products(path)
         cached_scientific_product((
-            :snapshot_pdfs_v2,
+            :snapshot_pdfs_v3,
             cube_signature(path),
             Tuple(Tuple(getfield(pdf_edges, field))
-                for field in (:density, :magnetic, :velocity, :normalized_B)),
+                for field in (:density, :temperature, :magnetic, :velocity,
+                    :normalized_B)),
             Float64(mean_molecular_weight),
             String(pdf_weighting),
         )) do
@@ -2993,6 +3052,9 @@ begin
             (
                 density = density_pdf(
                     samples.density, samples.weights, pdf_edges.density),
+                temperature = density_pdf(
+                    samples.temperature, samples.weights,
+                    pdf_edges.temperature),
                 magnetic = density_pdf(
                     samples.magnetic, samples.weights, pdf_edges.magnetic),
                 velocity = density_pdf(
@@ -3022,6 +3084,9 @@ begin
         density = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :density)
             for label in comparison_run_labels),
+        temperature = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :temperature)
+            for label in comparison_run_labels),
         magnetic = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :magnetic)
             for label in comparison_run_labels),
@@ -3033,6 +3098,7 @@ begin
             for label in comparison_run_labels),
     )
     density_pdfs = pdf_products.density
+    temperature_pdfs = pdf_products.temperature
     magnetic_pdfs = pdf_products.magnetic
     velocity_pdfs = pdf_products.velocity
     normalized_B_pdfs = pdf_products.normalized_B
@@ -3043,6 +3109,8 @@ begin
     pdf_specs = NamedTuple[]
     show_pdf_density && push!(pdf_specs, (pdfs = density_pdfs,
         xlabel = L"n\;[\mathrm{cm}^{-3}]"))
+    show_pdf_temperature && push!(pdf_specs, (pdfs = temperature_pdfs,
+        xlabel = L"T\;[\mathrm{K}]"))
     show_pdf_magnetic && push!(pdf_specs, (pdfs = magnetic_pdfs,
         xlabel = L"|B|\;[\mu\mathrm{G}]"))
     show_pdf_velocity && push!(pdf_specs, (pdfs = velocity_pdfs,
@@ -6409,6 +6477,8 @@ The panels measure velocity, vorticity, and magnetic-field increments as functio
 
 The average includes every cell and shifts along the three periodic grid axes, then averages those three results. This is an axis-sampled estimator of the full vector-increment magnitude: it mixes longitudinal and transverse contributions and is **not** an angularly isotropic average. Longitudinal or transverse intermittency exponents should therefore be measured with dedicated projected increments rather than inferred from these panels. Separation is measured in parsecs; vertical units are the corresponding physical field units raised to order $p$. **Order $p$** selects the increment moment, while **Number of separation samples** controls the balance between radial resolution and computation time.
 
+Every panel superposes all runs selected under **Simulations in comparative plots**. Colors identify the comparison parameter of the active family (Mach number, resolution, or forcing ratio $\chi$), and the horizontal legend is shared by the complete figure. Each run uses the selected snapshot index, clamped to its last available snapshot when necessary.
+
 The FFT spectra and structure-function arrays live in calculation cells separate from their plotting cells, so display checkboxes and other cosmetic plot controls do not rerun the heavy transforms. Changing the active cube, the structure-function order, or the separation sampling does require a new calculation. On grids of $256^3$ cells or larger this can still take appreciable time and memory.
 
 **Display velocity, vorticity, and magnetic structure functions:** $(@bind display_structure_functions PlutoUI.CheckBox(default = true))
@@ -6453,69 +6523,70 @@ begin
         values
     end
 
-    structure_products = cached_scientific_product((
-        :vector_structure_functions,
-        cube_signature(selected_path),
-        Int(structure_order),
-        Int(structure_samples),
-    )) do
-        maximum_lag = max(1, minimum(size(cube.rho)) ÷ 2)
+    function vector_structure_products(local_cube, source)
+        cached_scientific_product((
+            :vector_structure_functions,
+            cube_signature(source),
+            Int(structure_order),
+            Int(structure_samples),
+        )) do
+        local_turb = turbulent_velocity(local_cube)
+        local_omega = vorticity(local_cube)
+        maximum_lag = max(1, minimum(size(local_cube.rho)) ÷ 2)
         local_lags = unique(round.(Int, exp.(range(
             log(1.0),
             log(Float64(maximum_lag));
             length = structure_samples,
         ))))
         local_separations =
-            local_lags .* minimum(cube.L ./ size(cube.rho))
+            local_lags .* minimum(local_cube.L ./ size(local_cube.rho))
         (
             lags = local_lags,
             separations = local_separations,
             velocity = vector_structure_function(
-                (turb.dvx, turb.dvy, turb.dvz),
+                (local_turb.dvx, local_turb.dvy, local_turb.dvz),
                 local_lags,
                 structure_order,
             ),
             vorticity = vector_structure_function(
-                (omega.wx, omega.wy, omega.wz),
+                (local_omega.wx, local_omega.wy, local_omega.wz),
                 local_lags,
                 structure_order,
             ),
             magnetic = vector_structure_function(
                 (
-                    GAUSS_TO_MICROGAUSS .* cube.bx,
-                    GAUSS_TO_MICROGAUSS .* cube.by,
-                    GAUSS_TO_MICROGAUSS .* cube.bz,
+                    GAUSS_TO_MICROGAUSS .* local_cube.bx,
+                    GAUSS_TO_MICROGAUSS .* local_cube.by,
+                    GAUSS_TO_MICROGAUSS .* local_cube.bz,
                 ),
                 local_lags,
                 structure_order,
             ),
         )
+        end
     end
-    structure_lags = structure_products.lags
-    structure_separations_pc = structure_products.separations
-    Sv = structure_products.velocity
-    Somega = structure_products.vorticity
-    SB = structure_products.magnetic
+    structure_products_by_run = Dict(label => begin
+        local_index = comparison_snapshot_indices[label]
+        local_source = run_files[label][local_index]
+        vector_structure_products(comparison_cube(label), local_source)
+    end for label in comparison_run_labels)
 end
 
 # ╔═╡ d69dd1ce-312a-48e0-a478-b470b299ed1b
 begin
     structure_specs = NamedTuple[]
     show_structure_velocity && push!(structure_specs,
-        (values = Sv,
+        (field = :velocity,
             ylabel = latexstring("S_{", structure_order,
-                "}^{v}(\\ell)\\;[(\\mathrm{km\\,s}^{-1})^{", structure_order, "}]"),
-            color = MHD_COLORS[3]))
+                "}^{v}(\\ell)\\;[(\\mathrm{km\\,s}^{-1})^{", structure_order, "}]")))
     show_structure_vorticity && push!(structure_specs,
-        (values = Somega,
+        (field = :vorticity,
             ylabel = latexstring("S_{", structure_order,
-                "}^{\\omega}(\\ell)\\;[\\mathrm{Myr}^{-", structure_order, "}]"),
-            color = MHD_COLORS[5]))
+                "}^{\\omega}(\\ell)\\;[\\mathrm{Myr}^{-", structure_order, "}]")))
     show_structure_magnetic && push!(structure_specs,
-        (values = SB,
+        (field = :magnetic,
             ylabel = latexstring("S_{", structure_order,
-                "}^{B}(\\ell)\\;[(\\mu\\mathrm{G})^{", structure_order, "}]"),
-            color = MHD_COLORS[4]))
+                "}^{B}(\\ell)\\;[(\\mu\\mathrm{G})^{", structure_order, "}]")))
     if isempty(structure_specs)
         fig_structure = Figure(size = (900, 180))
         Label(fig_structure[1, 1], L"\mathrm{Select\ at\ least\ one\ structure\ function.}", fontsize = 20)
@@ -6527,15 +6598,33 @@ begin
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                 xminorticksvisible = true, yminorticksvisible = true)
-            lines!(axis, structure_separations_pc, spec.values;
-                color = spec.color, linewidth = 2.5)
-            scatter!(axis, structure_separations_pc, spec.values;
-                color = spec.color, markersize = 6)
-            x_limits = enclosing_decade_limits(structure_separations_pc)
-            y_limits = enclosing_decade_limits(spec.values)
+            all_separations = Float64[]
+            all_values = Float64[]
+            for label in comparison_run_labels
+                product = structure_products_by_run[label]
+                separations = product.separations
+                values = getproperty(product, spec.field)
+                valid = isfinite.(separations) .& isfinite.(values) .&
+                    (separations .> 0) .& (values .> 0)
+                append!(all_separations, separations[valid])
+                append!(all_values, values[valid])
+                lines!(axis, separations[valid], values[valid];
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
+                scatter!(axis, separations[valid], values[valid];
+                    color = run_colors[label], markersize = 6)
+            end
+            x_limits = enclosing_decade_limits(all_separations)
+            y_limits = enclosing_decade_limits(all_values)
             isnothing(x_limits) || xlims!(axis, x_limits...)
             isnothing(y_limits) || ylims!(axis, y_limits...)
         end
+        Legend(fig_structure[2, 1:length(structure_specs)],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true,
+            framevisible = false, labelsize = 14)
     end
     display_structure_functions ? fig_structure : nothing
 end
@@ -6547,6 +6636,8 @@ md"""
 ## 12. Shared observational beam
 
 Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
+
+All observable structure-function figures use the same comparative convention as the three-dimensional functions above: every selected run is recomputed with identical physical and instrumental parameters, then superposed with one shared horizontal simulation legend.
 
 | Gaussian PSF setting | Control |
 |:--|:--|
@@ -6652,40 +6743,68 @@ begin
     end
 
     "Plot projected structure functions for a collection of observable maps."
-    function observational_structure_figure(specs, c, plane_dims, order, samples;
+    function observational_structure_figure(specs_by_run, cubes_by_run,
+            plane_dims, order, samples;
             heading = "Projected observable structure functions")
-        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
-        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
-            length = Int(samples)))))
-        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
-            for dimension in plane_dims)
-        separations_pc = lags .* pixel_scale_pc
-        ncols = min(2, length(specs))
-        nrows = cld(length(specs), ncols)
-        figure = Figure(size = (540ncols, 390nrows + 55))
+        isempty(specs_by_run) && return Figure(size = (900, 140))
+        first_specs = first(values(specs_by_run))
+        ncols = min(2, length(first_specs))
+        nrows = cld(length(first_specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 115))
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
-        for (spec_index, spec) in enumerate(specs)
+        for (spec_index, reference_spec) in enumerate(first_specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
             axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
-                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                title = as_latex(reference_spec.label), xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                 xminorticksvisible = true, yminorticksvisible = true)
-            values = scalar_structure_function_2d(spec.data, lags, order;
-                period = spec.period)
-            valid = isfinite.(values) .& (values .> 0)
-            if any(valid)
+            any_valid = false
+            all_separations, all_values = Float64[], Float64[]
+            for label in comparison_run_labels
+                specs = specs_by_run[label]
+                spec_index <= length(specs) || continue
+                spec = specs[spec_index]
+                c = cubes_by_run[label]
+                maximum_lag = max(1, minimum(size(spec.data)) ÷ 2)
+                lags = unique(round.(Int, exp.(range(
+                    log(1.0), log(Float64(maximum_lag));
+                    length = Int(samples)))))
+                pixel_scale_pc = minimum(
+                    c.L[dimension] / size(c.rho, dimension)
+                    for dimension in plane_dims)
+                separations_pc = lags .* pixel_scale_pc
+                values = scalar_structure_function_2d(
+                    spec.data, lags, order; period = spec.period)
+                valid = isfinite.(values) .& (values .> 0)
+                any(valid) || continue
+                any_valid = true
+                append!(all_separations, separations_pc[valid])
+                append!(all_values, values[valid])
                 lines!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, linewidth = 2.5)
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
                 scatter!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, markersize = 6)
+                    color = run_colors[label], markersize = 6)
+            end
+            if any_valid
+                x_limits = enclosing_decade_limits(all_separations)
+                y_limits = enclosing_decade_limits(all_values)
+                isnothing(x_limits) || xlims!(axis, x_limits...)
+                isnothing(y_limits) || ylims!(axis, y_limits...)
             else
                 text!(axis, 0.5, 0.5; text = "constant or invalid map",
                     space = :relative, align = (:center, :center))
             end
         end
+        Legend(figure[nrows + 1, 1:ncols],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true,
+            framevisible = false, labelsize = 14)
         figure
     end
 
@@ -7097,11 +7216,24 @@ begin
         local_I = apply_observational_beam_2d(local_I, c, sky_dims)
         local_Q = apply_observational_beam_2d(local_Q, c, sky_dims)
         local_U = apply_observational_beam_2d(local_U, c, sky_dims)
-        local_fraction = sqrt.(local_Q .^ 2 .+ local_U .^ 2) ./
-            max.(local_I, eps(Float64))
+        local_spectral_factor = dust_planck_MJysr * dust_sigma_cm2
+        local_I_stokes = local_spectral_factor .* local_I
+        local_Q_stokes = local_spectral_factor .* local_Q
+        local_U_stokes = local_spectral_factor .* local_U
+        local_P_stokes = sqrt.(local_Q_stokes .^ 2 .+ local_U_stokes .^ 2)
+        local_fraction = local_P_stokes ./
+            max.(local_I_stokes, eps(Float64))
         local_column = finite_sum_dims(c.rho, los_dim) .* local_dx_cm ./
             (max(Float64(dust_mu_H), eps(Float64)) * M_H_CGS)
-        (column = local_column, fraction = local_fraction)
+        (
+            column = local_column,
+            I = local_I_stokes,
+            Q = local_Q_stokes,
+            U = local_U_stokes,
+            P = local_P_stokes,
+            fraction = local_fraction,
+            angle = rad2deg.(0.5 .* atan.(local_U_stokes, local_Q_stokes)),
+        )
     end
 
     dust_distributions_by_run = Dict(label =>
@@ -7189,16 +7321,22 @@ end
 
 # ╔═╡ a0010001-6f8c-4d0c-9a10-000000000001
 begin
-    dust_structure_specs = [
-        (data = dust_I, label = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[1], period = nothing),
-        (data = dust_Q, label = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[2], period = nothing),
-        (data = dust_U, label = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[3], period = nothing),
-        (data = dust_P, label = L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]", color = MHD_COLORS[4], period = nothing),
-        (data = dust_fraction, label = L"p_{\mathrm d}", color = MHD_COLORS[5], period = nothing),
-        (data = dust_angle_deg, label = L"\psi_{\mathrm d}\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
-    ]
+    dust_structure_specs_by_run = Dict(label => begin
+        products = dust_distributions_by_run[label]
+        [
+            (data = products.I, label = L"I_\nu\;[\mathrm{MJy\,sr}^{-1}]", period = nothing),
+            (data = products.Q, label = L"Q_\nu\;[\mathrm{MJy\,sr}^{-1}]", period = nothing),
+            (data = products.U, label = L"U_\nu\;[\mathrm{MJy\,sr}^{-1}]", period = nothing),
+            (data = products.P, label = L"P_\nu\;[\mathrm{MJy\,sr}^{-1}]", period = nothing),
+            (data = products.fraction, label = L"p_{\mathrm d}", period = nothing),
+            (data = products.angle, label = L"\psi_{\mathrm d}\;[{}^\circ]", period = 180.0),
+        ]
+    end for label in comparison_run_labels)
+    dust_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_dust_structure = display_observational_structure_functions ?
-        observational_structure_figure(dust_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            dust_structure_specs_by_run, dust_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "Dust observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_dust_structure : nothing
@@ -7524,18 +7662,88 @@ end
 
 # ╔═╡ a0020002-6f8c-4d0c-9a10-000000000002
 begin
-    starlight_structure_specs = [
-        (data = starlight_I_normalized, label = L"I/I_0", color = MHD_COLORS[1], period = nothing),
-        (data = starlight_Q_normalized, label = L"Q/I_0", color = MHD_COLORS[2], period = nothing),
-        (data = starlight_U_normalized, label = L"U/I_0", color = MHD_COLORS[3], period = nothing),
-        (data = starlight_V_map ./ starlight_I0, label = L"V/I_0", color = MHD_COLORS[4], period = nothing),
-        (data = starlight_p_map, label = L"p_\star", color = MHD_COLORS[5], period = nothing),
-        (data = starlight_angle_deg, label = L"\psi_\star\;[{}^\circ]", color = MHD_COLORS[6], period = 180.0),
-        (data = starlight_tau_map, label = L"\tau_V", color = MHD_COLORS[1], period = nothing),
-        (data = starlight_blos_map_uG, label = L"\langle B_{\mathrm{LOS}}\rangle_n\;[\mu\mathrm{G}]", color = MHD_COLORS[2], period = nothing),
-    ]
+    function starlight_structure_products(c)
+        nlos = size(c.rho, los_dim)
+        dx_pc = c.L[los_dim] / nlos
+        cell_count = clamp(ceil(Int, clamp(Float64(starlight_star_distance_pc),
+            dx_pc, c.L[los_dim]) / dx_pc), 1, nlos)
+        map_shape = size(selectdim(c.rho, los_dim, 1))
+        I0 = Float64(starlight_initial_I)
+        I = fill(I0, map_shape)
+        Q = fill(Float64(starlight_initial_Q), map_shape)
+        U = fill(Float64(starlight_initial_U), map_shape)
+        V = fill(Float64(starlight_initial_V), map_shape)
+        tau_total = zeros(Float64, map_shape)
+        blos_numerator = zeros(Float64, map_shape)
+        column = zeros(Float64, map_shape)
+        components = (c.bx, c.by, c.bz)
+        p0 = clamp(Float64(starlight_p0), 0.0, 1 - eps(Float64))
+        nh_per_av = max(Float64(starlight_nh_per_av), eps(Float64))
+        for cell_index in 1:cell_count
+            density = selectdim(c.rho, los_dim, cell_index) ./
+                (max(Float64(starlight_mu_H), eps(Float64)) * M_H_CGS)
+            blos = selectdim(components[los_dim], los_dim, cell_index)
+            east = selectdim(components[sky_dims[1]], los_dim, cell_index)
+            north = selectdim(components[sky_dims[2]], los_dim, cell_index)
+            psi = atan.(east, north)
+            tau = density .* (dx_pc * PC_CM) ./ nh_per_av
+            I, Q, U, V = starlight_mueller_step(I, Q, U, V, tau, psi, p0)
+            tau_total .+= tau
+            blos_numerator .+= density .* blos
+            column .+= density
+        end
+        I = apply_observational_beam_2d(I, c, sky_dims)
+        Q = apply_observational_beam_2d(Q, c, sky_dims)
+        U = apply_observational_beam_2d(U, c, sky_dims)
+        V = apply_observational_beam_2d(V, c, sky_dims)
+        (
+            I = I ./ I0,
+            Q = Q ./ I0,
+            U = U ./ I0,
+            V = V ./ I0,
+            fraction = clamp.(sqrt.(Q .^ 2 .+ U .^ 2) ./
+                max.(abs.(I), eps(Float64)), 0.0, 1.0),
+            angle = rad2deg.(0.5 .* atan.(U, Q)),
+            tau = tau_total,
+            blos = GAUSS_TO_MICROGAUSS .* blos_numerator ./
+                max.(column, eps(Float64)),
+        )
+    end
+    starlight_structure_products_by_run = Dict(label => begin
+        if label == selected_run &&
+                comparison_snapshot_indices[label] == selected_snapshot
+            (
+                I = starlight_I_normalized,
+                Q = starlight_Q_normalized,
+                U = starlight_U_normalized,
+                V = starlight_V_map ./ starlight_I0,
+                fraction = starlight_p_map,
+                angle = starlight_angle_deg,
+                tau = starlight_tau_map,
+                blos = starlight_blos_map_uG,
+            )
+        else
+            starlight_structure_products(comparison_cube(label))
+        end
+    end for label in comparison_run_labels)
+    starlight_structure_specs_by_run = Dict(label => begin
+        products = starlight_structure_products_by_run[label]
+        [
+            (data = products.I, label = L"I/I_0", period = nothing),
+            (data = products.Q, label = L"Q/I_0", period = nothing),
+            (data = products.U, label = L"U/I_0", period = nothing),
+            (data = products.V, label = L"V/I_0", period = nothing),
+            (data = products.fraction, label = L"p_\star", period = nothing),
+            (data = products.angle, label = L"\psi_\star\;[{}^\circ]", period = 180.0),
+            (data = products.tau, label = L"\tau_V", period = nothing),
+            (data = products.blos, label = L"\langle B_{\mathrm{LOS}}\rangle_n\;[\mu\mathrm{G}]", period = nothing),
+        ]
+    end for label in comparison_run_labels)
+    starlight_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_starlight_structure = display_observational_structure_functions ?
-        observational_structure_figure(starlight_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            starlight_structure_specs_by_run, starlight_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "Starlight observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_starlight_structure : nothing
@@ -7768,15 +7976,71 @@ end
 
 # ╔═╡ a0030003-6f8c-4d0c-9a10-000000000003
 begin
-    zeeman_structure_specs = [
-        (data = zeeman_Bmap_uG, label = L"\langle B_{\mathrm{LOS}}\rangle_{\mathrm{HI}}\;[\mu\mathrm{G}]", color = MHD_COLORS[1], period = nothing),
-        (data = zeeman_split_map_Hz, label = L"\Delta\nu_Z\;[\mathrm{Hz}]", color = MHD_COLORS[2], period = nothing),
-        (data = zeeman_NHI_map, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
-        (data = zeeman_Ipeak_map_K, label = L"\max_v I(v)\;[\mathrm{K}]", color = MHD_COLORS[4], period = nothing),
-        (data = zeeman_pV_map, label = L"p_V", color = MHD_COLORS[5], period = nothing),
-    ]
+    function zeeman_structure_products(c)
+        local_temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        local_components = (c.vx, c.vy, c.vz)
+        local_Bcomponents = (c.bx, c.by, c.bz)
+        local_nHI = Float64(zeeman_neutral_fraction) .* c.rho ./ (1.4M_H_CGS)
+        local_Blos = GAUSS_TO_MICROGAUSS .* local_Bcomponents[los_dim]
+        local_valid = isfinite.(local_nHI) .& isfinite.(local_Blos) .&
+            (local_nHI .> 0)
+        local_weight = finite_sum_dims(
+            ifelse.(local_valid, local_nHI, NaN), los_dim)
+        local_Bnumerator = finite_sum_dims(
+            ifelse.(local_valid, local_nHI .* local_Blos, NaN), los_dim)
+        local_weight = apply_observational_beam_2d(local_weight, c, sky_dims)
+        local_Bnumerator =
+            apply_observational_beam_2d(local_Bnumerator, c, sky_dims)
+        local_Bmap = local_Bnumerator ./ max.(local_weight, eps(Float64))
+        local_dx_cm = c.L[los_dim] / size(c.rho, los_dim) * PC_CM
+        local_NHI, local_pV, local_Ipeak = zeeman_fraction_maps(
+            local_nHI, local_components[los_dim], local_temperature, local_Blos,
+            los_dim, sky_dims, local_dx_cm,
+            Float64(zeeman_microturbulence_kms),
+            Float64(zeeman_frequency_MHz) * 1.0e6,
+            Float64(zeeman_coefficient_Hz_uG), Int(zeeman_channel_count))
+        local_polarized_peak = apply_observational_beam_2d(
+            local_pV .* local_Ipeak, c, sky_dims)
+        local_Ipeak = apply_observational_beam_2d(local_Ipeak, c, sky_dims)
+        local_NHI = apply_observational_beam_2d(local_NHI, c, sky_dims)
+        (
+            B = local_Bmap,
+            split = Float64(zeeman_coefficient_Hz_uG) .* local_Bmap,
+            NHI = local_NHI,
+            Ipeak = local_Ipeak,
+            pV = local_polarized_peak ./ max.(local_Ipeak, eps(Float64)),
+        )
+    end
+    zeeman_structure_products_by_run = Dict(label => begin
+        if label == selected_run &&
+                comparison_snapshot_indices[label] == selected_snapshot
+            (
+                B = zeeman_Bmap_uG,
+                split = zeeman_split_map_Hz,
+                NHI = zeeman_NHI_map,
+                Ipeak = zeeman_Ipeak_map_K,
+                pV = zeeman_pV_map,
+            )
+        else
+            zeeman_structure_products(comparison_cube(label))
+        end
+    end for label in comparison_run_labels)
+    zeeman_structure_specs_by_run = Dict(label => begin
+        products = zeeman_structure_products_by_run[label]
+        [
+            (data = products.B, label = L"\langle B_{\mathrm{LOS}}\rangle_{\mathrm{HI}}\;[\mu\mathrm{G}]", period = nothing),
+            (data = products.split, label = L"\Delta\nu_Z\;[\mathrm{Hz}]", period = nothing),
+            (data = products.NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.Ipeak, label = L"\max_v I(v)\;[\mathrm{K}]", period = nothing),
+            (data = products.pV, label = L"p_V", period = nothing),
+        ]
+    end for label in comparison_run_labels)
+    zeeman_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_zeeman_structure = display_observational_structure_functions ?
-        observational_structure_figure(zeeman_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            zeeman_structure_specs_by_run, zeeman_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "Zeeman observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_zeeman_structure : nothing
@@ -7833,7 +8097,7 @@ use all physical and instrumental defaults listed below.
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
 | First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = false)) |
+| Peak Faraday-spectrum map $P_{\max}$ | $(@bind show_moose_pmax PlutoUI.CheckBox(default = true)) |
 | Faraday-spectrum amplitude | $(@bind show_moose_F_abs PlutoUI.CheckBox(default = true)) |
 | $\Re F(\phi)$ spectrum | $(@bind show_moose_F_real PlutoUI.CheckBox(default = true)) |
 | $\Im F(\phi)$ spectrum | $(@bind show_moose_F_imag PlutoUI.CheckBox(default = true)) |
@@ -8226,21 +8490,22 @@ begin
     if isempty(moose_tomography_specs)
         fig_moose_tomography = Figure(size = (900, 180))
         Label(fig_moose_tomography[1, 1],
-            L"\mathrm{Select\ the\ }p_{\max}\mathrm{\ map\ or\ an\ }F(\phi)\mathrm{\ component.}", fontsize = 20)
+            L"\mathrm{Select\ the\ }P_{\max}\mathrm{\ map\ or\ an\ }F(\phi)\mathrm{\ component.}", fontsize = 20)
     else
         fig_moose_tomography = Figure(size = (570length(moose_tomography_specs), 445))
         for (index, product) in enumerate(moose_tomography_specs)
             if product == :pmax
                 panel = fig_moose_tomography[1, index] = GridLayout()
                 ax = physical_map_axis(panel[1, 1], xlabel = latexstring(sky_labels[1], "/\\mathrm{pc}"),
-                    ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"))
+                    ylabel = latexstring(sky_labels[2], "/\\mathrm{pc}"),
+                    title = L"P_{\max}=\max_\phi |F(\phi)|")
                 hm = heatmap!(ax, sky_coordinates[1], sky_coordinates[2], moose_pmax_K;
                     colormap = :viridis,
                     colorrange = robust_colorrange(moose_pmax_K, color_percentile))
                 scatter!(ax, [sky_coordinates[1][Int(moose_sky_i)]],
                     [sky_coordinates[2][Int(moose_sky_j)]];
                     marker = :cross, markersize = 20, strokewidth = 3, color = :white)
-                latex_colorbar(panel[1, 2], hm; label = L"p_{\max}=\max_\phi|F(\phi)|\;[\mathrm{K}]",
+                latex_colorbar(panel[1, 2], hm; label = L"P_{\max}\;[\mathrm{K}]",
                     tickformat = latex_ticklabels)
                 colsize!(panel, 2, 22)
             else
@@ -8273,17 +8538,125 @@ end
 
 # ╔═╡ a0040004-6f8c-4d0c-9a10-000000000004
 begin
-    moose_structure_specs = [
-        (data = moose_phi_map, label = L"\phi\;[\mathrm{rad\,m}^{-2}]", color = MHD_COLORS[1], period = nothing),
-        (data = moose_I_K, label = L"T_{\mathrm{syn}}\;[\mathrm{K}]", color = MHD_COLORS[2], period = nothing),
-        (data = moose_Q_K, label = L"Q_\nu\;[\mathrm{K}]", color = MHD_COLORS[3], period = nothing),
-        (data = moose_U_K, label = L"U_\nu\;[\mathrm{K}]", color = MHD_COLORS[4], period = nothing),
-        (data = moose_P_K, label = L"P_\nu\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
-        (data = moose_fraction, label = L"P_\nu/I_\nu", color = MHD_COLORS[6], period = nothing),
-        (data = moose_pmax_K, label = L"p_{\max}\;[\mathrm{K}]", color = MHD_COLORS[1], period = nothing),
-    ]
+    function moose_structure_products(c)
+        components = (c.bx, c.by, c.bz)
+        local_temperature = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        local_nH = c.rho ./
+            (Float64(mean_molecular_weight) * M_H_CGS)
+        local_ne = moose_electron_density(local_nH, local_temperature)
+        local_Blos = GAUSS_TO_MICROGAUSS .* components[los_dim]
+        local_B1 = GAUSS_TO_MICROGAUSS .* components[sky_dims[1]]
+        local_B2 = GAUSS_TO_MICROGAUSS .* components[sky_dims[2]]
+        local_Bperp = sqrt.(local_B1 .^ 2 .+ local_B2 .^ 2)
+        local_dx_pc = Float64(MOOSE_PATH_LENGTH_PC) / size(c.rho, los_dim)
+        local_phi_increment = 0.812 .* local_ne .* local_Blos .* local_dx_pc
+        local_phi_to_cell = cumsum(local_phi_increment; dims = los_dim) .-
+            0.5 .* local_phi_increment
+        local_phi_map = finite_sum_dims(local_phi_increment, los_dim)
+        local_p = Float64(moose_cr_index)
+        local_B_exponent = (local_p + 1) / 2
+        local_spectral_index = -(local_p + 3) / 2
+        local_emissivity_base = Float64(moose_synchrotron_norm) .*
+            local_Bperp .^ local_B_exponent
+        local_intrinsic_angle = atan.(local_B2, local_B1) .+ pi / 2
+        local_frequency_scale =
+            (Float64(moose_frequency_MHz) / 150.0)^local_spectral_index
+        local_phase = 2 .* (local_intrinsic_angle .+
+            local_phi_to_cell .* moose_lambda2_m2)
+        local_I = finite_sum_dims(
+            local_emissivity_base .* local_frequency_scale, los_dim) .* local_dx_pc
+        local_Q = finite_sum_dims(local_emissivity_base .* local_frequency_scale .*
+            cos.(local_phase), los_dim) .* local_dx_pc
+        local_U = finite_sum_dims(local_emissivity_base .* local_frequency_scale .*
+            sin.(local_phase), los_dim) .* local_dx_pc
+        local_transfer = moose_instrument_transfer(
+            size(local_I), moose_largest_scale_pix, moose_smallest_scale_pix)
+        if apply_moose_interferometer
+            local_I = apply_moose_interferometer_2d(local_I, local_transfer)
+            local_Q = apply_moose_interferometer_2d(local_Q, local_transfer)
+            local_U = apply_moose_interferometer_2d(local_U, local_transfer)
+        end
+        local_I = apply_observational_beam_2d(local_I, c, sky_dims)
+        local_Q = apply_observational_beam_2d(local_Q, c, sky_dims)
+        local_U = apply_observational_beam_2d(local_U, c, sky_dims)
+        local_P = sqrt.(local_Q .^ 2 .+ local_U .^ 2)
+
+        local_shape = size(local_phi_map)
+        local_Q_band = Array{Float64}(
+            undef, local_shape..., moose_nfrequency)
+        local_U_band = similar(local_Q_band)
+        for channel in eachindex(moose_band_frequency_MHz)
+            frequency_scale =
+                (moose_band_frequency_MHz[channel] / 150.0)^local_spectral_index
+            phase = 2 .* (local_intrinsic_angle .+
+                local_phi_to_cell .* moose_band_lambda2_m2[channel])
+            local_Q_band[:, :, channel] .= finite_sum_dims(
+                local_emissivity_base .* frequency_scale .* cos.(phase),
+                los_dim) .* local_dx_pc
+            local_U_band[:, :, channel] .= finite_sum_dims(
+                local_emissivity_base .* frequency_scale .* sin.(phase),
+                los_dim) .* local_dx_pc
+        end
+        if apply_moose_interferometer
+            local_Q_band =
+                apply_moose_interferometer_cube(local_Q_band, local_transfer)
+            local_U_band =
+                apply_moose_interferometer_cube(local_U_band, local_transfer)
+        end
+        local_Q_band =
+            apply_observational_beam_cube(local_Q_band, c, sky_dims)
+        local_U_band =
+            apply_observational_beam_cube(local_U_band, c, sky_dims)
+        local_P_matrix = reshape(
+            complex.(local_Q_band, local_U_band), :, moose_nfrequency)
+        local_F_matrix =
+            local_P_matrix * moose_rm_phase_matrix / moose_nfrequency
+        local_pmax = reshape(
+            maximum(abs.(local_F_matrix); dims = 2), local_shape)
+        (
+            phi = local_phi_map,
+            I = local_I,
+            Q = local_Q,
+            U = local_U,
+            P = local_P,
+            fraction = local_P ./ max.(abs.(local_I), eps(Float64)),
+            pmax = local_pmax,
+        )
+    end
+    moose_structure_products_by_run = Dict(label => begin
+        if label == selected_run &&
+                comparison_snapshot_indices[label] == selected_snapshot
+            (
+                phi = moose_phi_map,
+                I = moose_I_K,
+                Q = moose_Q_K,
+                U = moose_U_K,
+                P = moose_P_K,
+                fraction = moose_fraction,
+                pmax = moose_pmax_K,
+            )
+        else
+            moose_structure_products(comparison_cube(label))
+        end
+    end for label in comparison_run_labels)
+    moose_structure_specs_by_run = Dict(label => begin
+        products = moose_structure_products_by_run[label]
+        [
+            (data = products.phi, label = L"\phi\;[\mathrm{rad\,m}^{-2}]", period = nothing),
+            (data = products.I, label = L"T_{\mathrm{syn}}\;[\mathrm{K}]", period = nothing),
+            (data = products.Q, label = L"Q_\nu\;[\mathrm{K}]", period = nothing),
+            (data = products.U, label = L"U_\nu\;[\mathrm{K}]", period = nothing),
+            (data = products.P, label = L"P_\nu\;[\mathrm{K}]", period = nothing),
+            (data = products.fraction, label = L"P_\nu/I_\nu", period = nothing),
+            (data = products.pmax, label = L"P_{\max}\;[\mathrm{K}]", period = nothing),
+        ]
+    end for label in comparison_run_labels)
+    moose_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_moose_structure = display_observational_structure_functions ?
-        observational_structure_figure(moose_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            moose_structure_specs_by_run, moose_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "MOOSE observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_moose_structure : nothing
@@ -8314,7 +8687,7 @@ begin
         (
             data = moose_pmax_K,
             title = L"\max_\phi|F(\phi)|",
-            ylabel = L"E_{p_{\max}}(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
+            ylabel = L"E_{P_{\max}}(k)\;[\mathrm{K}^2\,\mathrm{pc}]",
             color = MHD_COLORS[4],
         ),
     ]
@@ -9367,23 +9740,156 @@ end
 
 # ╔═╡ a0050005-6f8c-4d0c-9a10-000000000005
 begin
-    shine_structure_specs = [
-        (data = shine_NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[1], period = nothing),
-        (data = shine_NCNM, label = L"N_{\mathrm{CNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[2], period = nothing),
-        (data = shine_NLNM, label = L"N_{\mathrm{LNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
-        (data = shine_NWNM, label = L"N_{\mathrm{WNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[4], period = nothing),
-        (data = shine_peakTb, label = L"\max_v T_B\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
-        (data = shine_mom0, label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", color = MHD_COLORS[6], period = nothing),
-        (data = shine_mom1, label = L"M_1\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[1], period = nothing),
-        (data = shine_mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[2], period = nothing),
-        (data = shine_peak_tau, label = L"\max_v\tau_{21}", color = MHD_COLORS[3], period = nothing),
-        (data = shine_fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", color = MHD_COLORS[4], period = nothing),
-        (data = shine_rgb_cnm_map, label = L"W_{\mathrm{CNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(0.000, 0.000, 1.000), period = nothing),
-        (data = shine_rgb_lnm_map, label = L"W_{\mathrm{LNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(0.000, 1.000, 0.000), period = nothing),
-        (data = shine_rgb_wnm_map, label = L"W_{\mathrm{WNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(1.000, 0.000, 0.000), period = nothing),
-    ]
+    function shine_structure_products(c)
+        local_permutation = (sky_dims[1], sky_dims[2], los_dim)
+        local_temperature_native =
+            Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        local_nHI = permutedims(
+            Float64(shine_neutral_fraction) .* c.rho ./
+                (max(Float64(shine_mu_H), eps(Float64)) * M_H_CGS),
+            local_permutation)
+        local_temperature = permutedims(
+            max.(local_temperature_native, eps(Float64)), local_permutation)
+        local_velocity = permutedims(
+            (c.vx, c.vy, c.vz)[los_dim], local_permutation)
+        local_nCNM = local_nHI .* (local_temperature .< shine_TCNM_value)
+        local_nLNM = local_nHI .* ((local_temperature .>= shine_TCNM_value) .&
+            (local_temperature .< shine_TWNM_value))
+        local_nWNM = local_nHI .* (local_temperature .>= shine_TWNM_value)
+        local_dx_cm = c.L[los_dim] / size(c.rho, los_dim) * PC_CM
+        local_NHI = apply_observational_beam_2d(
+            finite_sum_dims(local_nHI, 3) .* local_dx_cm, c, sky_dims)
+        local_NCNM = apply_observational_beam_2d(
+            finite_sum_dims(local_nCNM, 3) .* local_dx_cm, c, sky_dims)
+        local_NLNM = apply_observational_beam_2d(
+            finite_sum_dims(local_nLNM, 3) .* local_dx_cm, c, sky_dims)
+        local_NWNM = apply_observational_beam_2d(
+            finite_sum_dims(local_nWNM, 3) .* local_dx_cm, c, sky_dims)
+        local_Tb = zeros(Float64, size(local_nHI, 1), size(local_nHI, 2),
+            length(shine_velocity_axis))
+        local_tau = similar(local_Tb)
+        Threads.@threads for i in axes(local_nHI, 1)
+            for j in axes(local_nHI, 2)
+                Tb_line, tau_line = shine_hi_spectrum(
+                    @view(local_nHI[i, j, :]),
+                    @view(local_velocity[i, j, :]),
+                    @view(local_temperature[i, j, :]),
+                    shine_velocity_axis, local_dx_cm,
+                    shine_mu_value, shine_fixed_width_value)
+                local_Tb[i, j, :] .= Tb_line
+                local_tau[i, j, :] .= tau_line
+            end
+        end
+        local_Tb = apply_observational_beam_cube(local_Tb, c, sky_dims)
+        local_tau = apply_observational_beam_cube(local_tau, c, sky_dims)
+        local_velocity_3d = reshape(shine_velocity_axis, 1, 1, :)
+        local_positive_weight = max.(local_Tb, 0.0) .* shine_dv
+        local_mom0 = finite_sum_dims(local_positive_weight, 3)
+        local_weight_sum = max.(local_mom0, eps(Float64))
+        local_mom1 = finite_sum_dims(
+            local_positive_weight .* local_velocity_3d, 3) ./ local_weight_sum
+        local_mom2 = sqrt.(max.(finite_sum_dims(local_positive_weight .*
+            (local_velocity_3d .- reshape(local_mom1, size(local_mom1)..., 1)) .^ 2,
+            3) ./ local_weight_sum, 0.0))
+        local_peakTb = finite_maximum_dims(local_Tb, 3)
+        local_peak_tau = finite_maximum_dims(local_tau, 3)
+        local_fftcnm = zeros(Float64, size(local_NHI))
+        if !isempty(shine_fft_indices)
+            Threads.@threads for i in axes(local_Tb, 1)
+                for j in axes(local_Tb, 2)
+                    amplitudes = abs.(fft(@view local_Tb[i, j, :]))
+                    local_fftcnm[i, j] = amplitudes[1] > 0 ?
+                        maximum(amplitudes[shine_fft_indices]) /
+                            amplitudes[1] : 0.0
+                end
+            end
+        end
+        function local_phase_velocity_map(phase_density, window)
+            velocity_indices = findall(v ->
+                window[1] <= v <= window[2], shine_velocity_axis)
+            phase_map = zeros(Float64,
+                size(phase_density, 1), size(phase_density, 2))
+            isempty(velocity_indices) && return phase_map
+            Threads.@threads for i in axes(phase_density, 1)
+                for j in axes(phase_density, 2)
+                    brightness, _ = shine_hi_spectrum(
+                        @view(phase_density[i, j, :]),
+                        @view(local_velocity[i, j, :]),
+                        @view(local_temperature[i, j, :]),
+                        shine_velocity_axis, local_dx_cm,
+                        shine_mu_value, shine_fixed_width_value)
+                    phase_map[i, j] =
+                        sum(max.(@view(brightness[velocity_indices]), 0.0)) *
+                            shine_dv
+                end
+            end
+            apply_observational_beam_2d(phase_map, c, sky_dims)
+        end
+        (
+            NHI = local_NHI,
+            NCNM = local_NCNM,
+            NLNM = local_NLNM,
+            NWNM = local_NWNM,
+            peakTb = local_peakTb,
+            mom0 = local_mom0,
+            mom1 = local_mom1,
+            mom2 = local_mom2,
+            peak_tau = local_peak_tau,
+            fftcnm = local_fftcnm,
+            rgb_cnm = local_phase_velocity_map(
+                local_nCNM, shine_rgb_cnm_window),
+            rgb_lnm = local_phase_velocity_map(
+                local_nLNM, shine_rgb_lnm_window),
+            rgb_wnm = local_phase_velocity_map(
+                local_nWNM, shine_rgb_wnm_window),
+        )
+    end
+    shine_structure_products_by_run = Dict(label => begin
+        if label == selected_run &&
+                comparison_snapshot_indices[label] == selected_snapshot
+            (
+                NHI = shine_NHI,
+                NCNM = shine_NCNM,
+                NLNM = shine_NLNM,
+                NWNM = shine_NWNM,
+                peakTb = shine_peakTb,
+                mom0 = shine_mom0,
+                mom1 = shine_mom1,
+                mom2 = shine_mom2,
+                peak_tau = shine_peak_tau,
+                fftcnm = shine_fftcnm,
+                rgb_cnm = shine_rgb_cnm_map,
+                rgb_lnm = shine_rgb_lnm_map,
+                rgb_wnm = shine_rgb_wnm_map,
+            )
+        else
+            shine_structure_products(comparison_cube(label))
+        end
+    end for label in comparison_run_labels)
+    shine_structure_specs_by_run = Dict(label => begin
+        products = shine_structure_products_by_run[label]
+        [
+            (data = products.NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.NCNM, label = L"N_{\mathrm{CNM}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.NLNM, label = L"N_{\mathrm{LNM}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.NWNM, label = L"N_{\mathrm{WNM}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.peakTb, label = L"\max_v T_B\;[\mathrm{K}]", period = nothing),
+            (data = products.mom0, label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", period = nothing),
+            (data = products.mom1, label = L"M_1\;[\mathrm{km\,s}^{-1}]", period = nothing),
+            (data = products.mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", period = nothing),
+            (data = products.peak_tau, label = L"\max_v\tau_{21}", period = nothing),
+            (data = products.fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", period = nothing),
+            (data = products.rgb_cnm, label = L"W_{\mathrm{CNM}}\;[\mathrm{K\,km\,s}^{-1}]", period = nothing),
+            (data = products.rgb_lnm, label = L"W_{\mathrm{LNM}}\;[\mathrm{K\,km\,s}^{-1}]", period = nothing),
+            (data = products.rgb_wnm, label = L"W_{\mathrm{WNM}}\;[\mathrm{K\,km\,s}^{-1}]", period = nothing),
+        ]
+    end for label in comparison_run_labels)
+    shine_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_shine_structure = display_observational_structure_functions ?
-        observational_structure_figure(shine_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            shine_structure_specs_by_run, shine_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "SHINE observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_shine_structure : nothing
@@ -9449,8 +9955,6 @@ or the intensity-weighted mean,
 \langle p\rangle_I=\frac{\sum_j P_j}{\sum_j I_j}=\frac{\sum_j p_jI_j}{\sum_j I_j}.
 ```
 
-The thick horizontal segments above every panel identify two time intervals for the active run: the exponential dynamo interval used to fit $\Gamma_B$ in section 5 and the user-selected statistically steady interval. Thin vertical guides mark the end of growth and the beginning of the steady regime.
-
 **Display polarization fractions versus time:** $(@bind display_polarization_time PlutoUI.CheckBox(default = false))
 
 | Temporal polarization diagnostic | Display |
@@ -9465,8 +9969,6 @@ The thick horizontal segments above every panel identify two time intervals for 
 | Sky averaging | $(@bind polarization_time_weighting PlutoUI.Select(["Intensity-weighted mean" => "intensity", "Area-weighted mean" => "area"]; default = "intensity")) |
 | Snapshot stride | $(@bind polarization_time_stride PlutoUI.Slider(1:maximum_snapshot_count; default = 1, show_value = true)) |
 | Zeeman velocity channels | $(@bind polarization_time_zeeman_channels PlutoUI.Select([31, 51, 81, 101]; default = 51)) |
-| Display growth and steady-state bars | $(@bind show_polarization_regime_bars PlutoUI.CheckBox(default = true)) |
-| Steady-state start snapshot | $(@bind polarization_steady_start PlutoUI.Slider(1:length(run_files[selected_run]); default = min(last(growth_fit_window) + 1, length(run_files[selected_run])), show_value = true)) |
 """
 
 # ╔═╡ b37d82bc-7819-47f9-b0ab-4de2f124f3cc
@@ -9655,70 +10157,31 @@ begin
     else
         panel_columns = length(polarization_time_panel_specs) == 1 ? 1 : 2
         panel_rows = cld(length(polarization_time_panel_specs), panel_columns)
-        fig_polarization_time = Figure(size = (560panel_columns, 400panel_rows + 95))
-        growth_start_time = growth_has_interval ? growth_times[growth_first_index] : NaN
-        growth_end_time = growth_has_interval ? growth_times[growth_last_index] : NaN
-        steady_index = clamp(Int(polarization_steady_start), 1, length(growth_times))
-        steady_start_time = growth_times[steady_index]
-        steady_end_time = last(growth_times)
+        fig_polarization_time =
+            Figure(size = (560panel_columns, 400panel_rows + 75))
 
         for (panel_index, spec) in enumerate(polarization_time_panel_specs)
             row, column = cld(panel_index, panel_columns), mod1(panel_index, panel_columns)
             axis = latex_axis(fig_polarization_time[row, column],
                 xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel)
-            all_percentages = Float64[]
             for label in comparison_run_labels
                 series = polarization_time_series[label]
                 times = Float64.(getfield.(series, :t))
                 percentages = 100 .* Float64.(getfield.(series, spec.field))
                 valid = isfinite.(times) .& isfinite.(percentages)
-                append!(all_percentages, percentages[valid])
                 lines!(axis, times[valid], percentages[valid];
                     color = run_colors[label], linewidth = 2.4)
                 scatter!(axis, times[valid], percentages[valid];
                     color = run_colors[label], markersize = 7)
             end
-
-            if show_polarization_regime_bars && !isempty(all_percentages)
-                data_min, data_max = extrema(all_percentages)
-                span = max(data_max - data_min, max(abs(data_max), 1.0) * 0.08)
-                growth_bar_y = data_max + 0.12span
-                steady_bar_y = data_max + 0.28span
-                if growth_has_interval && isfinite(growth_start_time) && isfinite(growth_end_time)
-                    lines!(axis, [growth_start_time, growth_end_time],
-                        [growth_bar_y, growth_bar_y]; color = MHD_COLORS[2],
-                        linewidth = 7, linecap = :round)
-                    vlines!(axis, [growth_end_time]; color = (MHD_COLORS[2], 0.55),
-                        linewidth = 1.4, linestyle = :dash)
-                end
-                if steady_end_time >= steady_start_time
-                    lines!(axis, [steady_start_time, steady_end_time],
-                        [steady_bar_y, steady_bar_y]; color = MHD_COLORS[3],
-                        linewidth = 7, linecap = :round)
-                    vlines!(axis, [steady_start_time]; color = (MHD_COLORS[3], 0.55),
-                        linewidth = 1.4, linestyle = :dash)
-                end
-                ylims!(axis, data_min - 0.08span, data_max + 0.42span)
-            end
         end
 
-        polarization_legend_layout =
-            GridLayout(fig_polarization_time[panel_rows + 1, 1:panel_columns])
-        Legend(polarization_legend_layout[1, 1],
+        Legend(fig_polarization_time[panel_rows + 1, 1:panel_columns],
             [LineElement(color = run_colors[label], linewidth = 2.5)
                 for label in comparison_run_labels],
             legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
             orientation = :horizontal, tellheight = true, framevisible = false,
             labelsize = 14)
-        if show_polarization_regime_bars
-            Legend(polarization_legend_layout[1, 2], [
-                LineElement(color = MHD_COLORS[2], linewidth = 7),
-                LineElement(color = MHD_COLORS[3], linewidth = 7),
-            ], LaTeXString[L"\Gamma_B\ \mathrm{growth}", L"\mathrm{Steady\ state}"],
-                L"\mathrm{Time\ regime}";
-                orientation = :horizontal, tellheight = true, framevisible = false,
-                labelsize = 14)
-        end
     end
     fig_polarization_time
     end
@@ -9767,7 +10230,7 @@ begin
         "moose" => "MOOSE post-processing",
         "moose_structure" => "MOOSE observable structure functions",
         "moose_power_spectra" => "MOOSE spatial power spectra",
-        "moose_tomography" => "MOOSE F(phi) and pmax",
+        "moose_tomography" => "MOOSE F(phi) and Pmax",
         "moose_rmsf" => "MOOSE rotation-measure spread function",
         "moose_p_column" => "Faraday polarization fraction versus NH",
         "polarization_intensity" => "Polarization fraction versus intensity 2D histograms",

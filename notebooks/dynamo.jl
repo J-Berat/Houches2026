@@ -2533,6 +2533,56 @@ begin
         decade_lower / padding, decade_upper * padding
     end
 
+    """
+    Return data-focused limits for a logarithmic axis.
+
+    The central 99.8% of sufficiently sampled data sets controls the frame so
+    a handful of extreme pixels cannot create several empty decades. A small
+    margin is applied in log space; short vectors retain their full range.
+    """
+    function focused_log_limits(values;
+            lower_quantile = 0.001,
+            upper_quantile = 0.999,
+            padding_fraction = 0.06)
+        valid = Float64.(filter(value -> isfinite(value) && value > 0, vec(values)))
+        isempty(valid) && return nothing
+        lower, upper = length(valid) >= 20 ?
+            quantile(valid, (lower_quantile, upper_quantile)) :
+            extrema(valid)
+        lower > 0 && upper >= lower || return nothing
+        if upper == lower
+            padding_decades = 0.05
+            return lower / 10.0^padding_decades,
+                upper * 10.0^padding_decades
+        end
+        log_lower, log_upper = log10(lower), log10(upper)
+        padding_decades =
+            max(padding_fraction * (log_upper - log_lower), 0.025)
+        10.0^(log_lower - padding_decades),
+            10.0^(log_upper + padding_decades)
+    end
+
+    "Readable 1--2--5 logarithmic ticks, including sub-decade focused ranges."
+    function focused_log_ticks(limits; maximum_tick_count = 8)
+        lower, upper = limits
+        first_exponent = floor(Int, log10(lower))
+        last_exponent = ceil(Int, log10(upper))
+        values = sort(Float64[
+            mantissa * 10.0^exponent
+            for exponent in first_exponent:last_exponent
+            for mantissa in (1.0, 2.0, 5.0)
+            if lower <= mantissa * 10.0^exponent <= upper
+        ])
+        if isempty(values)
+            values = [sqrt(lower * upper)]
+        elseif length(values) > maximum_tick_count
+            indices = unique(round.(Int,
+                range(1, length(values); length = maximum_tick_count)))
+            values = values[indices]
+        end
+        values
+    end
+
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =
         decade_tick_values(vmin, vmax)
 
@@ -2555,12 +2605,13 @@ begin
                 fontsize = 20)
             return fig
         end
+        column_limits = focused_log_limits(N)
+        column_ticks = focused_log_ticks(column_limits)
         axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
-            xticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-        column_limits = enclosing_decade_limits(N)
+            xticks = column_ticks,
+            xminorticks = IntervalsBetween(4), xminorticksvisible = true)
         isnothing(column_limits) || xlims!(axis, column_limits...)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -2914,13 +2965,14 @@ md"""
 
 ## 3. Physical probability density functions
 
-The panels compare every run selected in **Simulations in comparative plots** at the selected snapshot index (clamped to the last available snapshot of shorter runs). They show number density $n$, magnetic-field strength $|B|$, and turbulent speed $|\delta\mathbf v|$ in physical units. Shared $\log_{10}X$ bins are used across runs. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
+The panels compare every run selected in **Simulations in comparative plots** at the selected snapshot index (clamped to the last available snapshot of shorter runs). They show number density $n$, gas temperature $T$, magnetic-field strength $|B|$, and turbulent speed $|\delta\mathbf v|$ in physical units. Shared $\log_{10}X$ bins are used across runs. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
 
 **Display physical PDFs:** $(@bind display_pdfs PlutoUI.CheckBox(default = true))
 
 | PDF panel | Display |
 |:--|:--:|
 | Number-density PDF | $(@bind show_pdf_density PlutoUI.CheckBox(default = true)) |
+| Temperature PDF | $(@bind show_pdf_temperature PlutoUI.CheckBox(default = true)) |
 | Magnetic-field PDF | $(@bind show_pdf_magnetic PlutoUI.CheckBox(default = true)) |
 | Turbulent-speed PDF | $(@bind show_pdf_velocity PlutoUI.CheckBox(default = true)) |
 """
@@ -2945,9 +2997,12 @@ begin
             vec(Float64.(c.rho)) : ones(length(c.rho))
         local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
         local_v = sqrt.(local_turb.dv2)
+        local_T = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
         local_mean_B = finite_mean(local_mag.B)
         (
             density = vec(safe_log10.(number_density(c.rho))),
+            temperature = vec(safe_log10.(local_T)),
             magnetic = vec(safe_log10.(local_B)),
             velocity = vec(safe_log10.(local_v)),
             normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
@@ -2970,6 +3025,7 @@ begin
     mean_B = finite_mean(mag.B)
     sB = vec(safe_log10.(mag.B ./ mean_B))
     logn = vec(safe_log10.(number_density_cells))
+    logTphysical = vec(safe_log10.(T))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
     pdf_reference_samples =
@@ -2978,6 +3034,8 @@ begin
     pdf_edges = (
         density = comparative_pdf_edges(
             pdf_reference_samples, :density, nbins),
+        temperature = comparative_pdf_edges(
+            pdf_reference_samples, :temperature, nbins),
         magnetic = comparative_pdf_edges(
             pdf_reference_samples, :magnetic, nbins),
         velocity = comparative_pdf_edges(
@@ -2988,10 +3046,11 @@ begin
 
     function snapshot_pdf_products(path)
         cached_scientific_product((
-            :snapshot_pdfs_v2,
+            :snapshot_pdfs_v3,
             cube_signature(path),
             Tuple(Tuple(getfield(pdf_edges, field))
-                for field in (:density, :magnetic, :velocity, :normalized_B)),
+                for field in (:density, :temperature, :magnetic, :velocity,
+                    :normalized_B)),
             Float64(mean_molecular_weight),
             String(pdf_weighting),
         )) do
@@ -2999,6 +3058,9 @@ begin
             (
                 density = density_pdf(
                     samples.density, samples.weights, pdf_edges.density),
+                temperature = density_pdf(
+                    samples.temperature, samples.weights,
+                    pdf_edges.temperature),
                 magnetic = density_pdf(
                     samples.magnetic, samples.weights, pdf_edges.magnetic),
                 velocity = density_pdf(
@@ -3028,6 +3090,9 @@ begin
         density = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :density)
             for label in comparison_run_labels),
+        temperature = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :temperature)
+            for label in comparison_run_labels),
         magnetic = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :magnetic)
             for label in comparison_run_labels),
@@ -3039,6 +3104,7 @@ begin
             for label in comparison_run_labels),
     )
     density_pdfs = pdf_products.density
+    temperature_pdfs = pdf_products.temperature
     magnetic_pdfs = pdf_products.magnetic
     velocity_pdfs = pdf_products.velocity
     normalized_B_pdfs = pdf_products.normalized_B
@@ -3049,6 +3115,8 @@ begin
     pdf_specs = NamedTuple[]
     show_pdf_density && push!(pdf_specs, (pdfs = density_pdfs,
         xlabel = L"n\;[\mathrm{cm}^{-3}]"))
+    show_pdf_temperature && push!(pdf_specs, (pdfs = temperature_pdfs,
+        xlabel = L"T\;[\mathrm{K}]"))
     show_pdf_magnetic && push!(pdf_specs, (pdfs = magnetic_pdfs,
         xlabel = L"|B|\;[\mu\mathrm{G}]"))
     show_pdf_velocity && push!(pdf_specs, (pdfs = velocity_pdfs,
@@ -6415,6 +6483,8 @@ The panels measure velocity, vorticity, and magnetic-field increments as functio
 
 The average includes every cell and shifts along the three periodic grid axes, then averages those three results. This is an axis-sampled estimator of the full vector-increment magnitude: it mixes longitudinal and transverse contributions and is **not** an angularly isotropic average. Longitudinal or transverse intermittency exponents should therefore be measured with dedicated projected increments rather than inferred from these panels. Separation is measured in parsecs; vertical units are the corresponding physical field units raised to order $p$. **Order $p$** selects the increment moment, while **Number of separation samples** controls the balance between radial resolution and computation time.
 
+Every panel superposes all runs selected under **Simulations in comparative plots**. Colors identify the comparison parameter of the active family (Mach number, resolution, or forcing ratio $\chi$), and the horizontal legend is shared by the complete figure. Each run uses the selected snapshot index, clamped to its last available snapshot when necessary.
+
 The FFT spectra and structure-function arrays live in calculation cells separate from their plotting cells, so display checkboxes and other cosmetic plot controls do not rerun the heavy transforms. Changing the active cube, the structure-function order, or the separation sampling does require a new calculation. On grids of $256^3$ cells or larger this can still take appreciable time and memory.
 
 **Display velocity, vorticity, and magnetic structure functions:** $(@bind display_structure_functions PlutoUI.CheckBox(default = true))
@@ -6459,69 +6529,70 @@ begin
         values
     end
 
-    structure_products = cached_scientific_product((
-        :vector_structure_functions,
-        cube_signature(selected_path),
-        Int(structure_order),
-        Int(structure_samples),
-    )) do
-        maximum_lag = max(1, minimum(size(cube.rho)) ÷ 2)
+    function vector_structure_products(local_cube, source)
+        cached_scientific_product((
+            :vector_structure_functions,
+            cube_signature(source),
+            Int(structure_order),
+            Int(structure_samples),
+        )) do
+        local_turb = turbulent_velocity(local_cube)
+        local_omega = vorticity(local_cube)
+        maximum_lag = max(1, minimum(size(local_cube.rho)) ÷ 2)
         local_lags = unique(round.(Int, exp.(range(
             log(1.0),
             log(Float64(maximum_lag));
             length = structure_samples,
         ))))
         local_separations =
-            local_lags .* minimum(cube.L ./ size(cube.rho))
+            local_lags .* minimum(local_cube.L ./ size(local_cube.rho))
         (
             lags = local_lags,
             separations = local_separations,
             velocity = vector_structure_function(
-                (turb.dvx, turb.dvy, turb.dvz),
+                (local_turb.dvx, local_turb.dvy, local_turb.dvz),
                 local_lags,
                 structure_order,
             ),
             vorticity = vector_structure_function(
-                (omega.wx, omega.wy, omega.wz),
+                (local_omega.wx, local_omega.wy, local_omega.wz),
                 local_lags,
                 structure_order,
             ),
             magnetic = vector_structure_function(
                 (
-                    GAUSS_TO_MICROGAUSS .* cube.bx,
-                    GAUSS_TO_MICROGAUSS .* cube.by,
-                    GAUSS_TO_MICROGAUSS .* cube.bz,
+                    GAUSS_TO_MICROGAUSS .* local_cube.bx,
+                    GAUSS_TO_MICROGAUSS .* local_cube.by,
+                    GAUSS_TO_MICROGAUSS .* local_cube.bz,
                 ),
                 local_lags,
                 structure_order,
             ),
         )
+        end
     end
-    structure_lags = structure_products.lags
-    structure_separations_pc = structure_products.separations
-    Sv = structure_products.velocity
-    Somega = structure_products.vorticity
-    SB = structure_products.magnetic
+    structure_products_by_run = Dict(label => begin
+        local_index = comparison_snapshot_indices[label]
+        local_source = run_files[label][local_index]
+        vector_structure_products(comparison_cube(label), local_source)
+    end for label in comparison_run_labels)
 end
 
 # ╔═╡ d69dd1ce-312a-48e0-a478-b470b299ed1b
 begin
     structure_specs = NamedTuple[]
     show_structure_velocity && push!(structure_specs,
-        (values = Sv,
+        (field = :velocity,
             ylabel = latexstring("S_{", structure_order,
-                "}^{v}(\\ell)\\;[(\\mathrm{km\\,s}^{-1})^{", structure_order, "}]"),
-            color = MHD_COLORS[3]))
+                "}^{v}(\\ell)\\;[(\\mathrm{km\\,s}^{-1})^{", structure_order, "}]")))
     show_structure_vorticity && push!(structure_specs,
-        (values = Somega,
+        (field = :vorticity,
             ylabel = latexstring("S_{", structure_order,
-                "}^{\\omega}(\\ell)\\;[\\mathrm{Myr}^{-", structure_order, "}]"),
-            color = MHD_COLORS[5]))
+                "}^{\\omega}(\\ell)\\;[\\mathrm{Myr}^{-", structure_order, "}]")))
     show_structure_magnetic && push!(structure_specs,
-        (values = SB,
+        (field = :magnetic,
             ylabel = latexstring("S_{", structure_order,
-                "}^{B}(\\ell)\\;[(\\mu\\mathrm{G})^{", structure_order, "}]"),
-            color = MHD_COLORS[4]))
+                "}^{B}(\\ell)\\;[(\\mu\\mathrm{G})^{", structure_order, "}]")))
     if isempty(structure_specs)
         fig_structure = Figure(size = (900, 180))
         Label(fig_structure[1, 1], L"\mathrm{Select\ at\ least\ one\ structure\ function.}", fontsize = 20)
@@ -6533,15 +6604,33 @@ begin
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                 xminorticksvisible = true, yminorticksvisible = true)
-            lines!(axis, structure_separations_pc, spec.values;
-                color = spec.color, linewidth = 2.5)
-            scatter!(axis, structure_separations_pc, spec.values;
-                color = spec.color, markersize = 6)
-            x_limits = enclosing_decade_limits(structure_separations_pc)
-            y_limits = enclosing_decade_limits(spec.values)
+            all_separations = Float64[]
+            all_values = Float64[]
+            for label in comparison_run_labels
+                product = structure_products_by_run[label]
+                separations = product.separations
+                values = getproperty(product, spec.field)
+                valid = isfinite.(separations) .& isfinite.(values) .&
+                    (separations .> 0) .& (values .> 0)
+                append!(all_separations, separations[valid])
+                append!(all_values, values[valid])
+                lines!(axis, separations[valid], values[valid];
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
+                scatter!(axis, separations[valid], values[valid];
+                    color = run_colors[label], markersize = 6)
+            end
+            x_limits = enclosing_decade_limits(all_separations)
+            y_limits = enclosing_decade_limits(all_values)
             isnothing(x_limits) || xlims!(axis, x_limits...)
             isnothing(y_limits) || ylims!(axis, y_limits...)
         end
+        Legend(fig_structure[2, 1:length(structure_specs)],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true,
+            framevisible = false, labelsize = 14)
     end
     display_structure_functions ? fig_structure : nothing
 end
@@ -6564,8 +6653,6 @@ or the intensity-weighted mean,
 \langle p\rangle_I=\frac{\sum_j P_j}{\sum_j I_j}=\frac{\sum_j p_jI_j}{\sum_j I_j}.
 ```
 
-The thick horizontal segments above every panel identify two time intervals for the active run: the exponential dynamo interval used to fit $\Gamma_B$ in section 5 and the user-selected statistically steady interval. Thin vertical guides mark the end of growth and the beginning of the steady regime.
-
 **Display polarization fractions versus time:** $(@bind display_polarization_time PlutoUI.CheckBox(default = false))
 
 | Temporal polarization diagnostic | Display |
@@ -6580,8 +6667,6 @@ The thick horizontal segments above every panel identify two time intervals for 
 | Sky averaging | $(@bind polarization_time_weighting PlutoUI.Select(["Intensity-weighted mean" => "intensity", "Area-weighted mean" => "area"]; default = "intensity")) |
 | Snapshot stride | $(@bind polarization_time_stride PlutoUI.Slider(1:maximum_snapshot_count; default = 1, show_value = true)) |
 | Zeeman velocity channels | $(@bind polarization_time_zeeman_channels PlutoUI.Select([31, 51, 81, 101]; default = 51)) |
-| Display growth and steady-state bars | $(@bind show_polarization_regime_bars PlutoUI.CheckBox(default = true)) |
-| Steady-state start snapshot | $(@bind polarization_steady_start PlutoUI.Slider(1:length(run_files[selected_run]); default = min(last(growth_fit_window) + 1, length(run_files[selected_run])), show_value = true)) |
 """
 
 # ╔═╡ e1000001-6f8c-4d0c-9a10-000000000001

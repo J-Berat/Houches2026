@@ -2514,6 +2514,56 @@ begin
         decade_lower / padding, decade_upper * padding
     end
 
+    """
+    Return data-focused limits for a logarithmic axis.
+
+    The central 99.8% of sufficiently sampled data sets controls the frame so
+    a handful of extreme pixels cannot create several empty decades. A small
+    margin is applied in log space; short vectors retain their full range.
+    """
+    function focused_log_limits(values;
+            lower_quantile = 0.001,
+            upper_quantile = 0.999,
+            padding_fraction = 0.06)
+        valid = Float64.(filter(value -> isfinite(value) && value > 0, vec(values)))
+        isempty(valid) && return nothing
+        lower, upper = length(valid) >= 20 ?
+            quantile(valid, (lower_quantile, upper_quantile)) :
+            extrema(valid)
+        lower > 0 && upper >= lower || return nothing
+        if upper == lower
+            padding_decades = 0.05
+            return lower / 10.0^padding_decades,
+                upper * 10.0^padding_decades
+        end
+        log_lower, log_upper = log10(lower), log10(upper)
+        padding_decades =
+            max(padding_fraction * (log_upper - log_lower), 0.025)
+        10.0^(log_lower - padding_decades),
+            10.0^(log_upper + padding_decades)
+    end
+
+    "Readable 1--2--5 logarithmic ticks, including sub-decade focused ranges."
+    function focused_log_ticks(limits; maximum_tick_count = 8)
+        lower, upper = limits
+        first_exponent = floor(Int, log10(lower))
+        last_exponent = ceil(Int, log10(upper))
+        values = sort(Float64[
+            mantissa * 10.0^exponent
+            for exponent in first_exponent:last_exponent
+            for mantissa in (1.0, 2.0, 5.0)
+            if lower <= mantissa * 10.0^exponent <= upper
+        ])
+        if isempty(values)
+            values = [sqrt(lower * upper)]
+        elseif length(values) > maximum_tick_count
+            indices = unique(round.(Int,
+                range(1, length(values); length = maximum_tick_count)))
+            values = values[indices]
+        end
+        values
+    end
+
     Makie.get_tickvalues(::DecadeTicks, ::typeof(log10), vmin, vmax) =
         decade_tick_values(vmin, vmax)
 
@@ -2536,12 +2586,13 @@ begin
                 fontsize = 20)
             return fig
         end
+        column_limits = focused_log_limits(N)
+        column_ticks = focused_log_ticks(column_limits)
         axis = latex_axis(fig[1, 1],
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
             ylabel = ylabel, xscale = log10,
-            xticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-        column_limits = enclosing_decade_limits(N)
+            xticks = column_ticks,
+            xminorticks = IntervalsBetween(4), xminorticksvisible = true)
         isnothing(column_limits) || xlims!(axis, column_limits...)
         sample_step = max(1, cld(length(N), 6000))
         sample = 1:sample_step:length(N)
@@ -2777,9 +2828,12 @@ begin
             vec(Float64.(c.rho)) : ones(length(c.rho))
         local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
         local_v = sqrt.(local_turb.dv2)
+        local_T = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
         local_mean_B = finite_mean(local_mag.B)
         (
             density = vec(safe_log10.(number_density(c.rho))),
+            temperature = vec(safe_log10.(local_T)),
             magnetic = vec(safe_log10.(local_B)),
             velocity = vec(safe_log10.(local_v)),
             normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
@@ -2802,6 +2856,7 @@ begin
     mean_B = finite_mean(mag.B)
     sB = vec(safe_log10.(mag.B ./ mean_B))
     logn = vec(safe_log10.(number_density_cells))
+    logTphysical = vec(safe_log10.(T))
     logBphysical = vec(safe_log10.(magnetic_strength_uG))
     logvphysical = vec(safe_log10.(turbulent_speed_kms))
     pdf_reference_samples =
@@ -2810,6 +2865,8 @@ begin
     pdf_edges = (
         density = comparative_pdf_edges(
             pdf_reference_samples, :density, nbins),
+        temperature = comparative_pdf_edges(
+            pdf_reference_samples, :temperature, nbins),
         magnetic = comparative_pdf_edges(
             pdf_reference_samples, :magnetic, nbins),
         velocity = comparative_pdf_edges(
@@ -2820,10 +2877,11 @@ begin
 
     function snapshot_pdf_products(path)
         cached_scientific_product((
-            :snapshot_pdfs_v2,
+            :snapshot_pdfs_v3,
             cube_signature(path),
             Tuple(Tuple(getfield(pdf_edges, field))
-                for field in (:density, :magnetic, :velocity, :normalized_B)),
+                for field in (:density, :temperature, :magnetic, :velocity,
+                    :normalized_B)),
             Float64(mean_molecular_weight),
             String(pdf_weighting),
         )) do
@@ -2831,6 +2889,9 @@ begin
             (
                 density = density_pdf(
                     samples.density, samples.weights, pdf_edges.density),
+                temperature = density_pdf(
+                    samples.temperature, samples.weights,
+                    pdf_edges.temperature),
                 magnetic = density_pdf(
                     samples.magnetic, samples.weights, pdf_edges.magnetic),
                 velocity = density_pdf(
@@ -2860,6 +2921,9 @@ begin
         density = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :density)
             for label in comparison_run_labels),
+        temperature = Dict(label => aggregate_snapshot_pdfs(
+                pdf_snapshots_by_run[label], :temperature)
+            for label in comparison_run_labels),
         magnetic = Dict(label => aggregate_snapshot_pdfs(
                 pdf_snapshots_by_run[label], :magnetic)
             for label in comparison_run_labels),
@@ -2871,6 +2935,7 @@ begin
             for label in comparison_run_labels),
     )
     density_pdfs = pdf_products.density
+    temperature_pdfs = pdf_products.temperature
     magnetic_pdfs = pdf_products.magnetic
     velocity_pdfs = pdf_products.velocity
     normalized_B_pdfs = pdf_products.normalized_B
@@ -3028,273 +3093,6 @@ begin
     display_phase_diagram ? fig_phase : nothing
 end
 
-# ╔═╡ 5a0d1b1b-fa59-4e7c-8c51-a98592c0c62e
-begin
-    temporal_series_requested = display_global_evolution ||
-        display_gamma_relations || display_normalized_B_relations ||
-        display_growth_fit || display_phase_B_time || display_energy_time ||
-        display_polarization_time
-
-    function metadata_only_series(label)
-        [(
-            t = Float64(time_unit_Myr) * Float64(time),
-            vrms = NaN, mach = NaN, mach_alfven = NaN, Bmean = NaN, Brms = NaN,
-            energy_ratio = NaN, kin_mag = NaN, therm_mag = NaN,
-            kin_therm = NaN,
-        ) for time in run_times[label]]
-    end
-
-    metric_series_by_run = temporal_series_requested ? Dict(
-            label => run_metric_series(run_files[label], Float64(gamma),
-                Float64(mean_molecular_weight), Float64(phase_cold_boundary_K),
-                Float64(phase_warm_boundary_K), String(phase_B_weighting),
-                display_phase_B_time && label in comparison_run_labels)
-            for label in analysis_series_labels
-        ) : Dict(
-            label => (bulk = metadata_only_series(label), phase = nothing)
-            for label in analysis_series_labels
-        )
-
-    all_series = Dict(label => metric_series_by_run[label].bulk
-        for label in analysis_series_labels)
-
-    phase_B_series_by_run = display_phase_B_time ? Dict(
-        label => metric_series_by_run[label].phase
-        for label in comparison_run_labels
-    ) : Dict{String, Any}()
-end
-
-# ╔═╡ 36aef377-3de7-435a-af83-3a90421e3159
-md"""
----
-
-## 5. Magnetic amplification and growth-rate fit
-
-The fitted physical model is $B(t)=A\exp[\Gamma_B(t-t_0)]$, where $t_0$ is the first valid snapshot time and both $A$ and $\Gamma_B$ are inferred from the snapshots in the **Fit window**. Equivalently, the regression is $\ln B=a+\Gamma_B(t-t_0)$ with a free intercept. In automatic mode, contiguous windows containing 4--8 snapshots are compared using their $R^2$, measured logarithmic amplification, and position in the growing part of the series. The shaded interval marks the retained range. Manual mode remains available for a physically prescribed interval.
-
-The figures show $\ln(B/B_0)$ on linear axes, with $B_0$ the first valid measured field used only as a plotting normalization. The reported $R^2$ uses the usual mean-centred total sum of squares appropriate to this intercept fit. The central fit and its $\Gamma_B\pm\sigma_{\Gamma_B}$ slope envelope are drawn only inside the fitted interval, so no straight line is extrapolated into the saturated regime. Because $E_{\mathrm B}\propto B^2$, magnetic energy grows at rate $2\Gamma_B$.
-
-**Display the magnetic growth-rate fit:** $(@bind display_growth_fit PlutoUI.CheckBox(default = false))
-
-| Setting | Control |
-|:--|:--|
-| Fitted field | $(@bind growth_fit_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
-| Fit-window selection | $(@bind growth_fit_mode PlutoUI.Select(["Automatic", "Manual"]; default = "Automatic")) |
-| Manual fit window (snapshot indices) | $(@bind growth_fit_window PlutoUI.RangeSlider(1:length(run_files[selected_run]); default = min(2, length(run_files[selected_run])):min(8, length(run_files[selected_run])), show_value = true)) |
-| Data and fitted exponential panel | $(@bind show_growth_fit_panel PlutoUI.CheckBox(default = true)) |
-| Fit-uncertainty comparison panel | $(@bind show_growth_theory_panel PlutoUI.CheckBox(default = true)) |
-| Display fitted curve | $(@bind show_growth_fit PlutoUI.CheckBox(default = true)) |
-| Logarithmic $B(t)$ axis in section 6 | $(@bind log_B_time PlutoUI.CheckBox(default = true)) |
-"""
-
-# ╔═╡ 89c33295-34e7-49ec-8d04-52b2aac29cff
-begin
-    growth_series = all_series[selected_run]
-    growth_times = Float64.(getfield.(growth_series, :t))
-    growth_B = growth_fit_field == "Mean field ⟨B⟩" ?
-        Float64.(getfield.(growth_series, :Bmean)) :
-        Float64.(getfield.(growth_series, :Brms))
-    growth_reference_index = findfirst(i -> isfinite(growth_times[i]) &&
-        isfinite(growth_B[i]) && growth_B[i] > 0, eachindex(growth_B))
-    growth_B0 = isnothing(growth_reference_index) ? NaN : growth_B[growth_reference_index]
-    growth_t0 = isnothing(growth_reference_index) ? NaN : growth_times[growth_reference_index]
-    growth_log_B = map(growth_B) do value
-        isfinite(value) && value > 0 ? log(value) : NaN
-    end
-    growth_elapsed_time = growth_times .- growth_t0
-
-    function exponential_growth_fit(elapsed_time, log_field, indices)
-        if length(indices) < 2
-            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN,
-                r2 = NaN, ssres = Inf)
-        end
-        xfit, yfit = elapsed_time[indices], log_field[indices]
-        xmean, ymean = mean(xfit), mean(yfit)
-        centered_x = xfit .- xmean
-        sxx = sum(abs2, centered_x)
-        if sxx <= 0
-            return (log_amplitude = NaN, gamma = NaN, gamma_error = NaN,
-                r2 = NaN, ssres = Inf)
-        end
-        gamma_fit = sum(centered_x .* (yfit .- ymean)) / sxx
-        log_amplitude = ymean - gamma_fit * xmean
-        residuals = yfit .- (log_amplitude .+ gamma_fit .* xfit)
-        ssres = sum(abs2, residuals)
-        sstot = sum(abs2, yfit .- mean(yfit))
-        r2 = sstot > 0 ? 1 - ssres / sstot : NaN
-        gamma_error = length(indices) > 2 ?
-            sqrt((ssres / (length(indices) - 2)) / sxx) : NaN
-        (; log_amplitude, gamma = gamma_fit, gamma_error, r2, ssres)
-    end
-
-    """
-    Select a contiguous kinematic-growth interval without extrapolating through
-    the saturated tail. Candidate windows contain 4--8 valid snapshots. The
-    score rewards linearity and resolved amplification while mildly preferring
-    earlier windows when otherwise equivalent.
-    """
-    function automatic_growth_fit_window(elapsed_time, log_field)
-        valid = filter(eachindex(elapsed_time)) do index
-            isfinite(elapsed_time[index]) && isfinite(log_field[index])
-        end
-        length(valid) < 4 && return valid
-        best_indices = valid[1:min(4, length(valid))]
-        best_score = -Inf
-        maximum_points = min(8, length(valid))
-        for point_count in 4:maximum_points
-            for first_position in 1:(length(valid) - point_count + 1)
-                indices = valid[first_position:(first_position + point_count - 1)]
-                all(diff(elapsed_time[indices]) .> 0) || continue
-                fit = exponential_growth_fit(elapsed_time, log_field, indices)
-                isfinite(fit.gamma) && fit.gamma > 0 && isfinite(fit.r2) || continue
-                amplification = fit.gamma *
-                    (elapsed_time[last(indices)] - elapsed_time[first(indices)])
-                amplification > 0.15 || continue
-                score = fit.r2 + 0.10min(amplification, 2.0) +
-                    0.015point_count - 0.012(first_position - 1)
-                if score > best_score
-                    best_score = score
-                    best_indices = indices
-                end
-            end
-        end
-        best_indices
-    end
-
-    manual_growth_indices = filter(i -> 1 <= i <= length(growth_times) &&
-        isfinite(growth_times[i]) && isfinite(growth_elapsed_time[i]) &&
-        isfinite(growth_log_B[i]), collect(growth_fit_window))
-    growth_indices = growth_fit_mode == "Automatic" ?
-        automatic_growth_fit_window(growth_elapsed_time, growth_log_B) :
-        manual_growth_indices
-    growth_fit = exponential_growth_fit(growth_elapsed_time, growth_log_B, growth_indices)
-    growth_gamma_uncertainty = isfinite(growth_fit.gamma_error) ?
-        growth_fit.gamma_error : 0.0
-    theory_gammas = growth_fit.gamma .+
-        growth_gamma_uncertainty .* [-1.0, 1.0]
-    fitted_B_curve = exp.(growth_fit.log_amplitude .+ growth_fit.gamma .* growth_elapsed_time)
-    fitted_ratio_curve = fitted_B_curve ./ growth_B0
-    growth_fit_center_time = isempty(growth_indices) ? NaN :
-        mean(growth_elapsed_time[growth_indices])
-    growth_fit_center_log_B = growth_fit.log_amplitude +
-        growth_fit.gamma * growth_fit_center_time
-    theory_B_curves = [
-        exp.(growth_fit_center_log_B .+
-            Γ .* (growth_elapsed_time .- growth_fit_center_time))
-        for Γ in theory_gammas
-    ]
-
-    growth_has_interval = !isempty(growth_indices)
-    growth_first_index = growth_has_interval ? first(growth_indices) : missing
-    growth_last_index = growth_has_interval ? last(growth_indices) : missing
-    growth_gamma_text = string(round(growth_fit.gamma; sigdigits = 5))
-    growth_error_text = string(round(growth_fit.gamma_error; sigdigits = 3))
-    growth_r2_text = string(round(growth_fit.r2; sigdigits = 4))
-    growth_amplitude_text = string(round(exp(growth_fit.log_amplitude); sigdigits = 5))
-    growth_energy_gamma_text = string(round(2 * growth_fit.gamma; sigdigits = 5))
-end
-
-# ╔═╡ 71c8ea26-d2ad-4430-9265-0b28d45bba1c
-md"""
-### Interval magnetic-growth rate
-
-The local magnetic-growth rate is evaluated between consecutive snapshots rather than with one fit over the complete selected window:
-
-```math
-\Gamma_{B,i+1/2}
-=\frac{\ln B_{i+1}-\ln B_i}{t_{i+1}-t_i}.
-```
-
-Time, sonic Mach number, and Alfvénic Mach number are assigned their midpoint values over the same interval. Positive $\Gamma_B$ indicates magnetic amplification; negative $\Gamma_B$ indicates decay.
-
-**Display interval growth-rate relations:** $(@bind display_gamma_relations PlutoUI.CheckBox(default = false))
-
-| Growth-rate setting | Control |
-|:--|:--|
-| Magnetic field | $(@bind gamma_relation_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
-| Simulations | Global multi-selection in section 1 |
-| $\Gamma_B(t)$ | $(@bind show_gamma_time PlutoUI.CheckBox(default = true)) |
-| $\Gamma_B(\mathcal{M})$ | $(@bind show_gamma_mach PlutoUI.CheckBox(default = true)) |
-| $\Gamma_B(\mathcal{M}_{\mathrm A})$ | $(@bind show_gamma_alfven_mach PlutoUI.CheckBox(default = true)) |
-"""
-
-# ╔═╡ cd7e037c-62f5-4682-92c2-92af7169d692
-md"""
-### Multi-snapshot normalized magnetic evolution
-
-Selected snapshots are superimposed in the same figure using
-
-```math
-\ln\!\left(\frac{B_i}{B_0}\right),
-```
-
-where $B_0$ is the first available snapshot of each run. Color identifies the run; every snapshot uses the same circular marker to keep temporal comparisons readable. All axes remain linear because the logarithm is applied to the magnetic-field ratio itself.
-
-**Display multi-snapshot normalized magnetic evolution:** $(@bind display_normalized_B_relations PlutoUI.CheckBox(default = false))
-
-| Normalized-field relation | Control |
-|:--|:--|
-| Magnetic field | $(@bind normalized_B_relation_field PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
-| Snapshots displayed | $(@bind normalized_B_snapshot_indices PlutoUI.MultiSelect(collect(1:maximum_snapshot_count); default = unique([1, cld(maximum_snapshot_count, 2), maximum_snapshot_count]))) |
-| Simulations displayed | Global multi-selection in section 1 |
-| $\ln(B/B_0)$ versus $t$ | $(@bind show_normalized_B_time PlutoUI.CheckBox(default = true)) |
-| $\ln(B/B_0)$ versus $\mathcal{M}$ | $(@bind show_normalized_B_mach PlutoUI.CheckBox(default = true)) |
-| $\ln(B/B_0)$ versus $\mathcal{M}_{\mathrm A}$ | $(@bind show_normalized_B_alfven_mach PlutoUI.CheckBox(default = true)) |
-"""
-
-# ╔═╡ dcc8f8f3-daaf-4d4b-92a3-4919ed5e36de
-md"""
----
-
-## 6. Global time evolution
-
-Selected panels compare every discovered run as a function of physical time. Turbulent velocity is measured after subtracting the mass-weighted bulk motion.
-
-$\mathcal{M}=v_{\mathrm{rms}}/c_{s,\mathrm{rms}}$ measures compressibility, while $\mathcal{M}_{\mathrm A}=v_{\mathrm{rms}}/v_{\mathrm A,\mathrm{rms}}$ compares turbulence with Alfvén-wave propagation. Values above unity are supersonic or super-Alfvénic, respectively. Dotted magnetic-field curves show the theoretical exponentials selected in section 5.
-
-**Display global time evolution:** $(@bind display_global_evolution PlutoUI.CheckBox(default = false))
-
-| Time-evolution panel | Display |
-|:--|:--:|
-| Sonic Mach number | $(@bind show_time_mach PlutoUI.CheckBox(default = true)) |
-| Alfvénic Mach number | $(@bind show_time_alfven PlutoUI.CheckBox(default = true)) |
-| Magnetic field | $(@bind show_time_magnetic PlutoUI.CheckBox(default = true)) |
-| Magnetic-to-kinetic energy ratio | $(@bind show_time_energy_ratio PlutoUI.CheckBox(default = true)) |
-"""
-
-# ╔═╡ 62bb58f1-37c3-4adb-a7fc-939f71a56635
-md"""
-### Magnetic field by thermal phase
-
-This diagnostic follows the magnetic-field strength after dividing every snapshot into three temperature phases. The phase boundaries are adjustable. **Volume average** assigns the same weight to every cell, while **Density-weighted average** uses $w_i=\rho_i$. The displayed phase mean and RMS are
-
-```math
-\langle |B|\rangle_{w,\phi}=\frac{\sum_{i\in\phi}w_i|B_i|}{\sum_{i\in\phi}w_i},\qquad
-B_{\mathrm{rms},w,\phi}=\left(\frac{\sum_{i\in\phi}w_iB_i^2}{\sum_{i\in\phi}w_i}\right)^{1/2},
-```
-
-with $w_i=1$ for volume normalization or $w_i=\rho_i$ for density normalization. Values are shown in $\mu\mathrm G$; no additional normalization by a global $B_0$ is applied in this phase diagnostic.
-
-```math
-\mathrm{CNM}:\ T<T_{\mathrm C},\qquad
-\mathrm{LNM}:\ T_{\mathrm C}\leq T<T_{\mathrm W},\qquad
-\mathrm{WNM}:\ T\geq T_{\mathrm W}.
-```
-
-**Display magnetic field by phase:** $(@bind display_phase_B_time PlutoUI.CheckBox(default = false))
-
-| Phase-field setting | Control |
-|:--|:--|
-| Cold/Lukewarm boundary $T_{\mathrm C}$ [$\mathrm{K}$] | $(@bind phase_cold_boundary_K PlutoUI.NumberField(10.0:10.0:5000.0; default = 200.0)) |
-| Lukewarm/Warm boundary $T_{\mathrm W}$ [$\mathrm{K}$] | $(@bind phase_warm_boundary_K PlutoUI.NumberField(100.0:50.0:50000.0; default = 2000.0)) |
-| Magnetic statistic | $(@bind phase_B_statistic PlutoUI.Select(["Mean field ⟨B⟩", "RMS field Bᵣₘₛ"]; default = "Mean field ⟨B⟩")) |
-| Phase normalization | $(@bind phase_B_weighting PlutoUI.Select(["Volume average" => "volume", "Density-weighted average" => "density"]; default = "volume")) |
-| Logarithmic $B$ axis | $(@bind log_phase_B_time PlutoUI.CheckBox(default = true)) |
-| CNM curve | $(@bind show_phase_B_cold PlutoUI.CheckBox(default = true)) |
-| LNM curve | $(@bind show_phase_B_lukewarm PlutoUI.CheckBox(default = true)) |
-| WNM curve | $(@bind show_phase_B_warm PlutoUI.CheckBox(default = true)) |
-"""
-
 # ╔═╡ b1000006-6f8c-4d0c-9a10-000000000006
 begin
     function hro_binned_summary(
@@ -3428,34 +3226,6 @@ begin
         string(@sprintf("%.3g", mantissa), raw"\times10^{", exponent, "}")
     end
 end
-
-# ╔═╡ 298bd579-bb28-48b7-8c55-ea74804b9837
-md"""
----
-
-## 8. Energy partition by density and time
-
-### Density-binned energy ratios
-
-The figure compares three energy ratios as functions of physical number density. Color identifies the simulation run and line style identifies the snapshot. The horizontal reference at unity marks equal energies; values above unity indicate that the numerator dominates.
-
-Each point is a ratio of energies summed within one density bin, rather than a mean of cell-by-cell ratios. The CGS energy densities are $E_{\mathrm{kin}}=\rho|\delta\mathbf v|^2/2$, $E_{\mathrm{mag}}=B^2/(8\pi)$, and $E_{\mathrm{therm}}=P/(\gamma-1)$ in $\mathrm{erg\,cm}^{-3}$. For $\gamma=1$, the notebook adopts the isothermal convention $E_{\mathrm{therm}}=P$. Cubes selected for the comparative profiles are read and reduced to these per-cell quantities in a separate Pluto cell; changing $\gamma$ or the density bins therefore rebins the cached arrays without rereading the RAMSES files.
-
-**Display energy ratios by density:** $(@bind display_energy_ratios PlutoUI.CheckBox(default = true))
-
-**Display energy ratios versus time:** $(@bind display_energy_time PlutoUI.CheckBox(default = false))
-
-| Setting | Control |
-|:--|:--|
-| Snapshots shown in energy reports | $(@bind energy_snapshot_indices PlutoUI.MultiSelect(collect(1:maximum_snapshot_count); default = [min(Int(selected_snapshot), maximum_snapshot_count)])) |
-| $E_{\mathrm{kin}}/E_{\mathrm{mag}}$ | $(@bind show_energy_kin_mag PlutoUI.CheckBox(default = true)) |
-| $E_{\mathrm{therm}}/E_{\mathrm{mag}}$ | $(@bind show_energy_therm_mag PlutoUI.CheckBox(default = true)) |
-| $E_{\mathrm{kin}}/E_{\mathrm{therm}}$ | $(@bind show_energy_kin_therm PlutoUI.CheckBox(default = true)) |
-
-### Time evolution of the energy ratios
-
-The same ratio checkboxes select the time-evolution panels. Each curve uses energies integrated over the complete simulation volume. Color identifies the run, and the horizontal reference at unity marks equipartition.
-"""
 
 # ╔═╡ 3190e127-1d53-49f1-bfab-b9645910c2c6
 begin
@@ -3825,6 +3595,8 @@ md"""
 
 Optional elliptical Gaussian beam applied to $I$, $Q$, and $U$ before computing polarization.
 
+All observable structure-function figures use the same comparative convention as the three-dimensional functions above: every selected run is recomputed with identical physical and instrumental parameters, then superposed with one shared horizontal simulation legend.
+
 | Gaussian PSF setting | Control |
 |:--|:--|
 | Apply Gaussian beam | $(@bind apply_observational_beam PlutoUI.CheckBox(default = false)) |
@@ -3929,40 +3701,68 @@ begin
     end
 
     "Plot projected structure functions for a collection of observable maps."
-    function observational_structure_figure(specs, c, plane_dims, order, samples;
+    function observational_structure_figure(specs_by_run, cubes_by_run,
+            plane_dims, order, samples;
             heading = "Projected observable structure functions")
-        maximum_lag = max(1, minimum(size(first(specs).data)) ÷ 2)
-        lags = unique(round.(Int, exp.(range(log(1.0), log(Float64(maximum_lag));
-            length = Int(samples)))))
-        pixel_scale_pc = minimum(c.L[dimension] / size(c.rho, dimension)
-            for dimension in plane_dims)
-        separations_pc = lags .* pixel_scale_pc
-        ncols = min(2, length(specs))
-        nrows = cld(length(specs), ncols)
-        figure = Figure(size = (540ncols, 390nrows + 55))
+        isempty(specs_by_run) && return Figure(size = (900, 140))
+        first_specs = first(values(specs_by_run))
+        ncols = min(2, length(first_specs))
+        nrows = cld(length(first_specs), ncols)
+        figure = Figure(size = (540ncols, 390nrows + 115))
         Label(figure[0, 1:ncols], heading; fontsize = 22, font = :bold)
-        for (spec_index, spec) in enumerate(specs)
+        for (spec_index, reference_spec) in enumerate(first_specs)
             row, column = cld(spec_index, ncols), mod1(spec_index, ncols)
             axis = latex_axis(figure[row, column],
                 xlabel = L"\ell\;[\mathrm{pc}]",
                 ylabel = latexstring("S_{", order, "}(\\ell)"),
-                title = as_latex(spec.label), xscale = log10, yscale = log10,
+                title = as_latex(reference_spec.label), xscale = log10, yscale = log10,
                 xticks = DECADE_TICKS, yticks = DECADE_TICKS,
                 xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
                 xminorticksvisible = true, yminorticksvisible = true)
-            values = scalar_structure_function_2d(spec.data, lags, order;
-                period = spec.period)
-            valid = isfinite.(values) .& (values .> 0)
-            if any(valid)
+            any_valid = false
+            all_separations, all_values = Float64[], Float64[]
+            for label in comparison_run_labels
+                specs = specs_by_run[label]
+                spec_index <= length(specs) || continue
+                spec = specs[spec_index]
+                c = cubes_by_run[label]
+                maximum_lag = max(1, minimum(size(spec.data)) ÷ 2)
+                lags = unique(round.(Int, exp.(range(
+                    log(1.0), log(Float64(maximum_lag));
+                    length = Int(samples)))))
+                pixel_scale_pc = minimum(
+                    c.L[dimension] / size(c.rho, dimension)
+                    for dimension in plane_dims)
+                separations_pc = lags .* pixel_scale_pc
+                values = scalar_structure_function_2d(
+                    spec.data, lags, order; period = spec.period)
+                valid = isfinite.(values) .& (values .> 0)
+                any(valid) || continue
+                any_valid = true
+                append!(all_separations, separations_pc[valid])
+                append!(all_values, values[valid])
                 lines!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, linewidth = 2.5)
+                    color = run_colors[label], linewidth = 2.5,
+                    label = legend_run_label(label))
                 scatter!(axis, separations_pc[valid], values[valid];
-                    color = spec.color, markersize = 6)
+                    color = run_colors[label], markersize = 6)
+            end
+            if any_valid
+                x_limits = enclosing_decade_limits(all_separations)
+                y_limits = enclosing_decade_limits(all_values)
+                isnothing(x_limits) || xlims!(axis, x_limits...)
+                isnothing(y_limits) || ylims!(axis, y_limits...)
             else
                 text!(axis, 0.5, 0.5; text = "constant or invalid map",
                     space = :relative, align = (:center, :center))
             end
         end
+        Legend(figure[nrows + 1, 1:ncols],
+            [LineElement(color = run_colors[label], linewidth = 2.5)
+                for label in comparison_run_labels],
+            legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
+            orientation = :horizontal, tellheight = true,
+            framevisible = false, labelsize = 14)
         figure
     end
 
@@ -4585,7 +4385,7 @@ use all physical and instrumental defaults listed below.
 | Faraday-depth step [$\mathrm{rad\,m^{-2}}$] | $(@bind moose_dphi PlutoUI.NumberField(0.05:0.05:10.0; default = 0.25)) |
 | First sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_i PlutoUI.Slider(1:size(cube.rho, sky_dims[1]); default = cld(size(cube.rho, sky_dims[1]), 2), show_value = true)) |
 | Second sky-axis pixel for $F(\phi)$ | $(@bind moose_sky_j PlutoUI.Slider(1:size(cube.rho, sky_dims[2]); default = cld(size(cube.rho, sky_dims[2]), 2), show_value = true)) |
-| Peak Faraday-spectrum map (pmax) | $(@bind show_moose_pmax PlutoUI.CheckBox(default = false)) |
+| Peak Faraday-spectrum map $P_{\max}$ | $(@bind show_moose_pmax PlutoUI.CheckBox(default = true)) |
 | Faraday-spectrum amplitude | $(@bind show_moose_F_abs PlutoUI.CheckBox(default = true)) |
 | $\Re F(\phi)$ spectrum | $(@bind show_moose_F_real PlutoUI.CheckBox(default = true)) |
 | $\Im F(\phi)$ spectrum | $(@bind show_moose_F_imag PlutoUI.CheckBox(default = true)) |
@@ -5716,23 +5516,156 @@ end
 
 # ╔═╡ a0050005-6f8c-4d0c-9a10-000000000005
 begin
-    shine_structure_specs = [
-        (data = shine_NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[1], period = nothing),
-        (data = shine_NCNM, label = L"N_{\mathrm{CNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[2], period = nothing),
-        (data = shine_NLNM, label = L"N_{\mathrm{LNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[3], period = nothing),
-        (data = shine_NWNM, label = L"N_{\mathrm{WNM}}\;[\mathrm{cm}^{-2}]", color = MHD_COLORS[4], period = nothing),
-        (data = shine_peakTb, label = L"\max_v T_B\;[\mathrm{K}]", color = MHD_COLORS[5], period = nothing),
-        (data = shine_mom0, label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", color = MHD_COLORS[6], period = nothing),
-        (data = shine_mom1, label = L"M_1\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[1], period = nothing),
-        (data = shine_mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", color = MHD_COLORS[2], period = nothing),
-        (data = shine_peak_tau, label = L"\max_v\tau_{21}", color = MHD_COLORS[3], period = nothing),
-        (data = shine_fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", color = MHD_COLORS[4], period = nothing),
-        (data = shine_rgb_cnm_map, label = L"W_{\mathrm{CNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(0.000, 0.000, 1.000), period = nothing),
-        (data = shine_rgb_lnm_map, label = L"W_{\mathrm{LNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(0.000, 1.000, 0.000), period = nothing),
-        (data = shine_rgb_wnm_map, label = L"W_{\mathrm{WNM}}\;[\mathrm{K\,km\,s}^{-1}]", color = RGBf(1.000, 0.000, 0.000), period = nothing),
-    ]
+    function shine_structure_products(c)
+        local_permutation = (sky_dims[1], sky_dims[2], los_dim)
+        local_temperature_native =
+            Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
+            (K_B_CGS .* c.rho)
+        local_nHI = permutedims(
+            Float64(shine_neutral_fraction) .* c.rho ./
+                (max(Float64(shine_mu_H), eps(Float64)) * M_H_CGS),
+            local_permutation)
+        local_temperature = permutedims(
+            max.(local_temperature_native, eps(Float64)), local_permutation)
+        local_velocity = permutedims(
+            (c.vx, c.vy, c.vz)[los_dim], local_permutation)
+        local_nCNM = local_nHI .* (local_temperature .< shine_TCNM_value)
+        local_nLNM = local_nHI .* ((local_temperature .>= shine_TCNM_value) .&
+            (local_temperature .< shine_TWNM_value))
+        local_nWNM = local_nHI .* (local_temperature .>= shine_TWNM_value)
+        local_dx_cm = c.L[los_dim] / size(c.rho, los_dim) * PC_CM
+        local_NHI = apply_observational_beam_2d(
+            finite_sum_dims(local_nHI, 3) .* local_dx_cm, c, sky_dims)
+        local_NCNM = apply_observational_beam_2d(
+            finite_sum_dims(local_nCNM, 3) .* local_dx_cm, c, sky_dims)
+        local_NLNM = apply_observational_beam_2d(
+            finite_sum_dims(local_nLNM, 3) .* local_dx_cm, c, sky_dims)
+        local_NWNM = apply_observational_beam_2d(
+            finite_sum_dims(local_nWNM, 3) .* local_dx_cm, c, sky_dims)
+        local_Tb = zeros(Float64, size(local_nHI, 1), size(local_nHI, 2),
+            length(shine_velocity_axis))
+        local_tau = similar(local_Tb)
+        Threads.@threads for i in axes(local_nHI, 1)
+            for j in axes(local_nHI, 2)
+                Tb_line, tau_line = shine_hi_spectrum(
+                    @view(local_nHI[i, j, :]),
+                    @view(local_velocity[i, j, :]),
+                    @view(local_temperature[i, j, :]),
+                    shine_velocity_axis, local_dx_cm,
+                    shine_mu_value, shine_fixed_width_value)
+                local_Tb[i, j, :] .= Tb_line
+                local_tau[i, j, :] .= tau_line
+            end
+        end
+        local_Tb = apply_observational_beam_cube(local_Tb, c, sky_dims)
+        local_tau = apply_observational_beam_cube(local_tau, c, sky_dims)
+        local_velocity_3d = reshape(shine_velocity_axis, 1, 1, :)
+        local_positive_weight = max.(local_Tb, 0.0) .* shine_dv
+        local_mom0 = finite_sum_dims(local_positive_weight, 3)
+        local_weight_sum = max.(local_mom0, eps(Float64))
+        local_mom1 = finite_sum_dims(
+            local_positive_weight .* local_velocity_3d, 3) ./ local_weight_sum
+        local_mom2 = sqrt.(max.(finite_sum_dims(local_positive_weight .*
+            (local_velocity_3d .- reshape(local_mom1, size(local_mom1)..., 1)) .^ 2,
+            3) ./ local_weight_sum, 0.0))
+        local_peakTb = finite_maximum_dims(local_Tb, 3)
+        local_peak_tau = finite_maximum_dims(local_tau, 3)
+        local_fftcnm = zeros(Float64, size(local_NHI))
+        if !isempty(shine_fft_indices)
+            Threads.@threads for i in axes(local_Tb, 1)
+                for j in axes(local_Tb, 2)
+                    amplitudes = abs.(fft(@view local_Tb[i, j, :]))
+                    local_fftcnm[i, j] = amplitudes[1] > 0 ?
+                        maximum(amplitudes[shine_fft_indices]) /
+                            amplitudes[1] : 0.0
+                end
+            end
+        end
+        function local_phase_velocity_map(phase_density, window)
+            velocity_indices = findall(v ->
+                window[1] <= v <= window[2], shine_velocity_axis)
+            phase_map = zeros(Float64,
+                size(phase_density, 1), size(phase_density, 2))
+            isempty(velocity_indices) && return phase_map
+            Threads.@threads for i in axes(phase_density, 1)
+                for j in axes(phase_density, 2)
+                    brightness, _ = shine_hi_spectrum(
+                        @view(phase_density[i, j, :]),
+                        @view(local_velocity[i, j, :]),
+                        @view(local_temperature[i, j, :]),
+                        shine_velocity_axis, local_dx_cm,
+                        shine_mu_value, shine_fixed_width_value)
+                    phase_map[i, j] =
+                        sum(max.(@view(brightness[velocity_indices]), 0.0)) *
+                            shine_dv
+                end
+            end
+            apply_observational_beam_2d(phase_map, c, sky_dims)
+        end
+        (
+            NHI = local_NHI,
+            NCNM = local_NCNM,
+            NLNM = local_NLNM,
+            NWNM = local_NWNM,
+            peakTb = local_peakTb,
+            mom0 = local_mom0,
+            mom1 = local_mom1,
+            mom2 = local_mom2,
+            peak_tau = local_peak_tau,
+            fftcnm = local_fftcnm,
+            rgb_cnm = local_phase_velocity_map(
+                local_nCNM, shine_rgb_cnm_window),
+            rgb_lnm = local_phase_velocity_map(
+                local_nLNM, shine_rgb_lnm_window),
+            rgb_wnm = local_phase_velocity_map(
+                local_nWNM, shine_rgb_wnm_window),
+        )
+    end
+    shine_structure_products_by_run = Dict(label => begin
+        if label == selected_run &&
+                comparison_snapshot_indices[label] == selected_snapshot
+            (
+                NHI = shine_NHI,
+                NCNM = shine_NCNM,
+                NLNM = shine_NLNM,
+                NWNM = shine_NWNM,
+                peakTb = shine_peakTb,
+                mom0 = shine_mom0,
+                mom1 = shine_mom1,
+                mom2 = shine_mom2,
+                peak_tau = shine_peak_tau,
+                fftcnm = shine_fftcnm,
+                rgb_cnm = shine_rgb_cnm_map,
+                rgb_lnm = shine_rgb_lnm_map,
+                rgb_wnm = shine_rgb_wnm_map,
+            )
+        else
+            shine_structure_products(comparison_cube(label))
+        end
+    end for label in comparison_run_labels)
+    shine_structure_specs_by_run = Dict(label => begin
+        products = shine_structure_products_by_run[label]
+        [
+            (data = products.NHI, label = L"N_{\mathrm{HI}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.NCNM, label = L"N_{\mathrm{CNM}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.NLNM, label = L"N_{\mathrm{LNM}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.NWNM, label = L"N_{\mathrm{WNM}}\;[\mathrm{cm}^{-2}]", period = nothing),
+            (data = products.peakTb, label = L"\max_v T_B\;[\mathrm{K}]", period = nothing),
+            (data = products.mom0, label = L"M_0\;[\mathrm{K\,km\,s}^{-1}]", period = nothing),
+            (data = products.mom1, label = L"M_1\;[\mathrm{km\,s}^{-1}]", period = nothing),
+            (data = products.mom2, label = L"M_2\;[\mathrm{km\,s}^{-1}]", period = nothing),
+            (data = products.peak_tau, label = L"\max_v\tau_{21}", period = nothing),
+            (data = products.fftcnm, label = L"f_{\mathrm{CNM}}^{\mathrm{FFT}}", period = nothing),
+            (data = products.rgb_cnm, label = L"W_{\mathrm{CNM}}\;[\mathrm{K\,km\,s}^{-1}]", period = nothing),
+            (data = products.rgb_lnm, label = L"W_{\mathrm{LNM}}\;[\mathrm{K\,km\,s}^{-1}]", period = nothing),
+            (data = products.rgb_wnm, label = L"W_{\mathrm{WNM}}\;[\mathrm{K\,km\,s}^{-1}]", period = nothing),
+        ]
+    end for label in comparison_run_labels)
+    shine_structure_cubes = Dict(
+        label => comparison_cube(label) for label in comparison_run_labels)
     fig_shine_structure = display_observational_structure_functions ?
-        observational_structure_figure(shine_structure_specs, cube, sky_dims,
+        observational_structure_figure(
+            shine_structure_specs_by_run, shine_structure_cubes, sky_dims,
             observational_structure_order, observational_structure_samples;
             heading = "SHINE observable structure functions") : Figure(size = (900, 120))
     display_observational_structure_functions ? fig_shine_structure : nothing
@@ -5798,8 +5731,6 @@ or the intensity-weighted mean,
 \langle p\rangle_I=\frac{\sum_j P_j}{\sum_j I_j}=\frac{\sum_j p_jI_j}{\sum_j I_j}.
 ```
 
-The thick horizontal segments above every panel identify two time intervals for the active run: the exponential dynamo interval used to fit $\Gamma_B$ in section 5 and the user-selected statistically steady interval. Thin vertical guides mark the end of growth and the beginning of the steady regime.
-
 **Display polarization fractions versus time:** $(@bind display_polarization_time PlutoUI.CheckBox(default = false))
 
 | Temporal polarization diagnostic | Display |
@@ -5814,8 +5745,6 @@ The thick horizontal segments above every panel identify two time intervals for 
 | Sky averaging | $(@bind polarization_time_weighting PlutoUI.Select(["Intensity-weighted mean" => "intensity", "Area-weighted mean" => "area"]; default = "intensity")) |
 | Snapshot stride | $(@bind polarization_time_stride PlutoUI.Slider(1:maximum_snapshot_count; default = 1, show_value = true)) |
 | Zeeman velocity channels | $(@bind polarization_time_zeeman_channels PlutoUI.Select([31, 51, 81, 101]; default = 51)) |
-| Display growth and steady-state bars | $(@bind show_polarization_regime_bars PlutoUI.CheckBox(default = true)) |
-| Steady-state start snapshot | $(@bind polarization_steady_start PlutoUI.Slider(1:length(run_files[selected_run]); default = min(last(growth_fit_window) + 1, length(run_files[selected_run])), show_value = true)) |
 """
 
 # ╔═╡ b37d82bc-7819-47f9-b0ab-4de2f124f3cc
@@ -6004,70 +5933,31 @@ begin
     else
         panel_columns = length(polarization_time_panel_specs) == 1 ? 1 : 2
         panel_rows = cld(length(polarization_time_panel_specs), panel_columns)
-        fig_polarization_time = Figure(size = (560panel_columns, 400panel_rows + 95))
-        growth_start_time = growth_has_interval ? growth_times[growth_first_index] : NaN
-        growth_end_time = growth_has_interval ? growth_times[growth_last_index] : NaN
-        steady_index = clamp(Int(polarization_steady_start), 1, length(growth_times))
-        steady_start_time = growth_times[steady_index]
-        steady_end_time = last(growth_times)
+        fig_polarization_time =
+            Figure(size = (560panel_columns, 400panel_rows + 75))
 
         for (panel_index, spec) in enumerate(polarization_time_panel_specs)
             row, column = cld(panel_index, panel_columns), mod1(panel_index, panel_columns)
             axis = latex_axis(fig_polarization_time[row, column],
                 xlabel = L"t\;[\mathrm{Myr}]", ylabel = spec.ylabel)
-            all_percentages = Float64[]
             for label in comparison_run_labels
                 series = polarization_time_series[label]
                 times = Float64.(getfield.(series, :t))
                 percentages = 100 .* Float64.(getfield.(series, spec.field))
                 valid = isfinite.(times) .& isfinite.(percentages)
-                append!(all_percentages, percentages[valid])
                 lines!(axis, times[valid], percentages[valid];
                     color = run_colors[label], linewidth = 2.4)
                 scatter!(axis, times[valid], percentages[valid];
                     color = run_colors[label], markersize = 7)
             end
-
-            if show_polarization_regime_bars && !isempty(all_percentages)
-                data_min, data_max = extrema(all_percentages)
-                span = max(data_max - data_min, max(abs(data_max), 1.0) * 0.08)
-                growth_bar_y = data_max + 0.12span
-                steady_bar_y = data_max + 0.28span
-                if growth_has_interval && isfinite(growth_start_time) && isfinite(growth_end_time)
-                    lines!(axis, [growth_start_time, growth_end_time],
-                        [growth_bar_y, growth_bar_y]; color = MHD_COLORS[2],
-                        linewidth = 7, linecap = :round)
-                    vlines!(axis, [growth_end_time]; color = (MHD_COLORS[2], 0.55),
-                        linewidth = 1.4, linestyle = :dash)
-                end
-                if steady_end_time >= steady_start_time
-                    lines!(axis, [steady_start_time, steady_end_time],
-                        [steady_bar_y, steady_bar_y]; color = MHD_COLORS[3],
-                        linewidth = 7, linecap = :round)
-                    vlines!(axis, [steady_start_time]; color = (MHD_COLORS[3], 0.55),
-                        linewidth = 1.4, linestyle = :dash)
-                end
-                ylims!(axis, data_min - 0.08span, data_max + 0.42span)
-            end
         end
 
-        polarization_legend_layout =
-            GridLayout(fig_polarization_time[panel_rows + 1, 1:panel_columns])
-        Legend(polarization_legend_layout[1, 1],
+        Legend(fig_polarization_time[panel_rows + 1, 1:panel_columns],
             [LineElement(color = run_colors[label], linewidth = 2.5)
                 for label in comparison_run_labels],
             legend_run_label.(comparison_run_labels), L"\mathrm{Simulation}";
             orientation = :horizontal, tellheight = true, framevisible = false,
             labelsize = 14)
-        if show_polarization_regime_bars
-            Legend(polarization_legend_layout[1, 2], [
-                LineElement(color = MHD_COLORS[2], linewidth = 7),
-                LineElement(color = MHD_COLORS[3], linewidth = 7),
-            ], LaTeXString[L"\Gamma_B\ \mathrm{growth}", L"\mathrm{Steady\ state}"],
-                L"\mathrm{Time\ regime}";
-                orientation = :horizontal, tellheight = true, framevisible = false,
-                labelsize = 14)
-        end
     end
     fig_polarization_time
     end
@@ -8167,15 +8057,7 @@ version = "4.1.0+0"
 # ╟─fa155a62-da75-4530-b5e9-215fd4f66412
 # ╟─9da572fe-21f2-43df-9320-b8742fd64773
 # ╠═41b4eb12-889d-43b3-87c2-fc7cccf8679f
-# ╟─5a0d1b1b-fa59-4e7c-8c51-a98592c0c62e
-# ╠═36aef377-3de7-435a-af83-3a90421e3159
-# ╟─89c33295-34e7-49ec-8d04-52b2aac29cff
-# ╟─71c8ea26-d2ad-4430-9265-0b28d45bba1c
-# ╟─cd7e037c-62f5-4682-92c2-92af7169d692
-# ╟─dcc8f8f3-daaf-4d4b-92a3-4919ed5e36de
-# ╟─62bb58f1-37c3-4adb-a7fc-939f71a56635
 # ╠═b1000006-6f8c-4d0c-9a10-000000000006
-# ╟─298bd579-bb28-48b7-8c55-ea74804b9837
 # ╟─3190e127-1d53-49f1-bfab-b9645910c2c6
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b
 # ╟─3a731972-3404-478c-a572-00a05ab652b1

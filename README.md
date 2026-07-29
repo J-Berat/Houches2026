@@ -191,6 +191,45 @@ Selections use numbers: `1,3` selects two entries, `1-3` selects a range, and
 default. LOS-independent figures are always put in `common/` and computed only
 once, even when several viewing axes are selected.
 
+The first question selects the data layout. **Any directory** accepts either:
+
+- the path of one simulation containing `DataCubes/` or snapshot files;
+- a directory whose immediate subdirectories are simulations.
+
+In the second case, the interface lists the simulations and lets the user
+select one or several of them for comparative figures. No `VaryingMach`,
+`VaryingRes`, or `VaryingRatio` suffix is added in this mode. The
+**Preconfigured** option retains the three standard comparison folders.
+
+Before asking which figures to compute, the interface scans every selected
+simulation and prints a snapshot inventory: the resolved `DataCubes` directory,
+the total number of HDF5/FITS or raw RAMSES snapshots, and the complete
+numbered list of snapshot paths. A missing or empty cube directory is therefore
+reported before any expensive calculation starts.
+
+Raw RAMSES directories named `output_XXXXX` are supported through a persistent
+yt conversion cache. Install the Python converter once on the cluster:
+
+```bash
+python3 -m pip install --user -r requirements-ramses.txt
+```
+
+When the selected simulation contains raw RAMSES outputs, the interface:
+
+1. lists every detected `output_XXXXX`;
+2. asks which outputs to cache;
+3. asks for the uniform cube resolution;
+4. converts them with yt into `.dynamo_cache/ramses_cubes/`;
+5. runs the normal Julia analysis on those HDF5 cubes.
+
+Each cache file contains density, pressure, three velocity components, three
+cell-centred magnetic components, physical time, and box metadata. Existing
+files are reused. A cache entry is rebuilt automatically when its RAMSES
+`info_XXXXX.txt` fingerprint or requested resolution changes. Conversion uses
+an atomic temporary file, so an interrupted job cannot leave a valid-looking
+partial cube. Set `DYNAMO_PYTHON` if yt is installed in a different Python
+environment.
+
 The generated files are separated by comparison and snapshot window:
 
 ```text

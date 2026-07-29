@@ -101,10 +101,9 @@ function batch_config(
         output_format = "png",
     )
     BatchConfig(
-        data_repository = joinpath(
-            comparison_repository,
-            comparison.folder,
-        ),
+        data_repository = isempty(comparison.folder) ?
+            comparison_repository :
+            joinpath(comparison_repository, comparison.folder),
         simulations = comparison.simulations,
         snapshot = :last,
         snapshot_window = snapshot_window,
@@ -293,26 +292,355 @@ function normalized_path(path)
     abspath(expanded)
 end
 
+const SNAPSHOT_EXTENSIONS = Set([".h5", ".hdf5", ".fits", ".fit", ".fts"])
+
+function directory_has_direct_snapshots(directory)
+    isdir(directory) || return false
+    isdir(joinpath(directory, "DataCubes")) && return true
+    !isempty(ramses_output_directories(directory)) && return true
+    try
+        any(readdir(directory; join = true)) do entry
+            isfile(entry) && lowercase(splitext(entry)[2]) in SNAPSHOT_EXTENSIONS
+        end
+    catch
+        false
+    end
+end
+
+function ramses_output_directories(simulation_directory)
+    isdir(simulation_directory) || return String[]
+    entries = try
+        readdir(simulation_directory; join = true, sort = true)
+    catch
+        return String[]
+    end
+    sort(filter(entries) do entry
+        isdir(entry) || return false
+        matched = match(r"^output_(\d+)$", basename(entry))
+        isnothing(matched) && return false
+        isfile(joinpath(entry, "info_$(matched.captures[1]).txt"))
+    end)
+end
+
+function immediate_simulation_directories(directory)
+    entries = try
+        readdir(directory; join = true, sort = true)
+    catch error_value
+        error(
+            "Cannot read $(directory): " *
+            sprint(showerror, error_value),
+        )
+    end
+    ignored = Set([
+        ".dynamo_cache",
+        "figures",
+        "exports",
+        "powerspectra",
+        "power_spectra",
+    ])
+    filter(entries) do entry
+        isdir(entry) &&
+            !startswith(basename(entry), ".") &&
+            lowercase(basename(entry)) ∉ ignored
+    end
+end
+
+function safe_output_name(path)
+    name = lowercase(basename(normpath(path)))
+    cleaned = replace(name, r"[^a-z0-9]+" => "_")
+    isempty(strip(cleaned, '_')) ? "custom_comparison" : strip(cleaned, '_')
+end
+
+function fits_field_directory_is_snapshot(directory)
+    isdir(directory) || return false
+    stems = try
+        Set(lowercase(splitext(entry)[1]) for entry in readdir(directory)
+            if lowercase(splitext(entry)[2]) in (".fits", ".fit", ".fts"))
+    catch
+        return false
+    end
+    density_names = Set(["rho", "density", "massdensity"])
+    velocity_names = (
+        Set(["vx", "velx", "velocityx", "xvelocity"]),
+        Set(["vy", "vely", "velocityy", "yvelocity"]),
+        Set(["vz", "velz", "velocityz", "zvelocity"]),
+    )
+    !isempty(intersect(stems, density_names)) &&
+        all(!isempty(intersect(stems, names)) for names in velocity_names)
+end
+
+function direct_snapshot_sources(directory)
+    isdir(directory) || return String[]
+    entries = try
+        readdir(directory; join = true, sort = true)
+    catch error_value
+        error(
+            "Cannot list snapshots in $(directory): " *
+            sprint(showerror, error_value),
+        )
+    end
+    sort(filter(entries) do entry
+        (isfile(entry) &&
+            lowercase(splitext(entry)[2]) in SNAPSHOT_EXTENSIONS) ||
+            fits_field_directory_is_snapshot(entry)
+    end)
+end
+
+function simulation_snapshot_inventory(
+        comparison_repository,
+        comparison,
+        simulation,
+    )
+    group_directory = isempty(comparison.folder) ?
+        comparison_repository :
+        joinpath(comparison_repository, comparison.folder)
+    simulation_directory = joinpath(group_directory, simulation)
+    isdir(simulation_directory) || error(
+        "Simulation directory not found: $(simulation_directory)",
+    )
+    cube_directory = isdir(joinpath(simulation_directory, "DataCubes")) ?
+        joinpath(simulation_directory, "DataCubes") :
+        simulation_directory
+    sources = direct_snapshot_sources(cube_directory)
+    if isempty(sources)
+        sources = ramses_output_directories(simulation_directory)
+        isempty(sources) || return (
+            simulation,
+            cube_directory = simulation_directory,
+            sources,
+            format = "RAMSES",
+        )
+    end
+    isempty(sources) && error(
+        "No HDF5 or FITS snapshots were found for simulation $(simulation) " *
+        "in $(cube_directory).",
+    )
+    (; simulation, cube_directory, sources, format = "HDF5/FITS")
+end
+
+function print_snapshot_inventory(comparisons, comparison_repository)
+    println("\n", repeat("─", 72))
+    println("SNAPSHOT INVENTORY")
+    println(repeat("─", 72))
+    inventories = NamedTuple[]
+    for comparison in comparisons
+        for simulation in comparison.simulations
+            inventory = simulation_snapshot_inventory(
+                comparison_repository,
+                comparison,
+                simulation,
+            )
+            push!(inventories, inventory)
+            println(
+                "\n",
+                inventory.simulation,
+                ": ",
+                length(inventory.sources),
+                " snapshot(s) [",
+                inventory.format,
+                "]",
+            )
+            println("  Cube directory: ", inventory.cube_directory)
+            for (index, source) in enumerate(inventory.sources)
+                println("  ", lpad(index, 4), ". ", source)
+            end
+        end
+    end
+    println(repeat("─", 72))
+    inventories
+end
+
+function inferred_ramses_resolution(simulation_paths)
+    resolutions = Int[]
+    for path in simulation_paths
+        for matched in eachmatch(r"(?:^|_)(\d{2,4})(?=$|_)", basename(normpath(path)))
+            push!(resolutions, parse(Int, matched.captures[1]))
+        end
+    end
+    isempty(resolutions) ? 256 : last(resolutions)
+end
+
+function ramses_cache_comparison(simulation_paths, requested_path)
+    inventories = Dict(
+        path => ramses_output_directories(path) for path in simulation_paths)
+    all(outputs -> !isempty(outputs), values(inventories)) || error(
+        "A custom comparison cannot currently mix raw RAMSES outputs with " *
+        "HDF5/FITS simulations. Convert the RAMSES simulations first or " *
+        "select simulations using the same format.",
+    )
+
+    println("\n", repeat("─", 72))
+    println("RAW RAMSES OUTPUTS")
+    println(repeat("─", 72))
+    selected_outputs = Dict{String,Vector{String}}()
+    for path in simulation_paths
+        outputs = inventories[path]
+        println("\n", basename(normpath(path)), ": ", length(outputs), " output(s)")
+        selected_outputs[path] = prompt_multiple(
+            "RAMSES outputs to cache for $(basename(normpath(path)))",
+            outputs;
+            labels = basename.(outputs),
+        )
+    end
+
+    dry_run = lowercase(get(ENV, "DYNAMO_DRY_RUN", "false")) in
+        ("1", "true", "yes")
+    if dry_run
+        println("\nDry run: RAMSES conversion was not started.")
+        comparison = (
+            key = "custom",
+            folder = "",
+            output_name = safe_output_name(requested_path),
+            simulations = basename.(normpath.(simulation_paths)),
+        )
+        return [comparison], dirname(first(simulation_paths))
+    end
+
+    resolution = prompt_positive_integer(
+        "Uniform RAMSES cache resolution per axis",
+        inferred_ramses_resolution(simulation_paths),
+    )
+    cache_root = normalized_path(prompt_text(
+        "RAMSES HDF5 cache root",
+        joinpath(PROJECT_DIRECTORY, ".dynamo_cache", "ramses_cubes"),
+    ))
+    mkpath(cache_root)
+    converter = joinpath(PROJECT_DIRECTORY, "tools", "ramses_to_hdf5.py")
+    isfile(converter) || error("RAMSES converter not found: $(converter)")
+    python = get(ENV, "DYNAMO_PYTHON", "python3")
+
+    cache_names = String[]
+    used_names = Set{String}()
+    for (simulation_index, path) in enumerate(simulation_paths)
+        base_name = safe_output_name(path)
+        cache_name = base_name
+        suffix = 2
+        while cache_name in used_names
+            cache_name = "$(base_name)_$(suffix)"
+            suffix += 1
+        end
+        push!(used_names, cache_name)
+        push!(cache_names, cache_name)
+        cache_directory = joinpath(cache_root, cache_name, "DataCubes")
+        mkpath(cache_directory)
+        outputs_argument = join(basename.(selected_outputs[path]), ",")
+        command = `$(python) $(converter) --simulation $(path) --output-directory $(cache_directory) --resolution $(resolution) --outputs $(outputs_argument)`
+        println(
+            "\nConverting RAMSES simulation ",
+            simulation_index,
+            "/",
+            length(simulation_paths),
+            ": ",
+            path,
+        )
+        try
+            run(command)
+        catch error_value
+            error(
+                "RAMSES conversion failed. Install Python dependencies with " *
+                "`$(python) -m pip install --user -r " *
+                "requirements-ramses.txt`. Original error: " *
+                sprint(showerror, error_value),
+            )
+        end
+    end
+
+    comparison = (
+        key = "custom",
+        folder = "",
+        output_name = safe_output_name(requested_path),
+        simulations = cache_names,
+    )
+    [comparison], cache_root
+end
+
+function custom_comparison_selection()
+    requested_path = normalized_path(prompt_text(
+        "Simulation or simulation-group directory",
+        COMPARISON_REPOSITORY,
+    ))
+    isdir(requested_path) ||
+        error("Data directory not found: $(requested_path)")
+
+    if directory_has_direct_snapshots(requested_path)
+        if !isempty(ramses_output_directories(requested_path))
+            return ramses_cache_comparison([requested_path], requested_path)
+        end
+        simulation_path = lowercase(basename(normpath(requested_path))) ==
+            "datacubes" ? dirname(normpath(requested_path)) : requested_path
+        simulation_name = basename(normpath(simulation_path))
+        comparison = (
+            key = "custom",
+            folder = "",
+            output_name = safe_output_name(simulation_path),
+            simulations = [simulation_name],
+        )
+        println("\nDetected one simulation: ", simulation_name)
+        return [comparison], dirname(normpath(simulation_path))
+    end
+
+    candidates = immediate_simulation_directories(requested_path)
+    isempty(candidates) && error(
+        "No simulation directory was found directly inside $(requested_path). " *
+        "Select the simulation directory itself or its immediate parent.",
+    )
+    candidate_names = basename.(candidates)
+    selected_names = prompt_multiple(
+        "Simulations to compare",
+        candidate_names;
+        labels = candidate_names,
+    )
+    selected_paths = [joinpath(requested_path, name) for name in selected_names]
+    raw_flags = .!isempty.(ramses_output_directories.(selected_paths))
+    if any(raw_flags)
+        all(raw_flags) || error(
+            "The selected simulations mix raw RAMSES and HDF5/FITS data. " *
+            "Select only raw RAMSES simulations for automatic conversion.",
+        )
+        return ramses_cache_comparison(selected_paths, requested_path)
+    end
+    comparison = (
+        key = "custom",
+        folder = "",
+        output_name = safe_output_name(requested_path),
+        simulations = selected_names,
+    )
+    [comparison], requested_path
+end
+
 function interactive_batch_configs()
     println("\n", repeat("═", 72))
     println("DYNAMO — INTERACTIVE FIGURE SELECTION")
     println(repeat("═", 72))
     println("Press Enter to accept a default. Multiple selections accept 1,3, 1-3, or all.")
 
-    comparison_repository = normalized_path(prompt_text(
-        "Comparison root directory",
-        COMPARISON_REPOSITORY,
-    ))
-    comparison_labels = [
-        "$(comparison.key): $(comparison.folder) (" *
-        join(comparison.simulations, ", ") * ")"
-        for comparison in COMPARISONS
-    ]
-    comparisons = prompt_multiple(
-        "Comparison groups",
-        collect(COMPARISONS);
-        labels = comparison_labels,
+    data_mode = prompt_one(
+        "Simulation layout",
+        ["custom", "standard"];
+        labels = [
+            "Any directory: one simulation or several simulations to compare",
+            "Preconfigured VaryingMach / VaryingRes / VaryingRatio folders",
+        ],
     )
+    if data_mode == "custom"
+        comparisons, comparison_repository = custom_comparison_selection()
+    else
+        comparison_repository = normalized_path(prompt_text(
+            "Comparison root directory",
+            COMPARISON_REPOSITORY,
+        ))
+        comparison_labels = [
+            "$(comparison.key): $(comparison.folder) (" *
+            join(comparison.simulations, ", ") * ")"
+            for comparison in COMPARISONS
+        ]
+        comparisons = prompt_multiple(
+            "Comparison groups",
+            collect(COMPARISONS);
+            labels = comparison_labels,
+        )
+    end
+    print_snapshot_inventory(comparisons, comparison_repository)
 
     notebook_names = available_notebooks()
     notebook_labels = [
@@ -432,7 +760,10 @@ function print_batch_plan(configurations, comparison_repository)
             "  ",
             index,
             ". ",
-            basename(config.data_repository),
+            basename(normpath(config.data_repository)),
+            " [",
+            join(config.simulations, ", "),
+            "]",
             " — ",
             config.snapshot_window,
             " ",

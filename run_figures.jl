@@ -559,8 +559,13 @@ function custom_comparison_selection()
         "Simulation or simulation-group directory",
         COMPARISON_REPOSITORY,
     ))
-    isdir(requested_path) ||
-        error("Data directory not found: $(requested_path)")
+    if !isdir(requested_path)
+        cluster_hint = startswith(requested_path, "/Xnfs/") ?
+            "\nThis is a cluster-only /Xnfs path. From the laptop, run " *
+            "`bash run_figures_interactive_cluster.sh` so the menu executes " *
+            "through SSH on PSMN_sr650node230." : ""
+        error("Data directory not found: $(requested_path)$(cluster_hint)")
+    end
 
     if directory_has_direct_snapshots(requested_path)
         if !isempty(ramses_output_directories(requested_path))

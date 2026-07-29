@@ -186,6 +186,19 @@ The equivalent Bash launcher is:
 bash run_figures_interactive.sh
 ```
 
+Paths below `/Xnfs` exist only on the cluster. To display the interactive menu
+on the laptop while performing discovery, RAMSES conversion, and computation
+remotely, use:
+
+```bash
+bash run_figures_interactive_cluster.sh
+```
+
+This allocates an SSH terminal on `PSMN_sr650node230`, runs the interactive
+launcher in `~/Houches2026`, and downloads the figures after a successful run.
+Set `DOWNLOAD_AFTER_RUN=false` to leave the results on the cluster, or override
+the SSH alias with `CLUSTER_HOST`.
+
 Selections use numbers: `1,3` selects two entries, `1-3` selects a range, and
 `all` selects every displayed entry. Pressing Enter accepts the displayed
 default. LOS-independent figures are always put in `common/` and computed only

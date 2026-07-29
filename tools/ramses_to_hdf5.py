@@ -24,6 +24,7 @@ except ImportError as error:
 
 
 DENSITY_STORAGE_UNIT = 1.0e-12
+CACHE_FORMAT_VERSION = 2
 OUTPUT_PATTERN = re.compile(r"^output_(\d+)$")
 
 
@@ -183,7 +184,8 @@ def cache_is_current(
     try:
         with h5py.File(target, "r") as handle:
             return (
-                int(handle.attrs.get("cache_format_version", 0)) == 1
+                int(handle.attrs.get("cache_format_version", 0))
+                == CACHE_FORMAT_VERSION
                 and int(handle.attrs.get("resolution", -1)) == resolution
                 and str(handle.attrs.get("source_fingerprint", "")) == fingerprint
                 and str(handle.attrs.get("source_info", "")) == str(info_path.resolve())
@@ -196,7 +198,10 @@ def write_dataset(handle, name: str, values: np.ndarray) -> None:
     handle.create_dataset(
         name,
         data=values,
-        compression="lzf",
+        # DEFLATE is part of the standard HDF5 filter set and can therefore be
+        # read by both h5py and HDF5.jl without an external filter plugin.
+        compression="gzip",
+        compression_opts=1,
         shuffle=True,
         chunks=True,
     )
@@ -269,7 +274,7 @@ def convert_output(output: Path, target: Path, resolution: int, force: bool) -> 
                     clear_data()
             handle.create_dataset("L", data=np.full(3, 100.0, dtype=np.float64))
             handle.create_dataset("t", data=np.float64(time_myr))
-            handle.attrs["cache_format_version"] = 1
+            handle.attrs["cache_format_version"] = CACHE_FORMAT_VERSION
             handle.attrs["source_format"] = "RAMSES/yt"
             handle.attrs["source_info"] = str(info_path.resolve())
             handle.attrs["source_fingerprint"] = fingerprint

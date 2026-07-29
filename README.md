@@ -245,7 +245,9 @@ cell-centred magnetic components, physical time, and box metadata. Existing
 files are reused. A cache entry is rebuilt automatically when its RAMSES
 `info_XXXXX.txt` fingerprint or requested resolution changes. Conversion uses
 an atomic temporary file, so an interrupted job cannot leave a valid-looking
-partial cube. Set `DYNAMO_PYTHON` if yt is installed in a different Python
+partial cube. Cube datasets use the standard HDF5 DEFLATE filter at compression
+level 1, which remains directly readable by HDF5.jl without an external filter
+plugin. Set `DYNAMO_PYTHON` if yt is installed in a different Python
 environment.
 
 The generated files are separated by comparison and snapshot window:

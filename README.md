@@ -169,6 +169,28 @@ cd "/Users/jb270005/Desktop/LesHouchesGit"
 julia --threads=auto --startup-file=no --project=. run_figures.jl
 ```
 
+### Interactive terminal selection
+
+To choose the comparison groups, figure families, individual plots, lines of
+sight, snapshot window, output format, and destination without editing the
+script, start the Julia terminal interface:
+
+```bash
+julia --threads=auto --startup-file=no --project=. \
+    run_figures.jl --interactive
+```
+
+The equivalent Bash launcher is:
+
+```bash
+bash run_figures_interactive.sh
+```
+
+Selections use numbers: `1,3` selects two entries, `1-3` selects a range, and
+`all` selects every displayed entry. Pressing Enter accepts the displayed
+default. LOS-independent figures are always put in `common/` and computed only
+once, even when several viewing axes are selected.
+
 The generated files are separated by comparison and snapshot window:
 
 ```text

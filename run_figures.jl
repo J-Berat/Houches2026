@@ -560,10 +560,30 @@ function custom_comparison_selection()
         COMPARISON_REPOSITORY,
     ))
     if !isdir(requested_path)
+        if startswith(requested_path, "/Xnfs/") && Sys.isapple()
+            remote_launcher = joinpath(
+                PROJECT_DIRECTORY,
+                "run_figures_interactive_cluster.sh",
+            )
+            isfile(remote_launcher) || error(
+                "Cluster launcher not found: $(remote_launcher)",
+            )
+            println(
+                "\nThe selected /Xnfs path is not mounted on this laptop.",
+            )
+            println(
+                "Switching automatically to the interactive cluster launcher...",
+            )
+            flush(stdout)
+            withenv("DYNAMO_REMOTE_DATA_PATH" => requested_path) do
+                run(`bash $(remote_launcher)`)
+            end
+            exit(0)
+        end
         cluster_hint = startswith(requested_path, "/Xnfs/") ?
-            "\nThis is a cluster-only /Xnfs path. From the laptop, run " *
-            "`bash run_figures_interactive_cluster.sh` so the menu executes " *
-            "through SSH on PSMN_sr650node230." : ""
+            "\nThis is a cluster-only /Xnfs path. Run " *
+            "`bash run_figures_interactive_cluster.sh` from the laptop so " *
+            "the menu executes through SSH on PSMN_sr650node230." : ""
         error("Data directory not found: $(requested_path)$(cluster_hint)")
     end
 

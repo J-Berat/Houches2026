@@ -199,6 +199,11 @@ launcher in `~/Houches2026`, and downloads the figures after a successful run.
 Set `DOWNLOAD_AFTER_RUN=false` to leave the results on the cluster, or override
 the SSH alias with `CLUSTER_HOST`.
 
+If `run_figures_interactive.sh` is started locally by mistake and an `/Xnfs`
+path is entered, the Julia launcher now switches to this SSH workflow
+automatically. The entered path is forwarded as the default data path in the
+remote menu.
+
 Selections use numbers: `1,3` selects two entries, `1-3` selects a range, and
 `all` selects every displayed entry. Pressing Enter accepts the displayed
 default. LOS-independent figures are always put in `common/` and computed only

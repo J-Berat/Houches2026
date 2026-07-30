@@ -97,6 +97,39 @@ Les extensions reconnues sont `.h5`, `.hdf5`, `.fits`, `.fit` et `.fts`.
 
 ## Calcul des figures sans Pluto
 
+### Comparaison directe de la vorticité : cooling / isotherme
+
+Le script autonome suivant ne charge aucun notebook et superpose
+`⟨|ω|⟩` (trait plein) et `ω_rms` (tirets) pour les simulations cooling et
+isotherme :
+
+```bash
+julia --threads=auto --startup-file=no --project=. \
+  plot_cooling_isothermal_vorticity.jl
+```
+
+Ses chemins par défaut sont :
+
+```text
+/Xnfs/Houches2026/DynSim/isothermal_correct/turb_rms_50_N128
+/Xnfs/Houches2026/DynSim/cooling_freq_output/turb_rms_10_N256
+```
+
+La figure est écrite dans
+`figures/cooling_isothermal_vorticity_time.png`. Pour remplacer les chemins,
+la destination et limiter le calcul à 12 snapshots uniformément répartis :
+
+```bash
+julia --threads=auto --startup-file=no --project=. \
+  plot_cooling_isothermal_vorticity.jl \
+  /path/to/isothermal /path/to/cooling /path/to/output.png 12
+```
+
+La fonction réutilisable est
+`plot_vorticity_time_comparison` dans `src/VorticityComparison.jl`. Les cubes
+ont une taille physique par défaut de 100 pc et les réductions scalaires sont
+mises en cache dans `.dynamo_cache/`.
+
 `run_figures.jl` launches the three comparison folders below:
 
 ```text

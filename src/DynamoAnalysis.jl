@@ -32,6 +32,7 @@ const BATCH_DISPLAY_FLAGS = Dict(
     "growth_rate_relations" => :display_gamma_relations,
     "normalized_magnetic_relations" => :display_normalized_B_relations,
     "energy_time" => :display_energy_time,
+    "vorticity_time" => :display_vorticity_time,
     "moose_rmsf" => :display_moose_rmsf,
     "summary" => :display_phase_B_time,
     "polarization_intensity" => :display_polarization_intensity_histograms,

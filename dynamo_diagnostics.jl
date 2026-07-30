@@ -4346,12 +4346,17 @@ md"""
 | HOG gradient rejection percentile | $(@bind hog_gradient_percentile PlutoUI.Slider(0.0:5.0:90.0; default = 20.0, show_value = true)) |
 | Apply HOG to $\log_{10}$ maps | $(@bind hog_logarithmic_maps PlutoUI.CheckBox(default = true)) |
 
-The 3D HRO compares $\mathbf B$ with three-dimensional iso-density
-structures. The 2D HRO compares the density-weighted plane-of-sky magnetic
-field $\mathbf B_\perp$ with structures in the projected column-density map
-$N_{\rm H}$. HOG compares the gradients of projected $N_{\rm H}$ and
-density-weighted $|B|$. All selected simulations use the active snapshot index
-and line of sight.
+The 3D HRO compares both $\nabla n$ and the turbulent velocity
+$\delta\mathbf v=\mathbf v-\langle\mathbf v\rangle_\rho$ with $\mathbf B$.
+The orientation parameter is
+$\xi=(A_\parallel-A_\perp)/(A_\parallel+A_\perp)$, where
+$A_\parallel$ contains $|\cos\phi|\geq0.75$ and $A_\perp$ contains
+$|\cos\phi|\leq0.25$. Consequently, $\xi>0$ indicates preferentially parallel
+vectors and $\xi<0$ preferentially perpendicular vectors. The 2D HRO applies
+the same convention to $\nabla N_{\rm H}$ and the density-weighted
+plane-of-sky magnetic field $\mathbf B_\perp$. HOG compares the gradients of
+projected $N_{\rm H}$ and density-weighted $|B|$. All selected simulations use
+the requested snapshot ensemble and line of sight.
 """
 
 # ╔═╡ b1000002-6f8c-4d0c-9a10-000000000002
@@ -4581,26 +4586,39 @@ begin
             density_bin_count;
             angle_bin_count = 18,
             bootstrap_replicates = 200,
+            requested_density_edges = nothing,
         )
         function orientation_parameter_with_bootstrap(local_angles, seed)
-            signs = Float64[
-                angle < 22.5 ? 1.0 : angle > 67.5 ? -1.0 : NaN
-                for angle in local_angles
-            ]
-            filter!(isfinite, signs)
-            isempty(signs) && return (NaN, NaN, NaN)
-            xi = mean(signs)
+            cosines = abs.(cosd.(Float64.(local_angles)))
+            filter!(isfinite, cosines)
+            isempty(cosines) && return (NaN, NaN, NaN)
+            orientation_parameter(values) = begin
+                parallel = count(>=(0.75), values)
+                perpendicular = count(<=(0.25), values)
+                denominator = parallel + perpendicular
+                denominator > 0 ?
+                    (parallel - perpendicular) / denominator : NaN
+            end
+            xi = orientation_parameter(cosines)
+            isfinite(xi) || return (NaN, NaN, NaN)
             bootstrap_replicates <= 0 && return (xi, NaN, NaN)
-            if length(signs) > 4000
-                indices = round.(Int, range(1, length(signs); length = 4000))
-                signs = signs[indices]
+            if length(cosines) > 4000
+                indices = round.(Int, range(1, length(cosines); length = 4000))
+                cosines = cosines[indices]
             end
             rng = MersenneTwister(seed)
             estimates = Vector{Float64}(undef, bootstrap_replicates)
             for replicate in eachindex(estimates)
-                estimates[replicate] =
-                    mean(signs[rand(rng, 1:length(signs), length(signs))])
+                estimates[replicate] = orientation_parameter(
+                    cosines[rand(
+                        rng,
+                        1:length(cosines),
+                        length(cosines),
+                    )],
+                )
             end
+            filter!(isfinite, estimates)
+            isempty(estimates) && return (xi, NaN, NaN)
             lower, upper = quantile(estimates, (0.16, 0.84))
             (xi, lower, upper)
         end
@@ -4620,15 +4638,22 @@ begin
                 counts = zeros(Int, density_bin_count),
             )
         end
-        probability_edges = collect(range(0.0, 1.0; length = density_bin_count + 1))
-        density_edges = unique(quantile(densities, probability_edges))
+        density_edges = if isnothing(requested_density_edges)
+            probability_edges =
+                collect(range(0.0, 1.0; length = density_bin_count + 1))
+            unique(quantile(densities, probability_edges))
+        else
+            Float64.(collect(requested_density_edges))
+        end
         length(density_edges) >= 2 || (density_edges = [minimum(densities), maximum(densities) + eps()])
         bin_count = length(density_edges) - 1
         histograms = zeros(Float64, length(angle_centers), bin_count)
         shape = fill(NaN, bin_count)
         bootstrap_lower = fill(NaN, bin_count)
         bootstrap_upper = fill(NaN, bin_count)
-        density_centers = fill(NaN, bin_count)
+        density_centers = isnothing(requested_density_edges) ?
+            fill(NaN, bin_count) :
+            (density_edges[1:end-1] .+ density_edges[2:end]) ./ 2
         counts = zeros(Int, bin_count)
         for bin in 1:bin_count
             members = (densities .>= density_edges[bin]) .&
@@ -4637,7 +4662,8 @@ begin
             local_angles = angles[members]
             counts[bin] = length(local_angles)
             isempty(local_angles) && continue
-            density_centers[bin] = median(densities[members])
+            isnothing(requested_density_edges) &&
+                (density_centers[bin] = median(densities[members]))
             histogram = fit(Histogram, local_angles, angle_edges).weights
             histograms[:, bin] .= histogram ./ max(sum(histogram), 1)
             shape[bin], bootstrap_lower[bin], bootstrap_upper[bin] =
@@ -4705,11 +4731,40 @@ begin
         mantissa = numeric_value / 10.0^exponent
         string(@sprintf("%.3g", mantissa), raw"\times10^{", exponent, "}")
     end
+
+    const HRO_PARALLEL_BACKGROUND = RGBf(0.78, 0.88, 0.94)
+    const HRO_PERPENDICULAR_BACKGROUND = RGBf(0.98, 0.75, 0.62)
+
+    function hro_xi_background!(axis, limits)
+        xmin, xmax = limits
+        band!(axis, [xmin, xmax], [0.0, 0.0], [1.0, 1.0];
+            color = HRO_PARALLEL_BACKGROUND)
+        band!(axis, [xmin, xmax], [-1.0, -1.0], [0.0, 0.0];
+            color = HRO_PERPENDICULAR_BACKGROUND)
+        hlines!(axis, [0.0]; color = :black, linewidth = 1.8)
+        xlims!(axis, xmin, xmax)
+        ylims!(axis, -1.0, 1.0)
+        axis
+    end
+
+    function hro_density_limits(products)
+        values = vcat([
+            10.0 .^ Float64.(filter(isfinite, product.density_centers))
+            for product in products
+        ]...)
+        limits = enclosing_decade_limits(values)
+        isnothing(limits) ? (0.1, 100.0) : limits
+    end
 end
 
 # ╔═╡ b1000004-6f8c-4d0c-9a10-000000000004
 begin
-    function hro_products(c, density_bin_count; angle_bin_count = 18)
+    function hro_products(
+            c,
+            density_bin_count;
+            angle_bin_count = 18,
+            density_edges = nothing,
+        )
         local_n = number_density(c.rho)
         log_density = safe_log10.(local_n)
         spacing = c.L ./ size(c.rho)
@@ -4722,106 +4777,180 @@ begin
             isfinite.(field_norm) .& (gradient_norm .> 0) .& (field_norm .> 0)
         cosine_gradient = abs.(c.bx .* gx .+ c.by .* gy .+ c.bz .* gz) ./
             max.(field_norm .* gradient_norm, eps(Float64))
-        # 0°: B follows an isodensity structure; 90°: B crosses it.
-        angles = asind.(clamp.(cosine_gradient[valid], 0.0, 1.0))
-        hro_binned_summary(
+        # 0° means that B and ∇n are parallel; 90° means perpendicular.
+        gradient_angles =
+            acosd.(clamp.(cosine_gradient[valid], 0.0, 1.0))
+        gradient_summary = hro_binned_summary(
             log_density[valid],
-            angles,
+            gradient_angles,
             density_bin_count;
             angle_bin_count,
+            requested_density_edges = density_edges,
         )
+
+        velocity = turbulent_velocity(c)
+        velocity_norm = sqrt.(velocity.dv2)
+        valid_velocity = isfinite.(log_density) .& isfinite.(velocity_norm) .&
+            isfinite.(field_norm) .& (velocity_norm .> 0) .& (field_norm .> 0)
+        cosine_velocity = abs.(
+            c.bx .* velocity.dvx .+
+            c.by .* velocity.dvy .+
+            c.bz .* velocity.dvz,
+        ) ./ max.(field_norm .* velocity_norm, eps(Float64))
+        velocity_angles =
+            acosd.(clamp.(cosine_velocity[valid_velocity], 0.0, 1.0))
+        velocity_summary = hro_binned_summary(
+            log_density[valid_velocity],
+            velocity_angles,
+            density_bin_count;
+            angle_bin_count,
+            requested_density_edges = density_edges,
+        )
+        (gradient = gradient_summary, velocity = velocity_summary)
     end
 
-    hro_by_run = Dict(label => aggregate_hro_products([
+    hro_common_log_density_edges = collect(range(
+        bn_nlo,
+        bn_nhi;
+        length = Int(hro_density_bin_count) + 1,
+    ))
+    hro_by_run = Dict(label => begin
+        snapshot_products = [
             cached_scientific_product((
-                :hro_3d_snapshot,
+                :hro_3d_ibanez_snapshot_v1,
                 cube_signature(path),
                 Float64(mean_molecular_weight),
                 Int(hro_density_bin_count),
+                Tuple(hro_common_log_density_edges),
                 200,
             )) do
                 local_cube = path ==
                     run_files[label][comparison_snapshot_indices[label]] ?
                     comparison_cube(label) : load_cube(path)
-                hro_products(local_cube, Int(hro_density_bin_count))
+                hro_products(
+                    local_cube,
+                    Int(hro_density_bin_count);
+                    density_edges = hro_common_log_density_edges,
+                )
             end
             for path in comparison_snapshot_paths[label]
-        ]) for label in comparison_run_labels)
-    active_hro = haskey(hro_by_run, selected_run) ? hro_by_run[selected_run] :
-        hro_products(cube, Int(hro_density_bin_count))
+        ]
+        (
+            gradient = aggregate_hro_products(
+                [product.gradient for product in snapshot_products]),
+            velocity = aggregate_hro_products(
+                [product.velocity for product in snapshot_products]),
+        )
+    end for label in comparison_run_labels)
 
-    fig_hro = Figure(size = (1450, 470))
-    hro_hist_axis = latex_axis(fig_hro[1, 1],
-        xlabel = L"\phi_{B,\,\mathrm{structure}}\;[{}^\circ]",
-        ylabel = L"\mathcal{P}(\phi)")
-    representative_bins = unique([1, cld(size(active_hro.histograms, 2), 2),
-        size(active_hro.histograms, 2)])
-    for (style_index, bin) in enumerate(representative_bins)
-        isfinite(active_hro.density_centers[bin]) || continue
-        lines!(hro_hist_axis, active_hro.angle_centers,
-            active_hro.histograms[:, bin]; color = MHD_COLORS[style_index],
-            linewidth = 2.8,
-            label = latexstring(raw"n_{\mathrm{med}}=",
-                @sprintf("%.3g", 10.0^active_hro.density_centers[bin]),
-                raw"\;\mathrm{cm}^{-3}"))
-    end
-    axislegend(hro_hist_axis; position = :ct, framevisible = false)
+    hro_3d_density_limits = hro_density_limits(vcat(
+        [hro_by_run[label].gradient for label in comparison_run_labels],
+        [hro_by_run[label].velocity for label in comparison_run_labels],
+    ))
+    fig_hro = Figure(size = (1250, 520))
+    hro_gradient_axis = latex_axis(
+        fig_hro[1, 1];
+        xlabel = L"\mathrm{number\ density}\ n\;[\mathrm{cm}^{-3}]",
+        ylabel = L"\xi_{\nabla n B}",
+        title = L"\phi_{\nabla n B}",
+        xscale = log10,
+        xticks = DECADE_TICKS,
+        yticks = -1.0:0.5:1.0,
+        xminorticks = IntervalsBetween(9),
+        yminorticks = IntervalsBetween(2),
+        xminorticksvisible = true,
+        yminorticksvisible = true,
+        xgridvisible = false,
+        ygridvisible = false,
+        xminorgridvisible = false,
+        yminorgridvisible = false,
+        topspinevisible = true,
+        rightspinevisible = true,
+    )
+    hro_velocity_axis = latex_axis(
+        fig_hro[1, 2];
+        xlabel = L"\mathrm{number\ density}\ n\;[\mathrm{cm}^{-3}]",
+        ylabel = L"\xi_{vB}",
+        title = L"\phi_{vB}",
+        xscale = log10,
+        xticks = DECADE_TICKS,
+        yticks = -1.0:0.5:1.0,
+        xminorticks = IntervalsBetween(9),
+        yminorticks = IntervalsBetween(2),
+        xminorticksvisible = true,
+        yminorticksvisible = true,
+        xgridvisible = false,
+        ygridvisible = false,
+        xminorgridvisible = false,
+        yminorgridvisible = false,
+        topspinevisible = true,
+        rightspinevisible = true,
+    )
+    hro_xi_background!(hro_gradient_axis, hro_3d_density_limits)
+    hro_xi_background!(hro_velocity_axis, hro_3d_density_limits)
 
-    hro_shape_axis = latex_axis(fig_hro[1, 2],
-        xlabel = L"n\;[\mathrm{cm}^{-3}]", ylabel = L"\xi_{\mathrm{HRO}}",
-        xscale = log10, xticks = DECADE_TICKS,
-        xminorticks = IntervalsBetween(9), xminorticksvisible = true)
-    hlines!(hro_shape_axis, [0.0]; color = (:gray45, 0.65), linestyle = :dash)
-    for label in comparison_run_labels
-        product = hro_by_run[label]
-        valid = isfinite.(product.density_centers) .& isfinite.(product.shape)
-        band!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
-            product.lower[valid], product.upper[valid];
-            color = (run_colors[label], 0.16))
-        lines!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
-            product.shape[valid]; color = run_colors[label], linewidth = 2.8,
-            label = ensemble_legend_label(label))
-        scatter!(hro_shape_axis, 10.0 .^ product.density_centers[valid],
-            product.shape[valid]; color = run_colors[label], markersize = 6)
-        bootstrap_valid = valid .& isfinite.(product.bootstrap_lower) .&
-            isfinite.(product.bootstrap_upper)
-        errorbars!(hro_shape_axis,
-            10.0 .^ product.density_centers[bootstrap_valid],
-            product.shape[bootstrap_valid],
-            max.(product.shape[bootstrap_valid] .-
-                product.bootstrap_lower[bootstrap_valid], 0.0),
-            max.(product.bootstrap_upper[bootstrap_valid] .-
-                product.shape[bootstrap_valid], 0.0);
-            color = run_colors[label], whiskerwidth = 7)
-    end
-    axislegend(hro_shape_axis; position = :lb, framevisible = false)
-
-    hro_count_axis = latex_axis(fig_hro[1, 3],
-        xlabel = L"n\;[\mathrm{cm}^{-3}]",
-        ylabel = L"N_{\mathrm{cells}}",
-        xscale = log10, yscale = log10,
-        xticks = DECADE_TICKS, yticks = DECADE_TICKS,
-        xminorticks = IntervalsBetween(9), yminorticks = IntervalsBetween(9),
-        xminorticksvisible = true, yminorticksvisible = true)
-    for label in comparison_run_labels
-        product = hro_by_run[label]
-        valid = isfinite.(product.density_centers) .&
-            isfinite.(product.counts) .& (product.counts .> 0)
-        band!(hro_count_axis, 10.0 .^ product.density_centers[valid],
-            max.(product.count_lower[valid], 1.0),
-            max.(product.count_upper[valid], 1.0);
-            color = (run_colors[label], 0.16))
-        lines!(hro_count_axis, 10.0 .^ product.density_centers[valid],
-            product.counts[valid]; color = run_colors[label], linewidth = 2.5)
-    end
-    hro_count_values = vcat([
-        Float64.(filter(value -> isfinite(value) && value > 0,
-            hro_by_run[label].counts))
+    for (axis, field) in (
+            (hro_gradient_axis, :gradient),
+            (hro_velocity_axis, :velocity),
+        )
         for label in comparison_run_labels
-    ]...)
-    hro_count_limits = enclosing_decade_limits(hro_count_values)
-    isnothing(hro_count_limits) ||
-        ylims!(hro_count_axis, hro_count_limits...)
+            product = getproperty(hro_by_run[label], field)
+            valid =
+                isfinite.(product.density_centers) .& isfinite.(product.shape)
+            x = 10.0 .^ product.density_centers[valid]
+            band!(
+                axis,
+                x,
+                product.lower[valid],
+                product.upper[valid];
+                color = (run_colors[label], 0.15),
+            )
+            lines!(
+                axis,
+                x,
+                product.shape[valid];
+                color = run_colors[label],
+                linewidth = 2.6,
+                label = field == :gradient ?
+                    ensemble_legend_label(label) : nothing,
+            )
+            scatter!(
+                axis,
+                x,
+                product.shape[valid];
+                color = run_colors[label],
+                strokecolor = :black,
+                strokewidth = 0.5,
+                markersize = 7,
+            )
+            bootstrap_valid = valid .&
+                isfinite.(product.bootstrap_lower) .&
+                isfinite.(product.bootstrap_upper)
+            errorbars!(
+                axis,
+                10.0 .^ product.density_centers[bootstrap_valid],
+                product.shape[bootstrap_valid],
+                max.(product.shape[bootstrap_valid] .-
+                    product.bootstrap_lower[bootstrap_valid], 0.0),
+                max.(product.bootstrap_upper[bootstrap_valid] .-
+                    product.shape[bootstrap_valid], 0.0);
+                color = run_colors[label],
+                whiskerwidth = 8,
+                linewidth = 1.5,
+            )
+        end
+    end
+    Legend(
+        fig_hro[2, 1:2],
+        hro_gradient_axis;
+        orientation = :horizontal,
+        framevisible = false,
+        tellheight = true,
+        tellwidth = false,
+        nbanks = 1,
+    )
+    colgap!(fig_hro.layout, 28)
+    rowgap!(fig_hro.layout, 4)
     stable_pluto_figure(display_hro, fig_hro)
 end
 
@@ -4885,9 +5014,8 @@ begin
         cosine_gradient = abs.(
             projected_B1 .* gradient1 .+ projected_B2 .* gradient2,
         ) ./ max.(projected_field_norm .* gradient_norm, eps(Float64))
-        # 0°: B_perp follows a column-density structure;
-        # 90°: B_perp crosses it.
-        angles = asind.(clamp.(cosine_gradient[valid], 0.0, 1.0))
+        # 0° means that B_perp and ∇N_H are parallel; 90° means perpendicular.
+        angles = acosd.(clamp.(cosine_gradient[valid], 0.0, 1.0))
         summary = hro_binned_summary(
             log_column_density[valid],
             angles,
@@ -4908,7 +5036,7 @@ begin
     for label in comparison_run_labels, local_los in 1:3
         products = [
             cached_scientific_product((
-                :hro_2d_snapshot,
+                :hro_2d_ibanez_snapshot_v1,
                 cube_signature(path),
                 Float64(mean_molecular_weight),
                 local_los,
@@ -4961,11 +5089,11 @@ begin
             logarithmic_column = hro_2d_logarithmic_column,
         )
 
-    fig_hro_2d = Figure(size = (1450, 1350))
+    fig_hro_2d = Figure(size = (1050, 1650))
     hro_2d_hist_axis = latex_axis(
         fig_hro_2d[1, 1];
         xlabel =
-            L"\phi_{\mathbf{B}_\perp,\,\mathrm{structure}(N_{\mathrm H})}\;[{}^\circ]",
+            L"\phi_{\nabla N_{\mathrm H},\,B_\perp}\;[{}^\circ]",
         ylabel = L"\mathrm{PDF}(\phi)",
         title = L"\mathrm{Projected\ 2D\ HRO}",
     )
@@ -4998,61 +5126,12 @@ begin
         labelsize = 14,
     )
 
-    hro_2d_shape_axis = latex_axis(
-        fig_hro_2d[1, 2];
-        xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
-        ylabel = L"\xi_{\mathrm{HRO}}^{\mathrm{2D}}",
-        xscale = log10,
-        xticks = DECADE_TICKS,
-        xminorticks = IntervalsBetween(9),
-        xminorticksvisible = true,
-        title = L"\mathrm{Orientation\ shape\ parameter}",
-    )
-    hlines!(
-        hro_2d_shape_axis,
-        [0.0];
-        color = (:gray45, 0.65),
-        linestyle = :dash,
-    )
-    for label in comparison_run_labels
-        product = hro_2d_by_run[label]
-        valid =
-            isfinite.(product.density_centers) .& isfinite.(product.shape)
-        band!(
-            hro_2d_shape_axis,
-            10.0 .^ product.density_centers[valid],
-            product.lower[valid],
-            product.upper[valid];
-            color = (run_colors[label], 0.16),
-        )
-        lines!(
-            hro_2d_shape_axis,
-            10.0 .^ product.density_centers[valid],
-            product.shape[valid];
-            color = run_colors[label],
-            linewidth = 2.8,
-            label = ensemble_legend_label(label),
-        )
-        scatter!(
-            hro_2d_shape_axis,
-            10.0 .^ product.density_centers[valid],
-            product.shape[valid];
-            color = run_colors[label],
-            markersize = 6,
-        )
-    end
-    axislegend(
-        hro_2d_shape_axis;
-        position = :lb,
-        framevisible = false,
-        labelsize = 14,
-    )
     los_symbols = ("x", "y", "z")
     for local_los in 1:3
         xi_axis = latex_axis(
             fig_hro_2d[local_los + 1, 1];
             xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
-            ylabel = L"\xi_{\mathrm{HRO}}^{\mathrm{2D}}",
+            ylabel = L"\xi_{\nabla N_{\mathrm H}B_\perp}",
             xscale = log10,
             xticks = DECADE_TICKS,
             xminorticks = IntervalsBetween(9),
@@ -5060,21 +5139,14 @@ begin
             title = latexstring(
                 raw"\mathrm{Line\ of\ sight}\;", los_symbols[local_los]),
         )
-        count_axis = latex_axis(
-            fig_hro_2d[local_los + 1, 2];
-            xlabel = L"N_{\mathrm H}\;[\mathrm{cm}^{-2}]",
-            ylabel = L"N_{\mathrm{pixels}}",
-            xscale = log10,
-            yscale = log10,
-            xticks = DECADE_TICKS,
-            yticks = DECADE_TICKS,
-            xminorticks = IntervalsBetween(9),
-            yminorticks = IntervalsBetween(9),
-            xminorticksvisible = true,
-            yminorticksvisible = true,
+        los_hro_products = [
+            hro_2d_all_los[(label, local_los)]
+            for label in comparison_run_labels
+        ]
+        hro_xi_background!(
+            xi_axis,
+            hro_density_limits(los_hro_products),
         )
-        hlines!(xi_axis, [0.0]; color = (:gray45, 0.65),
-            linestyle = :dash)
         for label in comparison_run_labels
             product = hro_2d_all_los[(label, local_los)]
             valid = isfinite.(product.density_centers) .&
@@ -5095,25 +5167,21 @@ begin
                 max.(product.bootstrap_upper[bootstrap_valid] .-
                     product.shape[bootstrap_valid], 0.0);
                 color = run_colors[label], whiskerwidth = 6)
-            count_valid = isfinite.(product.density_centers) .&
-                isfinite.(product.counts) .& (product.counts .> 0)
-            count_x = 10.0 .^ product.density_centers[count_valid]
-            band!(count_axis, count_x,
-                max.(product.count_lower[count_valid], 1.0),
-                max.(product.count_upper[count_valid], 1.0);
-                color = (run_colors[label], 0.16))
-            lines!(count_axis, count_x, product.counts[count_valid];
-                color = run_colors[label], linewidth = 2.5)
         end
-        los_count_values = vcat([
-            Float64.(filter(value -> isfinite(value) && value > 0,
-                hro_2d_all_los[(label, local_los)].counts))
-            for label in comparison_run_labels
-        ]...)
-        los_count_limits = enclosing_decade_limits(los_count_values)
-        isnothing(los_count_limits) ||
-            ylims!(count_axis, los_count_limits...)
     end
+    Legend(
+        fig_hro_2d[5, 1],
+        [
+            LineElement(color = run_colors[label], linewidth = 3)
+            for label in comparison_run_labels
+        ],
+        [ensemble_legend_label(label) for label in comparison_run_labels];
+        orientation = :horizontal,
+        framevisible = false,
+        tellwidth = false,
+        nbanks = 1,
+    )
+    rowgap!(fig_hro_2d.layout, 8)
     stable_pluto_figure(display_hro_2d, fig_hro_2d)
 end
 
@@ -5443,6 +5511,7 @@ The first map shows the line-of-sight mean of the vorticity magnitude, $\langle|
 in $\mathrm{Myr}^{-2}$. Both maps use the active run, snapshot, and line of sight.
 
 **Display vorticity and enstrophy maps:** $(@bind display_vorticity_figure PlutoUI.CheckBox(default = true))  
+**Display vorticity versus snapshot time:** $(@bind display_vorticity_time PlutoUI.CheckBox(default = false))
 **Display density-binned enstrophy diagnostics:** $(@bind display_enstrophy_density PlutoUI.CheckBox(default = true))
 
 | Vorticity and enstrophy diagnostic | Display |
@@ -5584,6 +5653,138 @@ begin
         end
     end
     display_vorticity_figure ? fig_vorticity : nothing
+end
+
+# ╔═╡ e610c7a2-9031-4a1d-9299-9cbb2fd44125
+begin
+    function snapshot_vorticity_metrics(local_cube)
+        magnitude = vorticity(local_cube).magnitude
+        sum_magnitude = 0.0
+        sum_square = 0.0
+        count_valid = 0
+        @inbounds for value in magnitude
+            numeric_value = Float64(value)
+            isfinite(numeric_value) || continue
+            sum_magnitude += numeric_value
+            sum_square += numeric_value^2
+            count_valid += 1
+        end
+        (
+            t = Float64(local_cube.t),
+            mean = count_valid > 0 ? sum_magnitude / count_valid : NaN,
+            rms = count_valid > 0 ? sqrt(sum_square / count_valid) : NaN,
+        )
+    end
+
+    vorticity_time_by_run = display_vorticity_time ? Dict(
+        label => sort([
+            cached_scientific_product((
+                :vorticity_time_metrics_v1,
+                cube_signature(path),
+                Float64(time_unit_Myr),
+            )) do
+                local_cube = path ==
+                    run_files[label][comparison_snapshot_indices[label]] ?
+                    comparison_cube(label) : load_cube(path)
+                snapshot_vorticity_metrics(local_cube)
+            end
+            for path in comparison_snapshot_paths[label]
+        ]; by = point -> point.t)
+        for label in comparison_run_labels
+    ) : Dict{String, Any}()
+
+    if !display_vorticity_time
+        fig_vorticity_time = Figure(size = (900, 180))
+        Label(
+            fig_vorticity_time[1, 1],
+            L"\mathrm{Enable\ vorticity\ versus\ time\ to\ compute\ the\ snapshot\ series.}";
+            fontsize = 20,
+        )
+    else
+        fig_vorticity_time = Figure(size = (900, 590))
+        vorticity_time_axis = latex_axis(
+            fig_vorticity_time[1, 1];
+            xlabel = L"t\;[\mathrm{Myr}]",
+            ylabel =
+                L"\langle|\omega|\rangle,\ \omega_{\mathrm{rms}}\;[\mathrm{Myr}^{-1}]",
+            title = L"\mathrm{Vorticity\ evolution}",
+            xminorticks = IntervalsBetween(5),
+            yminorticks = IntervalsBetween(5),
+            xminorticksvisible = true,
+            yminorticksvisible = true,
+        )
+        for label in comparison_run_labels
+            series = vorticity_time_by_run[label]
+            times = getfield.(series, :t)
+            mean_vorticity = getfield.(series, :mean)
+            rms_vorticity = getfield.(series, :rms)
+            valid_mean = isfinite.(times) .& isfinite.(mean_vorticity)
+            valid_rms = isfinite.(times) .& isfinite.(rms_vorticity)
+            lines!(
+                vorticity_time_axis,
+                times[valid_mean],
+                mean_vorticity[valid_mean];
+                color = run_colors[label],
+                linewidth = 2.6,
+            )
+            scatter!(
+                vorticity_time_axis,
+                times[valid_mean],
+                mean_vorticity[valid_mean];
+                color = run_colors[label],
+                markersize = 7,
+            )
+            lines!(
+                vorticity_time_axis,
+                times[valid_rms],
+                rms_vorticity[valid_rms];
+                color = run_colors[label],
+                linewidth = 2.3,
+                linestyle = :dash,
+            )
+            scatter!(
+                vorticity_time_axis,
+                times[valid_rms],
+                rms_vorticity[valid_rms];
+                color = run_colors[label],
+                marker = :rect,
+                markersize = 6,
+            )
+        end
+        vorticity_time_legend = GridLayout(fig_vorticity_time[2, 1])
+        Legend(
+            vorticity_time_legend[1, 1],
+            [
+                LineElement(color = run_colors[label], linewidth = 2.6)
+                for label in comparison_run_labels
+            ],
+            legend_run_label.(comparison_run_labels),
+            L"\mathrm{Simulation}";
+            orientation = :horizontal,
+            tellheight = true,
+            framevisible = false,
+            labelsize = 14,
+        )
+        Legend(
+            vorticity_time_legend[2, 1],
+            [
+                LineElement(color = :gray20, linewidth = 2.6),
+                LineElement(
+                    color = :gray20,
+                    linewidth = 2.3,
+                    linestyle = :dash,
+                ),
+            ],
+            LaTeXString[L"\langle|\omega|\rangle",
+                L"\omega_{\mathrm{rms}}"],
+            L"\mathrm{Statistic}";
+            orientation = :horizontal,
+            tellheight = true,
+            framevisible = false,
+            labelsize = 14,
+        )
+    end
+    stable_pluto_figure(display_vorticity_time, fig_vorticity_time)
 end
 
 # ╔═╡ b02ceda6-0a0d-4543-91f8-a6669231ec72
@@ -10206,6 +10407,7 @@ begin
         "energy_ratios" => "Energy ratios by density",
         "energy_time" => "Energy ratios versus time",
         "vorticity" => "Vorticity map",
+        "vorticity_time" => "Mean and RMS vorticity versus snapshot time",
         "enstrophy_density" => "Enstrophy by density and family parameter",
         "power_spectra" => "Power spectra",
         "density_spectra_time" => "Number-density power spectra through time",
@@ -10259,6 +10461,7 @@ begin
         "energy_ratios" => fig_energy,
         "energy_time" => fig_energy_time,
         "vorticity" => fig_vorticity,
+        "vorticity_time" => fig_vorticity_time,
         "enstrophy_density" => fig_enstrophy_density,
         "power_spectra" => fig_spectra,
         "density_spectra_time" => fig_density_spectra_time,
@@ -12414,6 +12617,7 @@ version = "4.1.0+0"
 # ╟─d87379b7-3527-45a8-bc60-bec191c499af
 # ╟─3190e127-1d53-49f1-bfab-b9645910c2c6
 # ╟─df880704-b12e-49eb-84f2-67b6f9583a8a
+# ╟─e610c7a2-9031-4a1d-9299-9cbb2fd44125
 # ╟─b02ceda6-0a0d-4543-91f8-a6669231ec72
 # ╟─873f7ef2-719b-4ae6-b015-1a23c6c27836
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b

@@ -2949,26 +2949,39 @@ begin
             density_bin_count;
             angle_bin_count = 18,
             bootstrap_replicates = 200,
+            requested_density_edges = nothing,
         )
         function orientation_parameter_with_bootstrap(local_angles, seed)
-            signs = Float64[
-                angle < 22.5 ? 1.0 : angle > 67.5 ? -1.0 : NaN
-                for angle in local_angles
-            ]
-            filter!(isfinite, signs)
-            isempty(signs) && return (NaN, NaN, NaN)
-            xi = mean(signs)
+            cosines = abs.(cosd.(Float64.(local_angles)))
+            filter!(isfinite, cosines)
+            isempty(cosines) && return (NaN, NaN, NaN)
+            orientation_parameter(values) = begin
+                parallel = count(>=(0.75), values)
+                perpendicular = count(<=(0.25), values)
+                denominator = parallel + perpendicular
+                denominator > 0 ?
+                    (parallel - perpendicular) / denominator : NaN
+            end
+            xi = orientation_parameter(cosines)
+            isfinite(xi) || return (NaN, NaN, NaN)
             bootstrap_replicates <= 0 && return (xi, NaN, NaN)
-            if length(signs) > 4000
-                indices = round.(Int, range(1, length(signs); length = 4000))
-                signs = signs[indices]
+            if length(cosines) > 4000
+                indices = round.(Int, range(1, length(cosines); length = 4000))
+                cosines = cosines[indices]
             end
             rng = MersenneTwister(seed)
             estimates = Vector{Float64}(undef, bootstrap_replicates)
             for replicate in eachindex(estimates)
-                estimates[replicate] =
-                    mean(signs[rand(rng, 1:length(signs), length(signs))])
+                estimates[replicate] = orientation_parameter(
+                    cosines[rand(
+                        rng,
+                        1:length(cosines),
+                        length(cosines),
+                    )],
+                )
             end
+            filter!(isfinite, estimates)
+            isempty(estimates) && return (xi, NaN, NaN)
             lower, upper = quantile(estimates, (0.16, 0.84))
             (xi, lower, upper)
         end
@@ -2988,15 +3001,22 @@ begin
                 counts = zeros(Int, density_bin_count),
             )
         end
-        probability_edges = collect(range(0.0, 1.0; length = density_bin_count + 1))
-        density_edges = unique(quantile(densities, probability_edges))
+        density_edges = if isnothing(requested_density_edges)
+            probability_edges =
+                collect(range(0.0, 1.0; length = density_bin_count + 1))
+            unique(quantile(densities, probability_edges))
+        else
+            Float64.(collect(requested_density_edges))
+        end
         length(density_edges) >= 2 || (density_edges = [minimum(densities), maximum(densities) + eps()])
         bin_count = length(density_edges) - 1
         histograms = zeros(Float64, length(angle_centers), bin_count)
         shape = fill(NaN, bin_count)
         bootstrap_lower = fill(NaN, bin_count)
         bootstrap_upper = fill(NaN, bin_count)
-        density_centers = fill(NaN, bin_count)
+        density_centers = isnothing(requested_density_edges) ?
+            fill(NaN, bin_count) :
+            (density_edges[1:end-1] .+ density_edges[2:end]) ./ 2
         counts = zeros(Int, bin_count)
         for bin in 1:bin_count
             members = (densities .>= density_edges[bin]) .&
@@ -3005,7 +3025,8 @@ begin
             local_angles = angles[members]
             counts[bin] = length(local_angles)
             isempty(local_angles) && continue
-            density_centers[bin] = median(densities[members])
+            isnothing(requested_density_edges) &&
+                (density_centers[bin] = median(densities[members]))
             histogram = fit(Histogram, local_angles, angle_edges).weights
             histograms[:, bin] .= histogram ./ max(sum(histogram), 1)
             shape[bin], bootstrap_lower[bin], bootstrap_upper[bin] =
@@ -3072,6 +3093,30 @@ begin
         exponent = floor(Int, log10(abs(numeric_value)))
         mantissa = numeric_value / 10.0^exponent
         string(@sprintf("%.3g", mantissa), raw"\times10^{", exponent, "}")
+    end
+
+    const HRO_PARALLEL_BACKGROUND = RGBf(0.78, 0.88, 0.94)
+    const HRO_PERPENDICULAR_BACKGROUND = RGBf(0.98, 0.75, 0.62)
+
+    function hro_xi_background!(axis, limits)
+        xmin, xmax = limits
+        band!(axis, [xmin, xmax], [0.0, 0.0], [1.0, 1.0];
+            color = HRO_PARALLEL_BACKGROUND)
+        band!(axis, [xmin, xmax], [-1.0, -1.0], [0.0, 0.0];
+            color = HRO_PERPENDICULAR_BACKGROUND)
+        hlines!(axis, [0.0]; color = :black, linewidth = 1.8)
+        xlims!(axis, xmin, xmax)
+        ylims!(axis, -1.0, 1.0)
+        axis
+    end
+
+    function hro_density_limits(products)
+        values = vcat([
+            10.0 .^ Float64.(filter(isfinite, product.density_centers))
+            for product in products
+        ]...)
+        limits = enclosing_decade_limits(values)
+        isnothing(limits) ? (0.1, 100.0) : limits
     end
 end
 

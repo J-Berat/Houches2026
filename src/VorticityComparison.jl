@@ -27,13 +27,66 @@ function snapshot_directory(simulation_directory)
     isdir(direct) ? direct : simulation_directory
 end
 
+function ramses_output_directories(simulation_directory)
+    isdir(simulation_directory) || return String[]
+    outputs = filter(readdir(simulation_directory; join = true, sort = true)) do path
+        isdir(path) || return false
+        matched = match(r"^output_(\d+)$", basename(path))
+        !isnothing(matched) &&
+            isfile(joinpath(path, "info_$(matched.captures[1]).txt"))
+    end
+    sort!(outputs; by = path -> snapshot_number(path))
+end
+
+function safe_cache_name(path)
+    name = lowercase(basename(normpath(path)))
+    cleaned = replace(name, r"[^a-z0-9]+" => "_")
+    stripped = strip(cleaned, '_')
+    isempty(stripped) ? "ramses_simulation" : stripped
+end
+
+function inferred_cache_resolution(simulation_directory)
+    name = basename(normpath(simulation_directory))
+    explicit = match(r"(?:^|_)[Nn](\d{2,4})(?=$|_)", name)
+    !isnothing(explicit) && return parse(Int, explicit.captures[1])
+    resolutions = Int[]
+    for matched in eachmatch(
+            r"(?:^|_)(\d{2,4})(?=$|_)",
+            name,
+        )
+        push!(resolutions, parse(Int, matched.captures[1]))
+    end
+    isempty(resolutions) ? 256 : last(resolutions)
+end
+
+function hdf5_contains_velocity_cube(path)
+    try
+        h5open(path, "r") do handle
+            paths = collect_dataset_paths!(String[], handle)
+            all((
+                !isnothing(dataset_path(paths,
+                    ["vx", "velx", "velocityx", "xvelocity", "velocity/x"];
+                    required = false)),
+                !isnothing(dataset_path(paths,
+                    ["vy", "vely", "velocityy", "yvelocity", "velocity/y"];
+                    required = false)),
+                !isnothing(dataset_path(paths,
+                    ["vz", "velz", "velocityz", "zvelocity", "velocity/z"];
+                    required = false)),
+            ))
+        end
+    catch
+        false
+    end
+end
+
 """
 Return the HDF5 snapshots of one simulation.
 
 If a `DataCubes/` directory exists it is used directly, which prevents power
 spectrum HDF5 files from being mistaken for physical cubes.
 """
-function discover_hdf5_snapshots(simulation_directory)
+function discover_hdf5_snapshots(simulation_directory; required = true)
     root = snapshot_directory(abspath(expanduser(simulation_directory)))
     isdir(root) || error("Simulation directory not found: $(root)")
     files = String[]
@@ -46,12 +99,86 @@ function discover_hdf5_snapshots(simulation_directory)
             push!(files, joinpath(directory, name))
         end
     end
+    filter!(hdf5_contains_velocity_cube, files)
     sort!(files; by = path -> (snapshot_number(path), path))
-    isempty(files) && error(
+    required && isempty(files) && error(
         "No HDF5 cube was found in $(root). Convert raw RAMSES outputs first " *
         "with tools/ramses_to_hdf5.py.",
     )
     files
+end
+
+"""
+Resolve native HDF5 cubes or the standard persistent RAMSES conversion cache.
+
+Raw `output_XXXXX` directories are converted with the same yt helper and cache
+layout as `run_figures.jl`. The converter validates fingerprints and reuses
+current cache files instead of rebuilding them.
+"""
+function resolved_snapshot_files(
+        simulation_directory;
+        maximum_snapshots = nothing,
+        cache_resolution = nothing,
+        ramses_cache_root = joinpath(
+            PROJECT_DIRECTORY,
+            ".dynamo_cache",
+            "ramses_cubes",
+        ),
+    )
+    simulation = abspath(expanduser(simulation_directory))
+    native = discover_hdf5_snapshots(simulation; required = false)
+    !isempty(native) && return evenly_selected(native, maximum_snapshots)
+
+    raw_outputs = ramses_output_directories(simulation)
+    isempty(raw_outputs) && error(
+        "No HDF5 cube or readable RAMSES output_XXXXX was found in " *
+        "$(simulation).",
+    )
+    selected_outputs = evenly_selected(raw_outputs, maximum_snapshots)
+    resolution = isnothing(cache_resolution) ?
+        inferred_cache_resolution(simulation) : Int(cache_resolution)
+    resolution > 0 || error("cache_resolution must be positive.")
+    cache_directory = joinpath(
+        abspath(expanduser(ramses_cache_root)),
+        safe_cache_name(simulation),
+        "DataCubes",
+    )
+    mkpath(cache_directory)
+    converter = joinpath(PROJECT_DIRECTORY, "tools", "ramses_to_hdf5.py")
+    isfile(converter) || error("RAMSES converter not found: $(converter)")
+    python = get(ENV, "DYNAMO_PYTHON", "python3")
+    selected_names = basename.(selected_outputs)
+
+    println("  Raw RAMSES outputs : ", length(raw_outputs))
+    println("  Selected snapshots : ", length(selected_outputs))
+    println("  Uniform cache grid : ", resolution, "^3")
+    println("  HDF5 cache         : ", cache_directory)
+    command = `$(python) $(converter) --simulation $(simulation) --output-directory $(cache_directory) --resolution $(resolution) --outputs $(join(selected_names, ","))`
+    try
+        run(command)
+    catch error_value
+        error(
+            "RAMSES cache preparation failed. Install the converter " *
+            "dependencies with `$(python) -m pip install --user -r " *
+            "requirements-ramses.txt`, or set DYNAMO_PYTHON. Original " *
+            "error: " * sprint(showerror, error_value),
+        )
+    end
+
+    selected_numbers = [
+        match(r"^output_(\d+)$", name).captures[1]
+        for name in selected_names
+    ]
+    cached_paths = [
+        joinpath(cache_directory, "info_$(number).h5")
+        for number in selected_numbers
+    ]
+    missing = filter(!isfile, cached_paths)
+    isempty(missing) || error(
+        "RAMSES conversion finished but cache files are missing: " *
+        join(missing, ", "),
+    )
+    cached_paths
 end
 
 function collect_dataset_paths!(paths, group, prefix = "")
@@ -236,12 +363,20 @@ function vorticity_time_series(
         box_length_pc = (100.0, 100.0, 100.0),
         velocity_unit_kms = 1.0,
         time_unit_myr = 1.0,
+        cache_resolution = nothing,
+        ramses_cache_root = joinpath(
+            PROJECT_DIRECTORY,
+            ".dynamo_cache",
+            "ramses_cubes",
+        ),
         label = basename(normpath(simulation_directory)),
         cache = load_cache(),
     )
-    paths = evenly_selected(
-        discover_hdf5_snapshots(simulation_directory),
+    paths = resolved_snapshot_files(
+        simulation_directory;
         maximum_snapshots,
+        cache_resolution,
+        ramses_cache_root,
     )
     points = NamedTuple[]
     total = length(paths)
@@ -306,6 +441,13 @@ function plot_vorticity_time_comparison(;
         box_length_pc = (100.0, 100.0, 100.0),
         velocity_unit_kms = 1.0,
         time_unit_myr = 1.0,
+        isothermal_cache_resolution = nothing,
+        cooling_cache_resolution = nothing,
+        ramses_cache_root = joinpath(
+            PROJECT_DIRECTORY,
+            ".dynamo_cache",
+            "ramses_cubes",
+        ),
     )
     reduction_cache = load_cache()
     specifications = [
@@ -334,6 +476,9 @@ function plot_vorticity_time_comparison(;
             box_length_pc,
             velocity_unit_kms,
             time_unit_myr,
+            cache_resolution = specification.label == "Isothermal" ?
+                isothermal_cache_resolution : cooling_cache_resolution,
+            ramses_cache_root,
             label = specification.label,
             cache = reduction_cache,
         )

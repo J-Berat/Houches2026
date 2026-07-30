@@ -128,7 +128,12 @@ julia --threads=auto --startup-file=no --project=. \
 La fonction réutilisable est
 `plot_vorticity_time_comparison` dans `src/VorticityComparison.jl`. Les cubes
 ont une taille physique par défaut de 100 pc et les réductions scalaires sont
-mises en cache dans `.dynamo_cache/`.
+mises en cache dans `.dynamo_cache/`. Si une simulation contient directement
+des sorties RAMSES `output_XXXXX`, le script utilise automatiquement le cache
+standard `.dynamo_cache/ramses_cubes/<simulation>/DataCubes`. Les caches
+valides sont réutilisés et seuls les fichiers manquants ou périmés sont
+convertis avec yt. La résolution est déduite du nom de la simulation (`N128`,
+`N256`, etc.).
 
 `run_figures.jl` launches the three comparison folders below:
 

@@ -448,6 +448,14 @@ function print_snapshot_inventory(comparisons, comparison_repository)
 end
 
 function inferred_ramses_resolution(simulation_paths)
+    for path in reverse(simulation_paths)
+        explicit = match(
+            r"(?:^|_)[Nn](\d{2,4})(?=$|_)",
+            basename(normpath(path)),
+        )
+        isnothing(explicit) ||
+            return parse(Int, explicit.captures[1])
+    end
     resolutions = Int[]
     for path in simulation_paths
         for matched in eachmatch(r"(?:^|_)(\d{2,4})(?=$|_)", basename(normpath(path)))

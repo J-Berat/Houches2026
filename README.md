@@ -99,9 +99,16 @@ Les extensions reconnues sont `.h5`, `.hdf5`, `.fits`, `.fit` et `.fts`.
 
 ### Comparaison directe de la vorticité : cooling / isotherme
 
-Le script autonome suivant ne charge aucun notebook et superpose
-`⟨|ω|⟩` (trait plein) et `ω_rms` (tirets) pour les simulations cooling et
-isotherme :
+Le script autonome suivant ne charge aucun notebook et crée trois panneaux
+temporels pour les simulations cooling et isotherme :
+
+1. `⟨|ω|⟩` (trait plein) et `ω_rms` (tirets) ;
+2. la dispersion turbulente massique `v_rms` ;
+3. `⟨|ω|⟩/v_rms` et `ω_rms/v_rms`, avec `v_rms` convertie en pc/Myr afin
+   d'obtenir une échelle inverse en pc⁻¹.
+
+Les trois panneaux utilisent par défaut les **10 premiers snapshots** de
+chaque simulation.
 
 ```bash
 julia --threads=auto --startup-file=no --project=. \
@@ -117,7 +124,7 @@ Ses chemins par défaut sont :
 
 La figure est écrite dans
 `figures/cooling_isothermal_vorticity_time.png`. Pour remplacer les chemins,
-la destination et limiter le calcul à 12 snapshots uniformément répartis :
+la destination et utiliser les 12 premiers snapshots :
 
 ```bash
 julia --threads=auto --startup-file=no --project=. \

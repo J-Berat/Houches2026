@@ -12,7 +12,8 @@ const SNAPSHOT_EXTENSIONS = Set([".h5", ".hdf5"])
 const PC_CM = 3.0856775814913673e18
 const KM_CM = 1.0e5
 const MYR_S = 3.15576e13
-const CACHE_VERSION = 1
+const KM_S_TO_PC_MYR = KM_CM * MYR_S / PC_CM
+const CACHE_VERSION = 2
 
 normalize_field_name(value) =
     lowercase(replace(String(value), r"[^a-zA-Z0-9]" => ""))
@@ -117,7 +118,7 @@ current cache files instead of rebuilding them.
 """
 function resolved_snapshot_files(
         simulation_directory;
-        maximum_snapshots = nothing,
+        maximum_snapshots = 10,
         cache_resolution = nothing,
         ramses_cache_root = joinpath(
             PROJECT_DIRECTORY,
@@ -127,14 +128,14 @@ function resolved_snapshot_files(
     )
     simulation = abspath(expanduser(simulation_directory))
     native = discover_hdf5_snapshots(simulation; required = false)
-    !isempty(native) && return evenly_selected(native, maximum_snapshots)
+    !isempty(native) && return first_selected(native, maximum_snapshots)
 
     raw_outputs = ramses_output_directories(simulation)
     isempty(raw_outputs) && error(
         "No HDF5 cube or readable RAMSES output_XXXXX was found in " *
         "$(simulation).",
     )
-    selected_outputs = evenly_selected(raw_outputs, maximum_snapshots)
+    selected_outputs = first_selected(raw_outputs, maximum_snapshots)
     resolution = isnothing(cache_resolution) ?
         inferred_cache_resolution(simulation) : Int(cache_resolution)
     resolution > 0 || error("cache_resolution must be positive.")
@@ -216,9 +217,11 @@ function dataset_path(paths, aliases; required = true)
     nothing
 end
 
-function read_velocity_and_time(path; velocity_unit_kms = 1.0)
+function read_cube_fields(path; velocity_unit_kms = 1.0)
     h5open(path, "r") do handle
         paths = collect_dataset_paths!(String[], handle)
+        rho_path = dataset_path(paths,
+            ["rho", "density", "massdensity"])
         vx_path = dataset_path(paths,
             ["vx", "velx", "velocityx", "xvelocity", "velocity/x"])
         vy_path = dataset_path(paths,
@@ -227,11 +230,12 @@ function read_velocity_and_time(path; velocity_unit_kms = 1.0)
             ["vz", "velz", "velocityz", "zvelocity", "velocity/z"])
         time_path = dataset_path(paths,
             ["t", "time", "simulationtime", "myrtime"]; required = false)
+        rho = Float64.(read(handle[rho_path]))
         vx = Float64.(read(handle[vx_path])) .* velocity_unit_kms
         vy = Float64.(read(handle[vy_path])) .* velocity_unit_kms
         vz = Float64.(read(handle[vz_path])) .* velocity_unit_kms
-        size(vx) == size(vy) == size(vz) || error(
-            "Velocity components have inconsistent shapes in $(path).",
+        size(rho) == size(vx) == size(vy) == size(vz) || error(
+            "Density and velocity fields have inconsistent shapes in $(path).",
         )
         ndims(vx) == 3 || error(
             "Velocity fields must be three-dimensional in $(path).",
@@ -242,8 +246,50 @@ function read_velocity_and_time(path; velocity_unit_kms = 1.0)
             raw_time = read(handle[time_path])
             Float64(raw_time isa Number ? raw_time : first(raw_time))
         end
-        vx, vy, vz, stored_time
+        rho, vx, vy, vz, stored_time
     end
+end
+
+"""
+Return the density-weighted three-dimensional turbulent velocity dispersion.
+
+The mean velocity is subtracted component by component before accumulating
+`v_rms = sqrt(Σρ|v-⟨v⟩ρ|² / Σρ)`, matching the main diagnostics notebook.
+"""
+function velocity_dispersion(rho, vx, vy, vz)
+    mass = 0.0
+    sx = 0.0
+    sy = 0.0
+    sz = 0.0
+    @inbounds for index in eachindex(rho)
+        weight = Float64(rho[index])
+        x = Float64(vx[index])
+        y = Float64(vy[index])
+        z = Float64(vz[index])
+        (isfinite(weight) && weight > 0 &&
+            isfinite(x) && isfinite(y) && isfinite(z)) || continue
+        mass += weight
+        sx += weight * x
+        sy += weight * y
+        sz += weight * z
+    end
+    mass > 0 || return NaN
+    mean_x, mean_y, mean_z = sx / mass, sy / mass, sz / mass
+    weighted_square = 0.0
+    valid_mass = 0.0
+    @inbounds for index in eachindex(rho)
+        weight = Float64(rho[index])
+        x = Float64(vx[index])
+        y = Float64(vy[index])
+        z = Float64(vz[index])
+        (isfinite(weight) && weight > 0 &&
+            isfinite(x) && isfinite(y) && isfinite(z)) || continue
+        weighted_square += weight * (
+            (x - mean_x)^2 + (y - mean_y)^2 + (z - mean_z)^2
+        )
+        valid_mass += weight
+    end
+    valid_mass > 0 ? sqrt(weighted_square / valid_mass) : NaN
 end
 
 """
@@ -313,11 +359,11 @@ function vorticity_metrics(
     )
 end
 
-function evenly_selected(paths, maximum_snapshots)
+function first_selected(paths, maximum_snapshots)
     isnothing(maximum_snapshots) && return paths
     count = min(Int(maximum_snapshots), length(paths))
     count > 0 || error("maximum_snapshots must be positive.")
-    paths[unique(round.(Int, range(1, length(paths); length = count)))]
+    paths[1:count]
 end
 
 function cache_path()
@@ -354,12 +400,13 @@ end
 """
 Compute the vorticity time series for one simulation directory.
 
-All discovered snapshots are used unless `maximum_snapshots` is provided, in
-which case that many snapshots are distributed evenly over the full run.
+The first ten snapshots are used by default. `maximum_snapshots` changes that
+count while preserving selection from the beginning of each run. Passing
+`nothing` explicitly uses every available snapshot.
 """
 function vorticity_time_series(
         simulation_directory;
-        maximum_snapshots = nothing,
+        maximum_snapshots = 10,
         box_length_pc = (100.0, 100.0, 100.0),
         velocity_unit_kms = 1.0,
         time_unit_myr = 1.0,
@@ -403,15 +450,27 @@ function vorticity_time_series(
         flush(stdout)
         point = get(cache, key, nothing)
         if isnothing(point)
-            vx, vy, vz, stored_time = read_velocity_and_time(
+            rho, vx, vy, vz, stored_time = read_cube_fields(
                 path;
                 velocity_unit_kms,
             )
             metrics = vorticity_metrics(vx, vy, vz; box_length_pc)
+            vrms = velocity_dispersion(rho, vx, vy, vz)
             fallback_time = snapshot_number(path)
             time = isfinite(stored_time) ?
                 stored_time * time_unit_myr : Float64(fallback_time)
-            point = (; t = time, metrics.mean, metrics.rms, path)
+            vrms_pc_myr = vrms * KM_S_TO_PC_MYR
+            point = (
+                t = time,
+                metrics.mean,
+                metrics.rms,
+                vrms,
+                mean_over_vrms = vrms_pc_myr > 0 ?
+                    metrics.mean / vrms_pc_myr : NaN,
+                rms_over_vrms = vrms_pc_myr > 0 ?
+                    metrics.rms / vrms_pc_myr : NaN,
+                path,
+            )
             cache[key] = point
         end
         push!(points, point)
@@ -422,10 +481,11 @@ function vorticity_time_series(
 end
 
 """
-Plot cooling and isothermal vorticity evolution on the same axis.
+Plot cooling and isothermal turbulence evolution on three stacked axes.
 
-Solid lines show `⟨|ω|⟩`; dashed lines show `ω_rms`. The function saves the
-figure and returns `(figure, output_path, series)`.
+The panels show vorticity, density-weighted `v_rms`, and vorticity divided by
+`v_rms`. Solid lines show mean vorticity and dashed lines show RMS vorticity.
+The function saves the figure and returns `(figure, output_path, series)`.
 """
 function plot_vorticity_time_comparison(;
         isothermal_path =
@@ -437,7 +497,7 @@ function plot_vorticity_time_comparison(;
             "figures",
             "cooling_isothermal_vorticity_time.png",
         ),
-        maximum_snapshots = nothing,
+        maximum_snapshots = 10,
         box_length_pc = (100.0, 100.0, 100.0),
         velocity_unit_kms = 1.0,
         time_unit_myr = 1.0,
@@ -485,13 +545,12 @@ function plot_vorticity_time_comparison(;
     end
     cache_file = save_cache(reduction_cache)
 
-    figure = Figure(size = (980, 650))
-    axis = Axis(
+    figure = Figure(size = (1000, 1250))
+    vorticity_axis = Axis(
         figure[1, 1];
-        xlabel = L"t\;[\mathrm{Myr}]",
         ylabel =
             L"\langle|\omega|\rangle,\ \omega_{\mathrm{rms}}\;[\mathrm{Myr}^{-1}]",
-        title = L"\mathrm{Cooling\ versus\ isothermal\ vorticity}",
+        title = L"\mathrm{Cooling\ versus\ isothermal\ turbulence}",
         xminorticks = IntervalsBetween(5),
         yminorticks = IntervalsBetween(5),
         xminorticksvisible = true,
@@ -501,23 +560,69 @@ function plot_vorticity_time_comparison(;
         topspinevisible = true,
         rightspinevisible = true,
     )
+    velocity_axis = Axis(
+        figure[2, 1];
+        ylabel = L"v_{\mathrm{rms}}\;[\mathrm{km\,s}^{-1}]",
+        xminorticks = IntervalsBetween(5),
+        yminorticks = IntervalsBetween(5),
+        xminorticksvisible = true,
+        yminorticksvisible = true,
+        xgridvisible = false,
+        ygridvisible = false,
+        topspinevisible = true,
+        rightspinevisible = true,
+    )
+    normalized_axis = Axis(
+        figure[3, 1];
+        xlabel = L"t\;[\mathrm{Myr}]",
+        ylabel =
+            L"\langle|\omega|\rangle/v_{\mathrm{rms}},\ \omega_{\mathrm{rms}}/v_{\mathrm{rms}}\;[\mathrm{pc}^{-1}]",
+        xminorticks = IntervalsBetween(5),
+        yminorticks = IntervalsBetween(5),
+        xminorticksvisible = true,
+        yminorticksvisible = true,
+        xgridvisible = false,
+        ygridvisible = false,
+        topspinevisible = true,
+        rightspinevisible = true,
+    )
+    linkxaxes!(vorticity_axis, velocity_axis, normalized_axis)
+    hidexdecorations!(vorticity_axis; grid = false)
+    hidexdecorations!(velocity_axis; grid = false)
+
     for specification in specifications
         points = series[specification.label]
         times = getfield.(points, :t)
         means = getfield.(points, :mean)
         rms = getfield.(points, :rms)
-        lines!(axis, times, means;
+        vrms = getfield.(points, :vrms)
+        mean_over_vrms = getfield.(points, :mean_over_vrms)
+        rms_over_vrms = getfield.(points, :rms_over_vrms)
+        lines!(vorticity_axis, times, means;
             color = specification.color, linewidth = 2.8)
-        scatter!(axis, times, means;
+        scatter!(vorticity_axis, times, means;
             color = specification.color, markersize = 7)
-        lines!(axis, times, rms;
+        lines!(vorticity_axis, times, rms;
             color = specification.color, linewidth = 2.5,
             linestyle = :dash)
-        scatter!(axis, times, rms;
+        scatter!(vorticity_axis, times, rms;
+            color = specification.color, marker = :rect, markersize = 6)
+        lines!(velocity_axis, times, vrms;
+            color = specification.color, linewidth = 2.8)
+        scatter!(velocity_axis, times, vrms;
+            color = specification.color, markersize = 7)
+        lines!(normalized_axis, times, mean_over_vrms;
+            color = specification.color, linewidth = 2.8)
+        scatter!(normalized_axis, times, mean_over_vrms;
+            color = specification.color, markersize = 7)
+        lines!(normalized_axis, times, rms_over_vrms;
+            color = specification.color, linewidth = 2.5,
+            linestyle = :dash)
+        scatter!(normalized_axis, times, rms_over_vrms;
             color = specification.color, marker = :rect, markersize = 6)
     end
     Legend(
-        figure[2, 1],
+        figure[4, 1],
         [
             LineElement(color = specification.color, linewidth = 2.8)
             for specification in specifications
@@ -530,7 +635,7 @@ function plot_vorticity_time_comparison(;
         tellwidth = false,
     )
     Legend(
-        figure[3, 1],
+        figure[5, 1],
         [
             LineElement(color = :gray20, linewidth = 2.8),
             LineElement(
@@ -545,7 +650,10 @@ function plot_vorticity_time_comparison(;
         framevisible = false,
         tellwidth = false,
     )
-    rowgap!(figure.layout, 5)
+    rowsize!(figure.layout, 1, Relative(0.32))
+    rowsize!(figure.layout, 2, Relative(0.27))
+    rowsize!(figure.layout, 3, Relative(0.32))
+    rowgap!(figure.layout, 6)
 
     destination = abspath(expanduser(output_path))
     mkpath(dirname(destination))

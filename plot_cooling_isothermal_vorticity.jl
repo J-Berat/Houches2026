@@ -18,7 +18,7 @@ function main(arguments = ARGS)
             "cooling_isothermal_vorticity_time.png",
         )
     maximum_snapshots = length(arguments) >= 4 ?
-        parse(Int, arguments[4]) : nothing
+        parse(Int, arguments[4]) : 10
 
     plot_vorticity_time_comparison(;
         isothermal_path,

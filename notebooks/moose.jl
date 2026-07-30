@@ -2817,15 +2817,19 @@ begin
         isempty(values) &&
             return (centers, fill(NaN, length(centers)))
         h = fit(Histogram, values, Weights(weights), edges)
-        pdf = h.weights ./ max(sum(h.weights .* diff(edges)), eps())
+        normalization = sum(h.weights .* diff(edges))
+        pdf = isfinite(normalization) && normalization > 0 ?
+            h.weights ./ normalization :
+            fill(NaN, length(centers))
         centers, pdf
     end
 
     function cube_pdf_samples(c)
         local_mag = magnetic_fields(c)
         local_turb = turbulent_velocity(c)
-        local_weights = pdf_weighting == "mass" ?
+        configurable_weights = pdf_weighting == "mass" ?
             vec(Float64.(c.rho)) : ones(length(c.rho))
+        density_weights = vec(Float64.(c.rho))
         local_B = GAUSS_TO_MICROGAUSS .* local_mag.B
         local_v = sqrt.(local_turb.dv2)
         local_T = Float64(mean_molecular_weight) * M_H_CGS .* c.P ./
@@ -2837,7 +2841,8 @@ begin
             magnetic = vec(safe_log10.(local_B)),
             velocity = vec(safe_log10.(local_v)),
             normalized_B = vec(safe_log10.(local_mag.B ./ local_mean_B)),
-            weights = local_weights,
+            configurable_weights,
+            density_weights,
         )
     end
 
@@ -2877,7 +2882,7 @@ begin
 
     function snapshot_pdf_products(path)
         cached_scientific_product((
-            :snapshot_pdfs_v3,
+            :snapshot_pdfs_v5_density_weighted_temperature_magnetic,
             cube_signature(path),
             Tuple(Tuple(getfield(pdf_edges, field))
                 for field in (:density, :temperature, :magnetic, :velocity,
@@ -2888,17 +2893,20 @@ begin
             samples = cube_pdf_samples(load_cube(path))
             (
                 density = density_pdf(
-                    samples.density, samples.weights, pdf_edges.density),
+                    samples.density, samples.configurable_weights,
+                    pdf_edges.density),
                 temperature = density_pdf(
-                    samples.temperature, samples.weights,
+                    samples.temperature, samples.density_weights,
                     pdf_edges.temperature),
                 magnetic = density_pdf(
-                    samples.magnetic, samples.weights, pdf_edges.magnetic),
+                    samples.magnetic, samples.density_weights,
+                    pdf_edges.magnetic),
                 velocity = density_pdf(
-                    samples.velocity, samples.weights, pdf_edges.velocity),
+                    samples.velocity, samples.configurable_weights,
+                    pdf_edges.velocity),
                 normalized_B = density_pdf(
                     samples.normalized_B,
-                    samples.weights,
+                    samples.density_weights,
                     pdf_edges.normalized_B,
                 ),
             )

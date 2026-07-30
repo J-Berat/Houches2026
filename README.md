@@ -115,9 +115,12 @@ requested figures into:
 - one job in each of `los_x`, `los_y`, and `los_z` for projected maps,
   synthetic observations, 2D statistics, and mixed summary figures.
 
-Dynamo still uses the first 20 snapshots. Dust, StarlightPol, ZEEMAN, MOOSE,
-and SHINE still use the last 10 snapshots. The `common` products are not
-recomputed for each viewing direction.
+Every selected figure family uses the same snapshot selection. In interactive
+mode, the inventory is followed by a single snapshot-count question; the
+selected number is distributed uniformly over the available run. Pressing
+Enter uses every listed snapshot (or the largest common count when comparing
+runs with different lengths). There are no notebook-specific snapshot windows.
+The `common` products are not recomputed for each viewing direction.
 
 In batch mode, the comparative density PDFs, magnetic-field--density relation,
 3D HRO, 2D HRO, and power spectra use every selected snapshot. Their solid
@@ -223,7 +226,10 @@ Before asking which figures to compute, the interface scans every selected
 simulation and prints a snapshot inventory: the resolved `DataCubes` directory,
 the total number of HDF5/FITS or raw RAMSES snapshots, and the complete
 numbered list of snapshot paths. A missing or empty cube directory is therefore
-reported before any expensive calculation starts.
+reported before any expensive calculation starts. The interface then asks only
+for the number of snapshots to use. They are sampled uniformly across the full
+available time range and the same selection rule is used by every requested
+figure.
 
 Raw RAMSES directories named `output_XXXXX` are supported through a persistent
 yt conversion cache. Install the Python converter once on the cluster:
@@ -250,17 +256,13 @@ level 1, which remains directly readable by HDF5.jl without an external filter
 plugin. Set `DYNAMO_PYTHON` if yt is installed in a different Python
 environment.
 
-The generated files are separated by comparison and snapshot window:
+The generated files are separated by comparison and the selected snapshot
+count:
 
 ```text
 figures/
 ├── varying_mach/
-│   ├── dynamo_first20/
-│   │   ├── common/
-│   │   ├── los_x/
-│   │   ├── los_y/
-│   │   └── los_z/
-│   └── observables_last10/
+│   └── selected_even10/
 │       ├── common/
 │       ├── los_x/
 │       ├── los_y/

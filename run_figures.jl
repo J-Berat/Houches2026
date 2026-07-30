@@ -29,6 +29,12 @@ const SELECTED_LINES_OF_SIGHT = [
     "z",
 ]
 
+# A single snapshot count is shared by every selected figure family. Snapshots
+# are distributed uniformly across the available run so temporal diagnostics
+# cover the complete evolution instead of applying notebook-specific
+# first/last rules.
+const SELECTED_SNAPSHOT_COUNT = 10
+
 const COMPARISONS = [
     (
         key = "mach",
@@ -175,24 +181,15 @@ end
 
 const BATCH_CONFIGS = let
     configurations = BatchConfig[]
-    other_notebooks = filter(!=("dynamo"), SELECTED_NOTEBOOKS)
     for comparison in COMPARISONS
         comparison.key in SELECTED_COMPARISONS || continue
-        "dynamo" in SELECTED_NOTEBOOKS && append_figure_jobs!(
+        append_figure_jobs!(
             configurations,
             comparison,
-            figures_for_notebooks(["dynamo"]),
-            :first,
-            20,
-            "dynamo",
-        )
-        isempty(other_notebooks) || append_figure_jobs!(
-            configurations,
-            comparison,
-            figures_for_notebooks(other_notebooks),
-            :last,
-            10,
-            "observables",
+            figures_for_notebooks(SELECTED_NOTEBOOKS),
+            :even,
+            SELECTED_SNAPSHOT_COUNT,
+            "selected",
         )
     end
     configurations
@@ -665,7 +662,7 @@ function interactive_batch_configs()
             labels = comparison_labels,
         )
     end
-    print_snapshot_inventory(comparisons, comparison_repository)
+    inventories = print_snapshot_inventory(comparisons, comparison_repository)
 
     notebook_names = available_notebooks()
     notebook_labels = [
@@ -700,76 +697,28 @@ function interactive_batch_configs()
         joinpath(PROJECT_DIRECTORY, "figures"),
     ))
 
-    snapshot_policy = prompt_one(
-        "Snapshot selection",
-        ["standard", "custom"];
-        labels = [
-            "Scientific defaults: Dynamo first 20; observables last 10",
-            "One custom snapshot window for every selected figure",
-        ],
+    available_snapshot_count = minimum(
+        length(inventory.sources) for inventory in inventories
+    )
+    snapshot_count = prompt_positive_integer(
+        "Number of snapshots per simulation (evenly spaced; Enter uses all listed)",
+        available_snapshot_count,
     )
 
     configurations = BatchConfig[]
-    if snapshot_policy == "standard"
-        dynamo_figures = filter(
-            figure -> figure in figures_for_notebooks(["dynamo"]),
+    for comparison in comparisons
+        append_figure_jobs!(
+            configurations,
+            comparison,
             selected_figures,
+            :even,
+            snapshot_count,
+            "selected",
+            lines_of_sight;
+            comparison_repository = comparison_repository,
+            output_root = output_root,
+            output_format = format,
         )
-        observable_figures = setdiff(selected_figures, dynamo_figures)
-        for comparison in comparisons
-            isempty(dynamo_figures) || append_figure_jobs!(
-                configurations,
-                comparison,
-                dynamo_figures,
-                :first,
-                20,
-                "dynamo",
-                lines_of_sight;
-                comparison_repository = comparison_repository,
-                output_root = output_root,
-                output_format = format,
-            )
-            isempty(observable_figures) || append_figure_jobs!(
-                configurations,
-                comparison,
-                observable_figures,
-                :last,
-                10,
-                "observables",
-                lines_of_sight;
-                comparison_repository = comparison_repository,
-                output_root = output_root,
-                output_format = format,
-            )
-        end
-    else
-        snapshot_window = Symbol(prompt_one(
-            "Snapshot window",
-            ["first", "last", "even"];
-            labels = [
-                "First snapshots",
-                "Last snapshots",
-                "Evenly spaced snapshots across the run",
-            ],
-        ))
-        snapshot_count = prompt_positive_integer(
-            "Number of snapshots per simulation",
-            10,
-        )
-        for comparison in comparisons
-            append_figure_jobs!(
-                configurations,
-                comparison,
-                selected_figures,
-                snapshot_window,
-                snapshot_count,
-                "selected",
-                lines_of_sight;
-                comparison_repository = comparison_repository,
-                output_root = output_root,
-                output_format = format,
-            )
-        end
     end
     configurations, comparison_repository
 end

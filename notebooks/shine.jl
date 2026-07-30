@@ -2947,7 +2947,7 @@ md"""
 
 ## 4. Thermodynamic phase diagram
 
-This comparative figure shows one joint distribution of number density $n$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. The plotted coordinates are $\log_{10}n$ and $\log_{10}(P/k_{\mathrm B})$; empty probability bins are masked and all panels share one color scale.
+This comparative figure shows one joint distribution of number density $n_{\mathrm H}$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. Both physical axes are logarithmic, empty probability bins are masked, and all panels share one color scale.
 
 The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curves satisfy $n\Lambda(T,Z)=\Gamma$ with $P/k_{\mathrm B}=nT$. In this illustrative metallicity extension, the low-temperature metal-line cooling term scales linearly with $Z/Z_\odot$, while the hydrogen cooling term and the heating rate remain fixed. These curves compare cooling multiplicities; they are not a substitute for a self-consistent chemical network.
 
@@ -3047,18 +3047,32 @@ begin
     for (panel_index, label) in enumerate(comparison_run_labels)
         phase_data = phase_data_by_run[label]
         phase_axis = latex_axis(fig_phase[1, panel_index],
-            xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
-            ylabel = L"\log_{10}\!\left[(P/k_B)/(\mathrm{K\,cm}^{-3})\right]",
+            xlabel = L"n_{\mathrm H}\;[\mathrm{cm}^{-3}]",
+            ylabel = L"P/k_{\mathrm B}\;[\mathrm{K\,cm}^{-3}]",
+            xscale = log10,
+            yscale = log10,
+            xticks = DECADE_TICKS,
+            yticks = DECADE_TICKS,
+            xminorticks = IntervalsBetween(9),
+            yminorticks = IntervalsBetween(9),
+            xminorticksvisible = true,
+            yminorticksvisible = true,
             title = latex_run_label(label))
-        phase_heatmap = heatmap!(phase_axis, phase_data.xcenters, phase_data.ycenters,
+        phase_heatmap = heatmap!(phase_axis,
+            10.0 .^ phase_data.xcenters,
+            10.0 .^ phase_data.ycenters,
             phase_data.log_probability; colormap = :magma, colorrange = phase_range)
         if show_phase_equilibrium && !isempty(phase_equilibria)
             for (curve_index, equilibrium) in enumerate(phase_equilibria)
                 curve_color = phase_equilibrium_colors[curve_index]
                 curve_width = isapprox(equilibrium.metallicity, 1.0) ? 3.2 : 2.4
-                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                lines!(phase_axis,
+                    10.0 .^ equilibrium.curve.logn,
+                    10.0 .^ equilibrium.curve.logpk;
                     color = (:black, 0.72), linewidth = curve_width + 2.0)
-                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                lines!(phase_axis,
+                    10.0 .^ equilibrium.curve.logn,
+                    10.0 .^ equilibrium.curve.logpk;
                     color = curve_color, linewidth = curve_width,
                     label = latexstring("Z/Z_{\\odot}=",
                         @sprintf("%.2g", equilibrium.metallicity)))
@@ -3068,10 +3082,12 @@ begin
             phase_data.xcenters[2] - phase_data.xcenters[1] : 1.0
         phase_dy = length(phase_data.ycenters) > 1 ?
             phase_data.ycenters[2] - phase_data.ycenters[1] : 1.0
-        xlims!(phase_axis, first(phase_data.xcenters) - phase_dx / 2,
-            last(phase_data.xcenters) + phase_dx / 2)
-        ylims!(phase_axis, first(phase_data.ycenters) - phase_dy / 2,
-            last(phase_data.ycenters) + phase_dy / 2)
+        xlims!(phase_axis,
+            10.0^(first(phase_data.xcenters) - phase_dx / 2),
+            10.0^(last(phase_data.xcenters) + phase_dx / 2))
+        ylims!(phase_axis,
+            10.0^(first(phase_data.ycenters) - phase_dy / 2),
+            10.0^(last(phase_data.ycenters) + phase_dy / 2))
     end
     latex_colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
         label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)

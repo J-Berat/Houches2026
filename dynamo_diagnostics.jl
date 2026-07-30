@@ -2959,7 +2959,7 @@ md"""
 
 ## 3. Physical probability density functions
 
-The panels compare every run selected in **Simulations in comparative plots** at the selected snapshot index (clamped to the last available snapshot of shorter runs). They show number density $n$, gas temperature $T$, magnetic-field strength $|B|$, and turbulent speed $|\delta\mathbf v|$ in physical units. Shared $\log_{10}X$ bins are used across runs. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
+The panels compare every run selected in **Simulations in comparative plots**. Density and temperature are displayed directly as the distributions of $\log_{10}(n_{\mathrm H}/\mathrm{cm}^{-3})$ and $\log_{10}(T/\mathrm K)$. Magnetic-field strength $|B|$ and turbulent speed $|\delta\mathbf v|$ retain physical logarithmic axes. Shared $\log_{10}X$ bins are used across runs. Their vertical axes are probability densities per dex and satisfy $\int (\mathrm{d}\mathcal P/\mathrm{d}\log_{10}X)\,\mathrm{d}\log_{10}X=1$.
 
 **Display physical PDFs:** $(@bind display_pdfs PlutoUI.CheckBox(default = true))
 
@@ -3108,13 +3108,17 @@ end
 begin
     pdf_specs = NamedTuple[]
     show_pdf_density && push!(pdf_specs, (pdfs = density_pdfs,
-        xlabel = L"n\;[\mathrm{cm}^{-3}]"))
+        xlabel = L"\log_{10}(n_{\mathrm H}/\mathrm{cm}^{-3})",
+        log_coordinate = true))
     show_pdf_temperature && push!(pdf_specs, (pdfs = temperature_pdfs,
-        xlabel = L"T\;[\mathrm{K}]"))
+        xlabel = L"\log_{10}(T/\mathrm K)",
+        log_coordinate = true))
     show_pdf_magnetic && push!(pdf_specs, (pdfs = magnetic_pdfs,
-        xlabel = L"|B|\;[\mu\mathrm{G}]"))
+        xlabel = L"|B|\;[\mu\mathrm{G}]",
+        log_coordinate = false))
     show_pdf_velocity && push!(pdf_specs, (pdfs = velocity_pdfs,
-        xlabel = L"|\delta v|\;[\mathrm{km\,s}^{-1}]"))
+        xlabel = L"|\delta v|\;[\mathrm{km\,s}^{-1}]",
+        log_coordinate = false))
     if isempty(pdf_specs)
         fig_pdf = Figure(size = (900, 180))
         Label(fig_pdf[1, 1], L"\mathrm{Select\ at\ least\ one\ PDF.}", fontsize = 20)
@@ -3122,12 +3126,16 @@ begin
         fig_pdf = Figure(size = (420length(pdf_specs), 430))
         for (j, spec) in enumerate(pdf_specs)
             ax = latex_axis(fig_pdf[1, j], xlabel = spec.xlabel,
-                ylabel = L"\mathrm{PDF}", xscale = log10,
-                xticks = DECADE_TICKS,
-                xminorticks = IntervalsBetween(9), xminorticksvisible = true)
+                ylabel = L"\mathrm{PDF}",
+                xscale = spec.log_coordinate ? identity : log10,
+                xticks = spec.log_coordinate ? Makie.automatic : DECADE_TICKS,
+                xminorticks = IntervalsBetween(
+                    spec.log_coordinate ? 5 : 9),
+                xminorticksvisible = true)
             for label in comparison_run_labels
                 product = spec.pdfs[label]
-                x = 10.0 .^ product.logx
+                x = spec.log_coordinate ?
+                    product.logx : 10.0 .^ product.logx
                 valid_band = isfinite.(product.lower) .&
                     isfinite.(product.upper)
                 band!(ax, x[valid_band], product.lower[valid_band],
@@ -3154,7 +3162,7 @@ md"""
 
 ## 4. Thermodynamic phase diagram
 
-This comparative figure shows one joint distribution of number density $n$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. The plotted coordinates are $\log_{10}n$ and $\log_{10}(P/k_{\mathrm B})$; empty probability bins are masked and all panels share one color scale.
+This comparative figure shows one joint distribution of number density $n_{\mathrm H}$ and thermal pressure $P/k_{\mathrm B}$ for each selected simulation. Both physical axes are logarithmic, empty probability bins are masked, and all panels share one color scale.
 
 The conversion follows the units defined in section 1: $n=\rho/(\mu m_{\mathrm H})$ and $P/k_{\mathrm B}$ in $\mathrm{K\,cm}^{-3}$. The selected **PDF weighting** is applied consistently. The optional Koyama--Inutsuka equilibrium curves satisfy $n\Lambda(T,Z)=\Gamma$ with $P/k_{\mathrm B}=nT$. In this illustrative metallicity extension, the low-temperature metal-line cooling term scales linearly with $Z/Z_\odot$, while the hydrogen cooling term and the heating rate remain fixed. These curves compare cooling multiplicities; they are not a substitute for a self-consistent chemical network.
 
@@ -3254,18 +3262,32 @@ begin
     for (panel_index, label) in enumerate(comparison_run_labels)
         phase_data = phase_data_by_run[label]
         phase_axis = latex_axis(fig_phase[1, panel_index],
-            xlabel = L"\log_{10}\!\left(n/\mathrm{cm}^{-3}\right)",
-            ylabel = L"\log_{10}\!\left[(P/k_B)/(\mathrm{K\,cm}^{-3})\right]",
+            xlabel = L"n_{\mathrm H}\;[\mathrm{cm}^{-3}]",
+            ylabel = L"P/k_{\mathrm B}\;[\mathrm{K\,cm}^{-3}]",
+            xscale = log10,
+            yscale = log10,
+            xticks = DECADE_TICKS,
+            yticks = DECADE_TICKS,
+            xminorticks = IntervalsBetween(9),
+            yminorticks = IntervalsBetween(9),
+            xminorticksvisible = true,
+            yminorticksvisible = true,
             title = latex_run_label(label))
-        phase_heatmap = heatmap!(phase_axis, phase_data.xcenters, phase_data.ycenters,
+        phase_heatmap = heatmap!(phase_axis,
+            10.0 .^ phase_data.xcenters,
+            10.0 .^ phase_data.ycenters,
             phase_data.log_probability; colormap = :magma, colorrange = phase_range)
         if show_phase_equilibrium && !isempty(phase_equilibria)
             for (curve_index, equilibrium) in enumerate(phase_equilibria)
                 curve_color = phase_equilibrium_colors[curve_index]
                 curve_width = isapprox(equilibrium.metallicity, 1.0) ? 3.2 : 2.4
-                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                lines!(phase_axis,
+                    10.0 .^ equilibrium.curve.logn,
+                    10.0 .^ equilibrium.curve.logpk;
                     color = (:black, 0.72), linewidth = curve_width + 2.0)
-                lines!(phase_axis, equilibrium.curve.logn, equilibrium.curve.logpk;
+                lines!(phase_axis,
+                    10.0 .^ equilibrium.curve.logn,
+                    10.0 .^ equilibrium.curve.logpk;
                     color = curve_color, linewidth = curve_width,
                     label = latexstring("Z/Z_{\\odot}=",
                         @sprintf("%.2g", equilibrium.metallicity)))
@@ -3275,10 +3297,12 @@ begin
             phase_data.xcenters[2] - phase_data.xcenters[1] : 1.0
         phase_dy = length(phase_data.ycenters) > 1 ?
             phase_data.ycenters[2] - phase_data.ycenters[1] : 1.0
-        xlims!(phase_axis, first(phase_data.xcenters) - phase_dx / 2,
-            last(phase_data.xcenters) + phase_dx / 2)
-        ylims!(phase_axis, first(phase_data.ycenters) - phase_dy / 2,
-            last(phase_data.ycenters) + phase_dy / 2)
+        xlims!(phase_axis,
+            10.0^(first(phase_data.xcenters) - phase_dx / 2),
+            10.0^(last(phase_data.xcenters) + phase_dx / 2))
+        ylims!(phase_axis,
+            10.0^(first(phase_data.ycenters) - phase_dy / 2),
+            10.0^(last(phase_data.ycenters) + phase_dy / 2))
     end
     latex_colorbar(fig_phase[1, phase_panel_count + 1], phase_heatmap,
         label = L"\log_{10}\mathcal{P}_{2\mathrm{D}}", tickformat = latex_ticklabels)
@@ -5512,6 +5536,7 @@ in $\mathrm{Myr}^{-2}$. Both maps use the active run, snapshot, and line of sigh
 
 **Display vorticity and enstrophy maps:** $(@bind display_vorticity_figure PlutoUI.CheckBox(default = true))  
 **Display vorticity versus snapshot time:** $(@bind display_vorticity_time PlutoUI.CheckBox(default = false))
+**Display thermal and magnetic accelerations versus density:** $(@bind display_acceleration_density PlutoUI.CheckBox(default = false))
 **Display density-binned enstrophy diagnostics:** $(@bind display_enstrophy_density PlutoUI.CheckBox(default = true))
 
 | Vorticity and enstrophy diagnostic | Display |
@@ -5520,6 +5545,9 @@ in $\mathrm{Myr}^{-2}$. Both maps use the active run, snapshot, and line of sigh
 | Enstrophy heatmap | $(@bind show_enstrophy_map PlutoUI.CheckBox(default = true)) |
 | Enstrophy profiles by density bin | $(@bind show_enstrophy_density_profiles PlutoUI.CheckBox(default = true)) |
 | Density-bin weighting | $(@bind enstrophy_density_weighting PlutoUI.Select(["volume", "mass"]; default = "volume")) |
+| Acceleration density intervals | $(@bind acceleration_density_bin_count PlutoUI.Slider(8:2:30; default = 14, show_value = true)) |
+| Minimum $\log_{10}(n_{\mathrm H}/\mathrm{cm}^{-3})$ | $(@bind acceleration_log_density_min PlutoUI.NumberField(default = -2.0)) |
+| Maximum $\log_{10}(n_{\mathrm H}/\mathrm{cm}^{-3})$ | $(@bind acceleration_log_density_max PlutoUI.NumberField(default = 3.0)) |
 """
 
 # ╔═╡ 3190e127-1d53-49f1-bfab-b9645910c2c6
@@ -5785,6 +5813,403 @@ begin
         )
     end
     stable_pluto_figure(display_vorticity_time, fig_vorticity_time)
+end
+
+# ╔═╡ a4b82011-58dc-43b8-863f-60f2d31ac73f
+begin
+    function acceleration_density_profile(
+            local_cube,
+            logarithmic_density_edges;
+            target_sample_count = 1_000_000,
+        )
+        rho, pressure = local_cube.rho, local_cube.P
+        bx, by, bz = local_cube.bx, local_cube.by, local_cube.bz
+        nx, ny, nz = size(rho)
+        dx, dy, dz = Float64.(local_cube.L) .* PC_CM ./
+            (nx, ny, nz)
+        sample_stride = max(
+            1,
+            floor(Int, cbrt(prod(size(rho)) / target_sample_count)),
+        )
+        bin_count = length(logarithmic_density_edges) - 1
+        thermal_samples = [Float64[] for _ in 1:bin_count]
+        magnetic_samples = [Float64[] for _ in 1:bin_count]
+
+        @inbounds for k in 1:sample_stride:nz,
+                j in 1:sample_stride:ny,
+                i in 1:sample_stride:nx
+            density = Float64(rho[i, j, k])
+            isfinite(density) && density > 0 || continue
+            number_density_value =
+                density / (Float64(mean_molecular_weight) * M_H_CGS)
+            logarithmic_density = log10(number_density_value)
+            bin = searchsortedlast(logarithmic_density_edges, logarithmic_density)
+            1 <= bin <= bin_count || continue
+            logarithmic_density < logarithmic_density_edges[bin + 1] ||
+                continue
+
+            im, ip = i == 1 ? nx : i - 1, i == nx ? 1 : i + 1
+            jm, jp = j == 1 ? ny : j - 1, j == ny ? 1 : j + 1
+            km, kp = k == 1 ? nz : k - 1, k == nz ? 1 : k + 1
+
+            dPdx = (Float64(pressure[ip, j, k]) -
+                Float64(pressure[im, j, k])) / (2dx)
+            dPdy = (Float64(pressure[i, jp, k]) -
+                Float64(pressure[i, jm, k])) / (2dy)
+            dPdz = (Float64(pressure[i, j, kp]) -
+                Float64(pressure[i, j, km])) / (2dz)
+            thermal_acceleration = hypot(dPdx, dPdy, dPdz) / density
+
+            curl_x = (
+                (Float64(bz[i, jp, k]) - Float64(bz[i, jm, k])) / (2dy) -
+                (Float64(by[i, j, kp]) - Float64(by[i, j, km])) / (2dz)
+            )
+            curl_y = (
+                (Float64(bx[i, j, kp]) - Float64(bx[i, j, km])) / (2dz) -
+                (Float64(bz[ip, j, k]) - Float64(bz[im, j, k])) / (2dx)
+            )
+            curl_z = (
+                (Float64(by[ip, j, k]) - Float64(by[im, j, k])) / (2dx) -
+                (Float64(bx[i, jp, k]) - Float64(bx[i, jm, k])) / (2dy)
+            )
+            local_bx = Float64(bx[i, j, k])
+            local_by = Float64(by[i, j, k])
+            local_bz = Float64(bz[i, j, k])
+            force_x = curl_y * local_bz - curl_z * local_by
+            force_y = curl_z * local_bx - curl_x * local_bz
+            force_z = curl_x * local_by - curl_y * local_bx
+            magnetic_acceleration =
+                hypot(force_x, force_y, force_z) / (4pi * density)
+
+            isfinite(thermal_acceleration) && thermal_acceleration > 0 &&
+                push!(thermal_samples[bin], log10(thermal_acceleration))
+            isfinite(magnetic_acceleration) && magnetic_acceleration > 0 &&
+                push!(magnetic_samples[bin], log10(magnetic_acceleration))
+        end
+
+        summarize(samples) = map(samples) do values
+            isempty(values) ? (NaN, NaN, NaN) :
+                Tuple(quantile(values, (0.16, 0.50, 0.84)))
+        end
+        thermal_statistics = summarize(thermal_samples)
+        magnetic_statistics = summarize(magnetic_samples)
+        (
+            centers = (
+                logarithmic_density_edges[1:end-1] .+
+                logarithmic_density_edges[2:end]
+            ) ./ 2,
+            thermal_lower = first.(thermal_statistics),
+            thermal_median = getindex.(thermal_statistics, 2),
+            thermal_upper = last.(thermal_statistics),
+            magnetic_lower = first.(magnetic_statistics),
+            magnetic_median = getindex.(magnetic_statistics, 2),
+            magnetic_upper = last.(magnetic_statistics),
+            sample_stride,
+        )
+    end
+
+    function aggregate_acceleration_profiles(products)
+        thermal_band =
+            snapshot_curve_band([product.thermal_median for product in products])
+        magnetic_band =
+            snapshot_curve_band([product.magnetic_median for product in products])
+        thermal_cell_lower = snapshot_curve_band(
+            [product.thermal_lower for product in products]).median
+        thermal_cell_upper = snapshot_curve_band(
+            [product.thermal_upper for product in products]).median
+        magnetic_cell_lower = snapshot_curve_band(
+            [product.magnetic_lower for product in products]).median
+        magnetic_cell_upper = snapshot_curve_band(
+            [product.magnetic_upper for product in products]).median
+        (
+            centers = first(products).centers,
+            thermal = thermal_band.median,
+            thermal_lower = min.(thermal_band.lower, thermal_cell_lower),
+            thermal_upper = max.(thermal_band.upper, thermal_cell_upper),
+            magnetic = magnetic_band.median,
+            magnetic_lower = min.(magnetic_band.lower, magnetic_cell_lower),
+            magnetic_upper = max.(magnetic_band.upper, magnetic_cell_upper),
+        )
+    end
+
+    function merge_acceleration_profiles(products)
+        thermal_band =
+            snapshot_curve_band([product.thermal for product in products])
+        magnetic_band =
+            snapshot_curve_band([product.magnetic for product in products])
+        thermal_lower_band = snapshot_curve_band(
+            [product.thermal_lower for product in products])
+        thermal_upper_band = snapshot_curve_band(
+            [product.thermal_upper for product in products])
+        magnetic_lower_band = snapshot_curve_band(
+            [product.magnetic_lower for product in products])
+        magnetic_upper_band = snapshot_curve_band(
+            [product.magnetic_upper for product in products])
+        (
+            centers = first(products).centers,
+            thermal = thermal_band.median,
+            thermal_lower =
+                min.(thermal_band.lower, thermal_lower_band.median),
+            thermal_upper =
+                max.(thermal_band.upper, thermal_upper_band.median),
+            magnetic = magnetic_band.median,
+            magnetic_lower =
+                min.(magnetic_band.lower, magnetic_lower_band.median),
+            magnetic_upper =
+                max.(magnetic_band.upper, magnetic_upper_band.median),
+        )
+    end
+
+    function acceleration_matrix_parameters(label)
+        directory = RUN_DIRS[label]
+        name = run_directory_name(directory)
+        forcing_rms = directory_parameter(name, ["rms"])
+        forcing_ratio = directory_parameter(name, ["r"])
+        isnothing(forcing_ratio) &&
+            (forcing_ratio = chi_value(ROOT, directory))
+        (rms = forcing_rms, chi = forcing_ratio)
+    end
+
+    acceleration_density_low = min(
+        Float64(acceleration_log_density_min),
+        Float64(acceleration_log_density_max),
+    )
+    acceleration_density_high = max(
+        Float64(acceleration_log_density_min),
+        Float64(acceleration_log_density_max),
+    )
+    acceleration_density_high > acceleration_density_low ||
+        (acceleration_density_high = acceleration_density_low + 1.0)
+    acceleration_density_edges = collect(range(
+        acceleration_density_low,
+        acceleration_density_high;
+        length = Int(acceleration_density_bin_count) + 1,
+    ))
+
+    acceleration_profiles_by_run = display_acceleration_density ? Dict(
+        label => aggregate_acceleration_profiles([
+            cached_scientific_product((
+                :acceleration_density_profile_v1,
+                cube_signature(path),
+                Float64(mean_molecular_weight),
+                Tuple(acceleration_density_edges),
+                1_000_000,
+            )) do
+                local_cube = path ==
+                    run_files[label][comparison_snapshot_indices[label]] ?
+                    comparison_cube(label) : load_cube(path)
+                acceleration_density_profile(
+                    local_cube,
+                    acceleration_density_edges,
+                )
+            end
+            for path in comparison_snapshot_paths[label]
+        ])
+        for label in comparison_run_labels
+    ) : Dict{String, Any}()
+
+    if !display_acceleration_density
+        fig_acceleration_density = Figure(size = (900, 180))
+        Label(
+            fig_acceleration_density[1, 1],
+            L"\mathrm{Enable\ acceleration\ profiles\ to\ compute\ the\ matrix.}";
+            fontsize = 20,
+        )
+    else
+        acceleration_parameters = Dict(
+            label => acceleration_matrix_parameters(label)
+            for label in comparison_run_labels
+        )
+        has_parameter_grid = all(
+            label -> !isnothing(acceleration_parameters[label].rms) &&
+                !isnothing(acceleration_parameters[label].chi),
+            comparison_run_labels,
+        )
+        acceleration_rows = has_parameter_grid ?
+            sort(unique(Float64[
+                acceleration_parameters[label].rms
+                for label in comparison_run_labels
+            ])) : [1.0]
+        acceleration_columns = has_parameter_grid ?
+            sort(unique(Float64[
+                acceleration_parameters[label].chi
+                for label in comparison_run_labels
+            ])) : collect(1.0:length(comparison_run_labels))
+        acceleration_cell_labels = Dict{Tuple{Int, Int}, Vector{String}}()
+        for (index, label) in enumerate(comparison_run_labels)
+            row = has_parameter_grid ?
+                findfirst(==(acceleration_parameters[label].rms),
+                    acceleration_rows) : 1
+            column = has_parameter_grid ?
+                findfirst(==(acceleration_parameters[label].chi),
+                    acceleration_columns) : index
+            push!(get!(acceleration_cell_labels, (row, column), String[]), label)
+        end
+
+        acceleration_y_values = vcat([
+            vcat(
+                filter(isfinite, product.thermal_lower),
+                filter(isfinite, product.thermal_upper),
+                filter(isfinite, product.magnetic_lower),
+                filter(isfinite, product.magnetic_upper),
+            )
+            for product in values(acceleration_profiles_by_run)
+        ]...)
+        acceleration_y_limits = isempty(acceleration_y_values) ?
+            (-12.0, -4.0) : begin
+            lower, upper = extrema(acceleration_y_values)
+            margin = max(0.15 * (upper - lower), 0.25)
+            (lower - margin, upper + margin)
+        end
+
+        row_count = length(acceleration_rows)
+        column_count = length(acceleration_columns)
+        fig_acceleration_density = Figure(
+            size = (360column_count + 150, 290row_count + 190),
+        )
+        for column in 1:column_count
+            column_label = has_parameter_grid ?
+                latexstring(
+                    raw"\chi=", parameter_text(acceleration_columns[column])) :
+                as_latex(plain_legend_run_label(
+                    comparison_run_labels[column]))
+            Label(
+                fig_acceleration_density[0, column],
+                column_label;
+                fontsize = 20,
+            )
+        end
+        for row in 1:row_count, column in 1:column_count
+            axis = latex_axis(
+                fig_acceleration_density[row, column];
+                xlabel = row == row_count ?
+                    L"\log_{10}(n_{\mathrm H}/\mathrm{cm}^{-3})" : "",
+                ylabel = column == 1 ?
+                    L"\log_{10}(a/\mathrm{cm\,s}^{-2})" : "",
+                xminorticks = IntervalsBetween(5),
+                yminorticks = IntervalsBetween(5),
+                xminorticksvisible = true,
+                yminorticksvisible = true,
+                xgridvisible = false,
+                ygridvisible = false,
+                xminorgridvisible = false,
+                yminorgridvisible = false,
+                topspinevisible = true,
+                rightspinevisible = true,
+            )
+            xlims!(axis, acceleration_density_low, acceleration_density_high)
+            ylims!(axis, acceleration_y_limits...)
+            if has_parameter_grid && column == 1
+                text!(
+                    axis,
+                    0.03,
+                    0.94;
+                    text = latexstring(
+                        raw"f_{\mathrm{rms}}=",
+                        parameter_text(acceleration_rows[row]),
+                    ),
+                    space = :relative,
+                    align = (:left, :top),
+                    fontsize = 16,
+                )
+            end
+            labels = get(acceleration_cell_labels, (row, column), String[])
+            if isempty(labels)
+                text!(
+                    axis,
+                    0.5,
+                    0.5;
+                    text = L"\mathrm{No\ simulation}",
+                    space = :relative,
+                    align = (:center, :center),
+                    color = :gray55,
+                    fontsize = 17,
+                )
+                continue
+            end
+            local_products =
+                [acceleration_profiles_by_run[label] for label in labels]
+            product = length(local_products) == 1 ?
+                first(local_products) :
+                merge_acceleration_profiles(local_products)
+            thermal_valid = isfinite.(product.centers) .&
+                isfinite.(product.thermal) .&
+                isfinite.(product.thermal_lower) .&
+                isfinite.(product.thermal_upper)
+            magnetic_valid = isfinite.(product.centers) .&
+                isfinite.(product.magnetic) .&
+                isfinite.(product.magnetic_lower) .&
+                isfinite.(product.magnetic_upper)
+            band!(
+                axis,
+                product.centers[thermal_valid],
+                product.thermal_lower[thermal_valid],
+                product.thermal_upper[thermal_valid];
+                color = (:darkorange, 0.18),
+            )
+            lines!(
+                axis,
+                product.centers[thermal_valid],
+                product.thermal[thermal_valid];
+                color = :darkorange,
+                linewidth = 2.6,
+            )
+            band!(
+                axis,
+                product.centers[magnetic_valid],
+                product.magnetic_lower[magnetic_valid],
+                product.magnetic_upper[magnetic_valid];
+                color = (:forestgreen, 0.18),
+            )
+            lines!(
+                axis,
+                product.centers[magnetic_valid],
+                product.magnetic[magnetic_valid];
+                color = :forestgreen,
+                linewidth = 2.6,
+                linestyle = :dash,
+            )
+        end
+        Legend(
+            fig_acceleration_density[row_count + 1, 1:column_count],
+            [
+                LineElement(color = :darkorange, linewidth = 2.6),
+                LineElement(
+                    color = :forestgreen,
+                    linewidth = 2.6,
+                    linestyle = :dash,
+                ),
+            ],
+            LaTeXString[
+                L"a_{\mathrm{th}}=|\nabla P|/\rho",
+                L"a_B=|(\nabla\times B)\times B|/(4\pi\rho)",
+            ];
+            orientation = :horizontal,
+            framevisible = false,
+            tellwidth = false,
+            nbanks = 1,
+        )
+        for column in 1:column_count
+            colsize!(
+                fig_acceleration_density.layout,
+                column,
+                Relative(1 / column_count),
+            )
+        end
+        for row in 1:row_count
+            rowsize!(
+                fig_acceleration_density.layout,
+                row,
+                Relative(1 / row_count),
+            )
+        end
+        rowgap!(fig_acceleration_density.layout, 5)
+        colgap!(fig_acceleration_density.layout, 5)
+    end
+    stable_pluto_figure(
+        display_acceleration_density,
+        fig_acceleration_density,
+    )
 end
 
 # ╔═╡ b02ceda6-0a0d-4543-91f8-a6669231ec72
@@ -10408,6 +10833,7 @@ begin
         "energy_time" => "Energy ratios versus time",
         "vorticity" => "Vorticity map",
         "vorticity_time" => "Mean and RMS vorticity versus snapshot time",
+        "accelerations_density" => "Thermal and magnetic accelerations versus density",
         "enstrophy_density" => "Enstrophy by density and family parameter",
         "power_spectra" => "Power spectra",
         "density_spectra_time" => "Number-density power spectra through time",
@@ -10462,6 +10888,7 @@ begin
         "energy_time" => fig_energy_time,
         "vorticity" => fig_vorticity,
         "vorticity_time" => fig_vorticity_time,
+        "accelerations_density" => fig_acceleration_density,
         "enstrophy_density" => fig_enstrophy_density,
         "power_spectra" => fig_spectra,
         "density_spectra_time" => fig_density_spectra_time,
@@ -12618,6 +13045,7 @@ version = "4.1.0+0"
 # ╟─3190e127-1d53-49f1-bfab-b9645910c2c6
 # ╟─df880704-b12e-49eb-84f2-67b6f9583a8a
 # ╟─e610c7a2-9031-4a1d-9299-9cbb2fd44125
+# ╟─a4b82011-58dc-43b8-863f-60f2d31ac73f
 # ╟─b02ceda6-0a0d-4543-91f8-a6669231ec72
 # ╟─873f7ef2-719b-4ae6-b015-1a23c6c27836
 # ╟─a8558c31-7dcf-433e-9950-a59e9acf158b

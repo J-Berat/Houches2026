@@ -6996,7 +6996,10 @@ begin
             10.0 .^ profile.medians[bn_valid];
             color, linewidth = 2.5)
 
-        hro = hro_by_run[label]
+        # The 3D HRO product now contains separate density-gradient and
+        # velocity alignments. The synthesis panel reports the conventional
+        # density-gradient–magnetic-field HRO.
+        hro = hro_by_run[label].gradient
         hro_valid = isfinite.(hro.density_centers) .&
             isfinite.(hro.shape)
         band!(summary_hro_axis,
